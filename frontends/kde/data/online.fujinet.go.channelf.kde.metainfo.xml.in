@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>online.fujinet.go.channelf.kde</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>FujiNet Go Channel F (KDE)</name>
+  <summary>Fairchild Channel F with a built-in FujiNet cartridge</summary>
+  <description>
+    <p>
+      A self-contained Fairchild Channel F with a FujiNet built in: browse a
+      network host from the console with the CONFIG client, boot cartridges
+      over the network, and let a FujiNet app keep talking to the network
+      once it is running, all in one application.
+    </p>
+    <p>
+      The machine is MAME's Channel F transposed to C: the Signetics 2650
+      CPU and the 2637 UVI video and sound chip. It is the Emerson Channel F
+      2001 (NTSC), or a PAL clone in the Bandai and Hanimex mould, with the
+      FujiNet cartridge always in the slot. CONFIG is the cartridge's
+      resident image, a game booted over the network runs from the cartridge,
+      and a local cartridge file can be opened in place of CONFIG.
+    </p>
+    <p>
+      Both hand controllers are on screen, drawn as they are on the console
+      (the disc, the 12-key keypad and the side fire button, with START,
+      OPTION, SELECT and RESET between them) and remappable; gamepads are
+      picked up as they are plugged in, and a native debugger is a key press
+      away: a command prompt, the 2650's registers and return stack, a
+      memory view and disassembly with breakpoints, every object the UVI
+      draws with its position, the character screen and its registers, the
+      picture as the chip renders it, the cartridge, and the FujiNet traffic.
+    </p>
+    <p>
+      The console has no BIOS, so there is nothing to import. Nothing
+      copyrighted is included: open your own game cartridge images from the
+      application.
+    </p>
+  </description>
+  <launchable type="desktop-id">online.fujinet.go.channelf.kde.desktop</launchable>
+  <icon type="stock">online.fujinet.go.channelf.kde</icon>
+  <!-- Software centres classify from these, not from the .desktop
+       Categories= line; without them the app lands in no section at all. -->
+  <categories>
+    <category>Game</category>
+    <category>Emulator</category>
+  </categories>
+  <url type="homepage">https://fujinet.online/</url>
+  <url type="bugtracker">https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop/issues</url>
+  <url type="vcs-browser">https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop</url>
+  <developer id="online.fujinet">
+    <name>FujiNet</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The FujiNet CONFIG client running on the Channel F</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/kde/1_running_config.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The debugger's Video tab: every object the UVI draws, with its position</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/kde/2_debugger.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The Controllers window: both hand controllers and the console panel</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/kde/3_controllers.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <!-- The CURRENT release templates its version from @PROJECT_VERSION@, so
+         it cannot disagree with the tree; past releases are literal. The
+         release job checks that this first entry is still a template. -->
+    <release version="@PROJECT_VERSION@" date="2026-11-02">
+      <description>
+        <p>
+          First release: the Fairchild Channel F (and a PAL clone) transposed from MAME, with the FujiNet Channel F cartridge and an in-process FujiNet. CONFIG and FujiNet apps boot with no BIOS to import; local game cartridges open in place of CONFIG. Both hand controllers are on screen, and the debugger shows everything the 2637 UVI knows. Needs Qt 6.7 or newer.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>online.fujinet.go.channelf.gnome</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>FujiNet Go Channel F (GNOME)</name>
+  <summary>Fairchild Channel F with a built-in FujiNet cartridge</summary>
+  <description>
+    <p>
+      A self-contained Fairchild Channel F, the 1982 Signetics 2650 console
+      with the 2637 UVI video chip, with a FujiNet built in: browse a network
+      host from the console, boot games and programs over the network, and let
+      a FujiNet program keep talking to the network, all in one application.
+    </p>
+    <p>
+      FujiNet's CONFIG program is built in and starts at power-on, exactly as
+      on the FujiNet Channel F cartridge. Local cartridge images (.bin,
+      .rom, .chf, or a zip holding one) can be opened in its place, or
+      imported to FujiNet's SD folder with Import Cartridge to SD and booted
+      from CONFIG. The console's RESET key restarts whatever the cartridge is
+      serving, and Reset to CONFIG ejects the cartridge and brings CONFIG back.
+      The NTSC console is the one checked against MAME; a PAL clone is also
+      offered (50 Hz), not verified against MAME. The 16-key Palladium is not
+      supported yet.
+    </p>
+    <p>
+      The emulator is MAME's Channel F, the Signetics 2650 and the 2637 UVI,
+      transposed to C, with the FujiNet cartridge running the real cartridge
+      firmware's own protocol and page-mapping sources, so it behaves as the
+      hardware does.
+    </p>
+    <p>
+      The Controllers window draws the console with both hand controllers, each
+      with its 12-key keypad, its disc and its side fire button, and the
+      START, OPTION, SELECT and RESET buttons; click and hold to press, drag
+      the disc, and Map rebinds any key, direction or button to a key or a
+      gamepad button. Gamepads are picked up as they are plugged in and out,
+      with an analog disc from the left stick. A native debugger has a command
+      prompt, the 2650's registers and return stack with a memory viewer,
+      disassembly with breakpoints, a Video tab that shows everything the UVI
+      knows (the rendered display with its layers, the four objects with their
+      positions and bitmaps, the character screen with its colour bits, the
+      registers, collisions and the glyph table), the inputs and the beeper,
+      and the FujiNet cartridge with every FujiBus packet on its link.
+    </p>
+    <p>
+      Nothing copyrighted is included, and the console needs no BIOS: it has
+      none. Game cartridge images are your own to open.
+    </p>
+  </description>
+  <launchable type="desktop-id">online.fujinet.go.channelf.gnome.desktop</launchable>
+  <icon type="stock">online.fujinet.go.channelf.gnome</icon>
+  <!-- Software centres classify from these, not from the .desktop
+       Categories= line; without them the app lands in no section at all. -->
+  <categories>
+    <category>Game</category>
+    <category>Emulator</category>
+  </categories>
+  <url type="homepage">https://fujinet.online/</url>
+  <url type="bugtracker">https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop/issues</url>
+  <url type="vcs-browser">https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop</url>
+  <developer id="online.fujinet">
+    <name>FujiNet</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The FujiNet CONFIG client running on the console</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/1_running_config.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The built-in debugger's Video tab, showing the UVI's objects</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/2_debugger.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The Controllers window: both hand controllers and the console's buttons</caption>
+      <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/3_controllers.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <!-- The CURRENT release templates its version from @PROJECT_VERSION@, so
+         it cannot disagree with the tree; past releases are literal. The
+         release job checks that this first entry is still a template. -->
+    <release version="@PROJECT_VERSION@" date="2026-11-02">
+      <description>
+        <p>
+          First release: the Fairchild Channel F transposed from MAME, with
+          the FujiNet Channel F cartridge and an in-process FujiNet; a
+          Controllers window with both hand controllers and the console's
+          buttons, hotplugged gamepads with an analog disc, and a native
+          debugger with a full 2637 video tab and a FujiNet tab showing every
+          FujiBus packet.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

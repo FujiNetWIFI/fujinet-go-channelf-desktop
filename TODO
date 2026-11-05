@@ -1,0 +1,22 @@
+FujiNet Go Channel F desktop -- milestone log and what is left
+
+Plan: ~/.claude/plans/do-version-of-fujinet-composed-pearl.md (approved
+2026-11-05). Template: fujinet-go-arcadia-desktop v0.1.0, renamed arc -> chf;
+BIOS import from fujinet-go-o2-desktop; built-in Help from
+fujinet-go-msdos-desktop v0.6.2.
+
+PREREQUISITE (CONFIG)
+  [x] fujinet-config #375: channelf/ CONFIG (F8 asm), rebased on main
+  [ ] firmware bake PR after #375 merges (branch channelf-bake-config on
+      tschak909's fork, 945f9009d, pinned meanwhile); re-pin master after
+
+M0  [x] scaffold: rename, contracts (chfsession.h, chfdebug.h, chfhelp.h,
+        core/chf/{f8,host,carts,fujinet_cart}.h), pin, staging, icons
+M1  [ ] F8 CPU + disassembler, A/B against MAME (probes, ROMC traces)
+M2  [ ] video, sound, machine (4 machines), Videocarts, FujiNet cart, host
+M3  [ ] stand-in BIOS (clean room: SPEC from black-box runs, then stub.asm)
+M4  [ ] session: BIOS import, controls layout, bindings, right stick, Help
+M5  [ ] debugger engine (F8, VRAM/palettes/ports, write log, beam view)
+M6  [ ] frontends: GNOME, KDE, Windows, macOS
+M7  [ ] A/B campaign, live FujiNet, screenshots, README, COMPLIANCE
+M8  [ ] CI green, v0.1.0, ROM scan, publish, Flatpak remote, fujinet-go-web

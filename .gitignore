@@ -1,0 +1,57 @@
+# Build trees. The negation matters: build-aux/ is SOURCE (flatpak manifests,
+# the NSIS installer script), and "build*/" swallows it -- new manifests then
+# never show up as untracked and quietly go missing from CI.
+build*/
+!build-aux/
+
+# Provisioned dependencies. cmake/Dependencies.cmake fetches these at their
+# pinned commits, so they are build output, not source -- and committing them
+# as bare gitlinks (which `git add -A` will happily do once they exist
+# locally) is worse than not tracking them at all.
+third_party/
+
+# Staged sources: cmake/StageFujiProto.cmake copies the cartridge firmware's
+# own sources here. Never edit these; edit the firmware checkout and re-stage
+# with -DFUJI_RESTAGE=ON.
+core/chf/fuji-generated/
+
+# FujiNet runtime build tree (tools/fujinet/build-fujinet-desktop.sh).
+tools/fujinet/work/
+
+# BIOS dumps and commercial cartridges a developer keeps here for the
+# no_embedded_roms check and WITH_CHF_ROMS builds (see COMPLIANCE.md). Never
+# committed.
+tools/roms/local/
+roms/
+
+# Cartridge images that stray into the tree while testing. The only image
+# this project ships is FujiNet's own CONFIG client, staged from the
+# firmware; the tests build their own.
+*.chf
+*.bin
+*.rom
+*.ppm
+
+.cache/
+compile_commands.json
+.flatpak-builder/
+__pycache__/
+*.pyc
+
+# assembler byproducts (stub.asm, tools/ab/probes)
+*.o
+*.p
+*.lst
+
+# MAME's run-time directories, when it is run from the repo root
+/cfg/
+/nvram/
+/snap/
+/diff/
+/tools/ab/cfg/
+/tools/ab/nvram/
+/tools/ab/snap/
+/tools/ab/diff/
+
+# the console photo the icon colours were sampled from (not ours to ship)
+/fairchild-channel-f-console.png

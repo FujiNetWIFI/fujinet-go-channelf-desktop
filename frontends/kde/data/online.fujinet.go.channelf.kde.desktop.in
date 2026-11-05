@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FujiNet Go Channel F (KDE)
+GenericName=Fairchild Channel F Emulator
+Comment=Fairchild Channel F with a built-in FujiNet cartridge
+Exec=fujinet-go-channelf-kde %f
+Icon=online.fujinet.go.channelf.kde
+Terminal=false
+Categories=Game;Emulator;
+Keywords=Emerson;Channel F;2650;2637;FujiNet;emulator;retro;
+StartupNotify=true

@@ -7,45 +7,42 @@
   <summary>Fairchild Channel F with a built-in FujiNet cartridge</summary>
   <description>
     <p>
-      A self-contained Fairchild Channel F, the 1982 Signetics 2650 console
-      with the 2637 UVI video chip, with a FujiNet built in: browse a network
-      host from the console, boot games and programs over the network, and let
-      a FujiNet program keep talking to the network, all in one application.
+      A self-contained Fairchild Channel F, the 1976 console with the F8
+      microprocessor and the first programmable cartridges, the Videocarts,
+      with a FujiNet built in: browse a network host from the console, boot
+      games and programs over the network, and let a FujiNet program keep
+      talking to the network, all in one application.
     </p>
     <p>
       FujiNet's CONFIG program is built in and starts at power-on, exactly as
-      on the FujiNet Channel F cartridge. Local cartridge images (.bin,
-      .rom, .chf, or a zip holding one) can be opened in its place, or
-      imported to FujiNet's SD folder with Import Cartridge to SD and booted
-      from CONFIG. The console's RESET key restarts whatever the cartridge is
-      serving, and Reset to CONFIG ejects the cartridge and brings CONFIG back.
-      The NTSC console is the one checked against MAME; a PAL clone is also
-      offered (50 Hz), not verified against MAME. The 16-key Palladium is not
-      supported yet.
+      on the FujiNet Channel F cartridge. Local cartridge images (.bin, .chf,
+      or a zip holding one) can be opened in its place, or imported to
+      FujiNet's SD folder with Import Cartridge to SD and booted from CONFIG.
+      The Channel F, the System II and the Saba Videoplay PAL consoles are
+      offered.
     </p>
     <p>
-      The emulator is MAME's Channel F, the Signetics 2650 and the 2637 UVI,
-      transposed to C, with the FujiNet cartridge running the real cartridge
-      firmware's own protocol and page-mapping sources, so it behaves as the
-      hardware does.
+      The emulator is MAME's Channel F and its F8 CPU transposed to C, with the
+      FujiNet cartridge running the real cartridge firmware's own protocol and
+      bus sources, so it behaves as the hardware does.
     </p>
     <p>
-      The Controllers window draws the console with both hand controllers, each
-      with its 12-key keypad, its disc and its side fire button, and the
-      START, OPTION, SELECT and RESET buttons; click and hold to press, drag
-      the disc, and Map rebinds any key, direction or button to a key or a
-      gamepad button. Gamepads are picked up as they are plugged in and out,
-      with an analog disc from the left stick. A native debugger has a command
-      prompt, the 2650's registers and return stack with a memory viewer,
-      disassembly with breakpoints, a Video tab that shows everything the UVI
-      knows (the rendered display with its layers, the four objects with their
-      positions and bitmaps, the character screen with its colour bits, the
-      registers, collisions and the glyph table), the inputs and the beeper,
-      and the FujiNet cartridge with every FujiBus packet on its link.
+      The Controllers window draws both hand controllers with all four of the
+      knob's axes (tilt in eight directions, twist either way, pull up and push
+      down) and the console's RESET, TIME, MODE, HOLD and START buttons; click,
+      drag, scroll to twist, and Map rebinds any of them to a key or a gamepad
+      button. A gamepad's right stick twists and pulls. A native debugger has a
+      command prompt, the F8's registers, scratchpad and K stack with a memory
+      viewer, disassembly with breakpoints, a Video tab that shows the whole
+      128 by 64 video memory with each row's palette, the hidden columns, the
+      four ports and every write, the sound and the controllers, and the
+      FujiNet cartridge with every FujiBus packet on its link. The built-in
+      Help covers all of it.
     </p>
     <p>
-      Nothing copyrighted is included, and the console needs no BIOS: it has
-      none. Game cartridge images are your own to open.
+      Nothing copyrighted is included. FujiNet programs run on the app's own
+      stand-in BIOS; Videocarts need the console's BIOS, which you import from
+      your own dumps.
     </p>
   </description>
   <launchable type="desktop-id">online.fujinet.go.channelf.gnome.desktop</launchable>
@@ -69,7 +66,7 @@
       <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/1_running_config.png</image>
     </screenshot>
     <screenshot>
-      <caption>The built-in debugger's Video tab, showing the UVI's objects</caption>
+      <caption>The built-in debugger's Video tab: the video memory, its palettes and the ports</caption>
       <image>https://raw.githubusercontent.com/FujiNetWIFI/fujinet-go-channelf-desktop/v0.1.0/data/screenshots/2_debugger.png</image>
     </screenshot>
     <screenshot>
@@ -81,15 +78,14 @@
     <!-- The CURRENT release templates its version from @PROJECT_VERSION@, so
          it cannot disagree with the tree; past releases are literal. The
          release job checks that this first entry is still a template. -->
-    <release version="@PROJECT_VERSION@" date="2026-11-02">
+    <release version="@PROJECT_VERSION@" date="2026-11-05">
       <description>
         <p>
           First release: the Fairchild Channel F transposed from MAME, with
-          the FujiNet Channel F cartridge and an in-process FujiNet; a
-          Controllers window with both hand controllers and the console's
-          buttons, hotplugged gamepads with an analog disc, and a native
-          debugger with a full 2637 video tab and a FujiNet tab showing every
-          FujiBus packet.
+          the FujiNet Channel F cartridge and an in-process FujiNet; BIOS
+          import, a Controllers window with both hand controllers' four axes,
+          gamepads, a native debugger with a full Channel F video tab and a
+          FujiNet tab, and built-in Help.
         </p>
       </description>
     </release>

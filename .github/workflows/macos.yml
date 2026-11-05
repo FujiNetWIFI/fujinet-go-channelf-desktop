@@ -65,7 +65,8 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_PREFIX_PATH=/tmp/sdl3-install
+            -DCMAKE_PREFIX_PATH=/tmp/sdl3-install \
+            -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build

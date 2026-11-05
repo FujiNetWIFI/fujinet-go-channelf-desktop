@@ -52,7 +52,7 @@ jobs:
         run: pacman -Q mingw-w64-ucrt-x86_64-sdl3 | grep -qE ' 3\.[0-9]+\.[0-9]+-'
 
       - name: Configure
-        run: cmake -B build -G Ninja
+        run: cmake -B build -G Ninja -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build

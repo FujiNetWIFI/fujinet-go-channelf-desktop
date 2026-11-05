@@ -7,33 +7,42 @@
   <summary>Fairchild Channel F with a built-in FujiNet cartridge</summary>
   <description>
     <p>
-      A self-contained Fairchild Channel F with a FujiNet built in: browse a
-      network host from the console with the CONFIG client, boot cartridges
-      over the network, and let a FujiNet app keep talking to the network
-      once it is running, all in one application.
+      A self-contained Fairchild Channel F, the 1976 console with the F8
+      microprocessor and the first programmable cartridges, the Videocarts,
+      with a FujiNet built in: browse a network host from the console, boot
+      games and programs over the network, and let a FujiNet program keep
+      talking to the network, all in one application.
     </p>
     <p>
-      The machine is MAME's Channel F transposed to C: the Signetics 2650
-      CPU and the 2637 UVI video and sound chip. It is the Emerson Channel F
-      2001 (NTSC), or a PAL clone in the Bandai and Hanimex mould, with the
-      FujiNet cartridge always in the slot. CONFIG is the cartridge's
-      resident image, a game booted over the network runs from the cartridge,
-      and a local cartridge file can be opened in place of CONFIG.
+      FujiNet's CONFIG program is built in and starts at power-on, exactly as
+      on the FujiNet Channel F cartridge. Local cartridge images (.bin, .chf,
+      or a zip holding one) can be opened in its place, or imported to
+      FujiNet's SD folder with Import Cartridge to SD and booted from CONFIG.
+      The Channel F, the System II and the Saba Videoplay PAL consoles are
+      offered.
     </p>
     <p>
-      Both hand controllers are on screen, drawn as they are on the console
-      (the disc, the 12-key keypad and the side fire button, with START,
-      OPTION, SELECT and RESET between them) and remappable; gamepads are
-      picked up as they are plugged in, and a native debugger is a key press
-      away: a command prompt, the 2650's registers and return stack, a
-      memory view and disassembly with breakpoints, every object the UVI
-      draws with its position, the character screen and its registers, the
-      picture as the chip renders it, the cartridge, and the FujiNet traffic.
+      The emulator is MAME's Channel F and its F8 CPU transposed to C, with the
+      FujiNet cartridge running the real cartridge firmware's own protocol and
+      bus sources, so it behaves as the hardware does.
     </p>
     <p>
-      The console has no BIOS, so there is nothing to import. Nothing
-      copyrighted is included: open your own game cartridge images from the
-      application.
+      The Controllers window draws both hand controllers with all four of the
+      knob's axes (tilt in eight directions, twist either way, pull up and push
+      down) and the console's RESET, TIME, MODE, HOLD and START buttons; click,
+      drag, scroll to twist, and Map rebinds any of them to a key or a gamepad
+      button. A gamepad's right stick twists and pulls. A native debugger has a
+      command prompt, the F8's registers, scratchpad and K stack with a memory
+      viewer, disassembly with breakpoints, a Video tab that shows the whole
+      128 by 64 video memory with each row's palette, the hidden columns, the
+      four ports and every write, the sound and the controllers, and the
+      FujiNet cartridge with every FujiBus packet on its link. The built-in
+      Help covers all of it.
+    </p>
+    <p>
+      Nothing copyrighted is included. FujiNet programs run on the app's own
+      stand-in BIOS; Videocarts need the console's BIOS, which you import from
+      your own dumps.
     </p>
   </description>
   <launchable type="desktop-id">online.fujinet.go.channelf.kde.desktop</launchable>
@@ -69,10 +78,14 @@
     <!-- The CURRENT release templates its version from @PROJECT_VERSION@, so
          it cannot disagree with the tree; past releases are literal. The
          release job checks that this first entry is still a template. -->
-    <release version="@PROJECT_VERSION@" date="2026-11-02">
+    <release version="@PROJECT_VERSION@" date="2026-11-05">
       <description>
         <p>
-          First release: the Fairchild Channel F (and a PAL clone) transposed from MAME, with the FujiNet Channel F cartridge and an in-process FujiNet. CONFIG and FujiNet apps boot with no BIOS to import; local game cartridges open in place of CONFIG. Both hand controllers are on screen, and the debugger shows everything the 2637 UVI knows. Needs Qt 6.7 or newer.
+          First release: the Fairchild Channel F transposed from MAME, with
+          the FujiNet Channel F cartridge and an in-process FujiNet; BIOS
+          import, a Controllers window with both hand controllers' four axes,
+          gamepads, a native debugger with a full Channel F video tab and a
+          FujiNet tab, and built-in Help.
         </p>
       </description>
     </release>

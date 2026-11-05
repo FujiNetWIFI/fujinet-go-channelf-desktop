@@ -7,5 +7,5 @@ Exec=fujinet-go-channelf-gnome %f
 Icon=online.fujinet.go.channelf.gnome
 Terminal=false
 Categories=Game;Emulator;
-Keywords=Emerson;Channel F;2650;UVI;FujiNet;emulator;retro;
+Keywords=Fairchild;Channel F;Videocart;F8;FujiNet;emulator;retro;
 StartupNotify=true

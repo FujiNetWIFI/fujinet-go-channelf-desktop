@@ -129,7 +129,8 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_PREFIX_PATH=/tmp/sdl3-install \
             -DCMAKE_INSTALL_PREFIX=/usr \
-            -DFRONTEND=${{ matrix.frontend }}
+            -DFRONTEND=${{ matrix.frontend }} \
+            -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build
@@ -250,7 +251,7 @@ jobs:
           cmake --install sdl3-src/build
 
       - name: Configure
-        run: cmake -B build -G Ninja
+        run: cmake -B build -G Ninja -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build
@@ -395,7 +396,8 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja \
-            -DCMAKE_PREFIX_PATH=/tmp/sdl3-install
+            -DCMAKE_PREFIX_PATH=/tmp/sdl3-install \
+            -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build

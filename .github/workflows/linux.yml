@@ -58,7 +58,8 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_PREFIX_PATH=/tmp/sdl3-install \
-            -DWITH_FUJINET=OFF
+            -DWITH_FUJINET=OFF \
+            -DWITH_CHF_ROMS=OFF
 
       - name: Build
         run: cmake --build build

@@ -46,19 +46,19 @@ set(CHF_FUJI_SOURCES
 # The emulator's own modules. A module that has not landed yet is skipped, so
 # the library builds at every step of the bring-up.
 set(CHF_EMU_SOURCES)
-foreach(_f s2650 dasm2650 uvi sound carts machine fujinet_cart fujitcp_host host)
+foreach(_f f8 dasmf8 video sound carts machine stub fujinet_cart fujitcp_host host)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/${_f}.c")
     list(APPEND CHF_EMU_SOURCES chf/${_f}.c)
   endif()
 endforeach()
 
 # The debugger drives the machine, so it joins once the machine and the
-# debugger's own Channel F port (uviview.c is its marker) exist.
+# debugger's own Channel F port (vidview.c is its marker) exist.
 option(CHF_CORE_ONLY "Build only the emulator and its machine-level tests (no debugger, no session)" OFF)
 set(CHF_DEBUGGER_SOURCES)
 if(NOT CHF_CORE_ONLY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/machine.c"
-   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/debugger/uviview.c")
-  foreach(_f debugger.c expr.c fujitrace.c prompt.c symbols.c symbols_builtin.c uviview.c)
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/debugger/vidview.c")
+  foreach(_f debugger.c expr.c fujitrace.c prompt.c symbols.c symbols_builtin.c vidview.c)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/debugger/${_f}")
       list(APPEND CHF_DEBUGGER_SOURCES debugger/${_f})
     endif()
@@ -73,9 +73,9 @@ set_target_properties(chf_core PROPERTIES
 
 target_include_directories(chf_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/arc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/chf"
   # public because the debugger and the tests read the cart's state through
-  # the staged fuji_mailbox.h, chfmap.h and arcapp.h
+  # the staged fuji_mailbox.h and chfmap.h
   "${FUJI_GEN}")
 target_include_directories(chf_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/debugger")
 

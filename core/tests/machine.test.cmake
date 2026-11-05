@@ -2,12 +2,6 @@
 # that is ours (tools/ab/): built, not registered.
 chf_test(chf_headless chf_headless.c)
 
-# The 2637 UVI on its own: characters, colour bits, multicolour, UDCs, 8x16
-# rows, refresh mode, scroll, block graphics, objects, collisions, SENSE, the
-# pots, and the debugger's views, pixel by pixel.
-chf_test(uvi_test uvi_test.c)
-add_test(NAME uvi COMMAND uvi_test)
-
 # The whole machine, no host thread: the memory map, SENSE, the line timer, the
 # keypads and the fire wire, the pots, the beeper, RESET.
 chf_test(machine_test machine_test.c)

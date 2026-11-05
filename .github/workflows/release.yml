@@ -23,9 +23,9 @@ name: Release
 # downloaded build's About box can never disagree with the download it came
 # from. The check-version job below enforces that.
 #
-# Nothing copyrighted is embedded in any artifact (the Channel F has no
-# BIOS; games are the user's own files), and the no_embedded_roms ctests run
-# against each frontend binary (see COMPLIANCE.md).
+# Nothing copyrighted is embedded in any artifact (the BIOS is the user's own
+# import, WITH_CHF_ROMS stays OFF; games are the user's own files), and the
+# no_embedded_roms ctests run against each frontend binary (see COMPLIANCE.md).
 
 on:
   push:

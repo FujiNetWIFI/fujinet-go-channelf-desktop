@@ -2,9 +2,9 @@ name: Linux
 
 # Builds both frontends (GNOME + KDE) and runs the full test suite.
 #
-# Nothing copyrighted is embedded (the Channel F has no BIOS; games are the
+# Nothing copyrighted is embedded (the BIOS is the user's import; games are the
 # user's own files; see COMPLIANCE.md). The tests build the images they need
-# themselves, and the ones that need a commercial cartridge skip.
+# themselves, and the ones that need the BIOS or a commercial cartridge skip.
 #
 # WITH_FUJINET=OFF here to keep the test job fast and self-contained: the
 # emulator, both frontends and every test build and run without the FujiNet

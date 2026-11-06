@@ -1,6 +1,6 @@
 /*
  * debugger_internal -- the engine's side of the session glue, the prompt's
- * view of the engine, and what debugger.c shares with uviview.c. Not
+ * view of the engine, and what debugger.c shares with vidview.c. Not
  * installed.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -43,17 +43,37 @@ int chfdebug_eval(chfdebug *d, const char *text, long *out, char *err, int errsz
 void chfdebug_step_n(chfdebug *d, int n);
 /* Register names the evaluator knows, for completion. */
 extern const char *const chfdebug_reg_names[];
+/* The ROMC stream (`romc on|off|n`): the last n bus cycles, newest last. */
+typedef struct {
+    uint64_t cycles;
+    uint16_t pc0;
+    uint8_t romc, dbus;
+} chfdebug_romc;
+void chfdebug_romc_enable(chfdebug *d, int on);
+int  chfdebug_romc_enabled(chfdebug *d);
+int  chfdebug_romc_read(chfdebug *d, chfdebug_romc *out, int max);
 
 /* The running machine, or NULL when the host is not running. Every use is
  * under chf_host_lock (or on the machine thread). */
 chf_machine_t *chfdebug_machine(void);
-/* Where the beam is: the UVI's line and the pixel in it. */
-void chfdebug_beam(chf_machine_t *m, int *vpos, int *hpos);
+/* The instruction about to run (the CPU has fetched its opcode: PC0 - 1). */
+uint16_t chfdebug_machine_pc(const chf_machine_t *m);
 
-/* uviview.c: the prompt's views of the chip. Each takes the host lock. */
-int chfdebug_text_uvi(char *dst, int dstsz);
-int chfdebug_text_objects(char *dst, int dstsz);
-int chfdebug_text_screen(char *dst, int dstsz);
+/* vidview.c: the prompt's views of the chip and the console. Each takes the
+ * host lock. */
+int chfdebug_text_ports(char *dst, int dstsz);
+int chfdebug_text_video(char *dst, int dstsz);
+int chfdebug_text_pal(char *dst, int dstsz);
+int chfdebug_text_sound(chfdebug *d, char *dst, int dstsz);
+int chfdebug_text_input(char *dst, int dstsz);
+/* `vram [row]`: one row of values with its palette, or the visible picture. */
+int chfdebug_text_vram(int row, char *dst, int dstsz);
+int chfdebug_text_scratch(char *dst, int dstsz);
+int chfdebug_text_kstack(char *dst, int dstsz);
+int chfdebug_text_bios(char *dst, int dstsz);
+/* Fix up the newest VRAM-log entry and its cell with the PC of the instruction
+ * (the machine logs PC0 - 1, one short for a two-byte OUT). Under the run lock. */
+void chfdebug_vram_log_fix_pc(chf_machine_t *m, unsigned offs, uint16_t pc);
 
 #ifdef __cplusplus
 }

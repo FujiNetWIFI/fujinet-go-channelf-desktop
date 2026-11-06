@@ -105,7 +105,7 @@ static long number(parser *ps)
     return v;
 }
 
-/* After the opening bracket: expr ] and the read. */
+/* After the opening bracket: expr ] and the read. space is a chfdebug_space. */
 static long mem_read(parser *ps, int space)
 {
     long a = expr_or(ps);
@@ -138,18 +138,36 @@ static long primary(parser *ps)
         while (is_name_char(*ps->p) && n + 1 < (int)sizeof name)
             name[n++] = *ps->p++;
         name[n] = '\0';
-        /* p[..], u[..], c[..]: a byte of PROG, UVI or CART space */
-        if (*ps->p == '[' && n == 1 && strchr("pucPUC", name[0]))
+        /* p[..] s[..] v[..] c[..] io[..]: a byte of one of the five spaces */
+        if (*ps->p == '[')
         {
-            int space = 0;
-            switch (name[0] | 0x20)
+            int space = -1;
+            if (n == 1)
+                switch (name[0] | 0x20)
+                {
+                case 'p': space = 0; break;
+                case 's': space = 1; break;
+                case 'v': space = 2; break;
+                case 'c': space = 3; break;
+                default:  break;
+                }
+            else if (n == 2 && (name[0] | 0x20) == 'i' && (name[1] | 0x20) == 'o')
+                space = 4;
+            if (space >= 0)
             {
-            case 'u': space = 1; break;
-            case 'c': space = 2; break;
-            default:  break;
+                ps->p++;
+                return mem_read(ps, space);
             }
-            ps->p++;
-            return mem_read(ps, space);
+        }
+        /* o17: an octal number (a bare `o` is the overflow flag) */
+        if (n >= 2 && (name[0] | 0x20) == 'o')
+        {
+            int digits = 1;
+            for (int i = 1; i < n; i++)
+                if (name[i] < '0' || name[i] > '7')
+                    digits = 0;
+            if (digits)
+                return strtol(name + 1, NULL, 8);
         }
         if (!ps->ctx)
             return 0;

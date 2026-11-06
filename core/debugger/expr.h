@@ -2,12 +2,14 @@
  * expr -- the debugger's expression evaluator: breakpoint conditions,
  * print, set, and every address argument the prompt takes.
  *
- *   numbers     $C000  0xC000  C000h  49152  %1010
+ *   numbers     $C000  0xC000  0C000h  49152  %1010  o17 (octal)
  *   names       whatever the context resolves: registers, flags, labels,
- *               vpos/hpos/frame/cycles, and value/addr in a condition
+ *               vpos/hpos/frame/cycles, and value/addr (row/col, port) in a
+ *               breakpoint condition
  *   memory      [expr] a PROG-space byte, and one per address space:
- *               p[expr] PROG, u[expr] the UVI's registers (offset from
- *               $1800), c[expr] the cartridge's image -- all side-effect free
+ *               p[expr] PROG, s[expr] the scratchpad, v[expr] the VRAM
+ *               (row * 128 + col), c[expr] the cartridge's memory, io[expr]
+ *               a port -- all side-effect free
  *   operators   C's, with C's precedence: unary - ! ~, * / %, + -, << >>,
  *               < <= > >=, == !=, &, ^, |, &&, ||
  *
@@ -28,7 +30,7 @@ typedef struct {
     /* A name to a value; return 1 if known. */
     int (*name)(void *user, const char *name, long *out);
     /* A byte of memory, without side effects. space is the chfdebug_space
-     * (0 PROG, 1 UVI, 2 CART). */
+     * (0 PROG, 1 SCRATCH, 2 VRAM, 3 CART, 4 IO). */
     uint8_t (*read8)(void *user, int space, uint32_t addr);
     void *user;
 } expr_ctx;

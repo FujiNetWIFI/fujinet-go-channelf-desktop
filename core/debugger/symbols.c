@@ -11,7 +11,6 @@
 #include <string.h>
 
 #include "symbols.h"
-#include "chfmap.h"
 #include "fuji_mailbox.h"
 
 void symtab_init(symtab *t)
@@ -117,6 +116,8 @@ static const sym_entry *best_at(symtab *t, int i, uint16_t addr, int bank)
     for (; i < t->n && t->v[i].addr == addr; i++)
     {
         const sym_entry *e = &t->v[i];
+        if (e->bank == SYM_BANK_PORT)
+            continue;
         if (e->bank == SYM_BANK_ANY)
         {
             if (!any)
@@ -178,6 +179,14 @@ int symtab_find(symtab *t, const char *name)
     return -1;
 }
 
+const char *symtab_port_name(symtab *t, unsigned port)
+{
+    for (int i = 0; i < t->n; i++)
+        if (t->v[i].bank == SYM_BANK_PORT && t->v[i].addr == port)
+            return t->v[i].name;
+    return NULL;
+}
+
 const char *symtab_name_at(symtab *t, int i)
 {
     return (i >= 0 && i < t->n) ? t->v[i].name : NULL;
@@ -206,16 +215,12 @@ static int is_ident(const char *s)
     return 1;
 }
 
-/* A value that may be banked: up to $FFFF is an address; above, the bank
- * is the high part (z88dk and SDCC banked builds). */
+/* The F8 addresses 64K: a larger value is a constant, not an address. */
 static void add_value(symtab *t, unsigned long long v, const char *name, int *count)
 {
-    if (v > 0xFFFFFFull)
-        return;   /* a constant, not an address */
-    if (v > 0xFFFF)
-        symtab_add(t, (uint16_t)(v & 0xFFFF), (int)(v >> 16), name, 0);
-    else
-        symtab_add(t, (uint16_t)v, SYM_BANK_ANY, name, 0);
+    if (v > 0xFFFFull)
+        return;
+    symtab_add(t, (uint16_t)v, SYM_BANK_ANY, name, 0);
     (*count)++;
 }
 
@@ -383,35 +388,32 @@ int symtab_load(symtab *t, const char *path, char *msg, int msgsz)
     return count;
 }
 
-/* ---- the mailbox hotspots ---- */
+/* ---- the mailbox ranges ---- */
 
 const char *chf_mailbox_name(uint16_t addr)
 {
     static char buf[32];
-    /* the cartridge sees the address through chfmap: $2D00 is image $1D00 */
-    int img;
-    unsigned off;
 
-    if (addr < 0x2b00 || addr > 0x2fff)
+    if (addr < FN_ARENA_BASE + FN_RAM_TOP)
         return NULL;
-    img = chfmap_decode(addr & 0x3fff);
-    if (img < 0)
-        return NULL;
-    off = (unsigned)img;
-    if (off >= FN_R_DATA && off < FN_R_DATA + FN_R_SLICE_LEN)
-        snprintf(buf, sizeof buf, "FN_R_DATA+%02X", off - FN_R_DATA);
-    else if (off >= FN_H_REGSEL && off < FN_H_REGSEL + 0x80)
-        snprintf(buf, sizeof buf, "FN_H_REGSEL+%02X", off - FN_H_REGSEL);
-    else if (off >= FN_H_REGSEL + FN_HOT_BANK && off <= FN_H_REGSEL + FN_HOT_BANK_LAST)
-        snprintf(buf, sizeof buf, "FN_HOT_BANK+%02X", off - FN_H_REGSEL - FN_HOT_BANK);
-    else if (off == FN_H_REGSEL + FN_HOT_SWAP)
-        return "FN_HOT_SWAP";
-    else if (off >= FN_H_REGSEL && off < FN_H_REGSEL + 0x100)
-        snprintf(buf, sizeof buf, "FN_H_REGSEL+%02X", off - FN_H_REGSEL);
-    else if (off >= FN_H_REGDATA && off < FN_H_REGDATA + 0x100)
-        snprintf(buf, sizeof buf, "FN_H_REGDATA+%02X", off - FN_H_REGDATA);
-    else if (off >= FN_H_DATA && off < FN_H_DATA + 0x100)
-        snprintf(buf, sizeof buf, "FN_H_DATA+%02X", off - FN_H_DATA);
+    if (addr >= FN_ARENA_BASE + FN_R_DATA && addr < FN_ARENA_BASE + FN_R_DATA + FN_R_SLICE_LEN)
+        snprintf(buf, sizeof buf, "REPLY+%04X", addr - (FN_ARENA_BASE + FN_R_DATA));
+    else if (addr >= FN_ARENA_BASE + FN_R_BASE && addr < FN_ARENA_BASE + FN_H_REGSEL)
+        snprintf(buf, sizeof buf, "STATUS_PAGE+%02X", addr - (FN_ARENA_BASE + FN_R_BASE));
+    else if (addr >= FN_ARENA_BASE + FN_H_REGSEL && addr < FN_ARENA_BASE + FN_H_REGSEL + FN_HOT_BANK)
+        snprintf(buf, sizeof buf, "REGSEL+%02X", addr - (FN_ARENA_BASE + FN_H_REGSEL));
+    else if (addr >= FN_ARENA_BASE + FN_H_REGSEL + FN_HOT_BANK &&
+             addr <= FN_ARENA_BASE + FN_H_REGSEL + FN_HOT_BANK_LAST)
+        snprintf(buf, sizeof buf, "APPBANK_SEL+%02X",
+                 addr - (FN_ARENA_BASE + FN_H_REGSEL + FN_HOT_BANK));
+    else if (addr == FN_ARENA_BASE + FN_H_REGSEL + FN_HOT_SWAP)
+        return "SWAP";
+    else if (addr >= FN_ARENA_BASE + FN_H_REGSEL && addr < FN_ARENA_BASE + FN_H_REGSEL + 0x100)
+        snprintf(buf, sizeof buf, "REGSEL+%02X", addr - (FN_ARENA_BASE + FN_H_REGSEL));
+    else if (addr >= FN_ARENA_BASE + FN_H_REGDATA && addr < FN_ARENA_BASE + FN_H_REGDATA + 0x100)
+        snprintf(buf, sizeof buf, "REGDATA+%02X", addr - (FN_ARENA_BASE + FN_H_REGDATA));
+    else if (addr >= FN_ARENA_BASE + FN_H_DATA)
+        snprintf(buf, sizeof buf, "TXDATA+%02X", addr - (FN_ARENA_BASE + FN_H_DATA));
     else
         return NULL;
     return buf;

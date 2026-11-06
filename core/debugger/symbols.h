@@ -1,11 +1,14 @@
 /*
- * symbols -- the debugger's label tables: built-in names for the 2650's
- * reset vector, the UVI's registers and the FujiNet cartridge's mailbox,
- * plus whatever symbol files the user loads.
+ * symbols -- the debugger's label tables: built-in names for the BIOS's
+ * four entry points, the cartridge's signature, entry and APPBANK window, the
+ * Videocart RAM and bank latch and the FujiNet cartridge's mailbox, the
+ * console's port names, plus whatever symbol files the user loads.
  *
- * Labels name PROG addresses (15 bits). A label belongs to an address, not to
+ * Labels name PROG addresses (16 bits). A label belongs to an address, not to
  * a bank: every label matches any bank. The bank field stays (the family's
- * table format, and a WLA-DX "BB:AAAA" file still reads).
+ * table format, and a WLA-DX "BB:AAAA" file still reads). An entry whose bank
+ * is SYM_BANK_PORT names an I/O PORT (0-255), not a PROG address: it resolves
+ * by name (`bpo ROW_SOUND`, `print PANEL`) but never labels a disassembly line.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -22,6 +25,7 @@ extern "C" {
 
 #define SYM_NAME_MAX 48
 #define SYM_BANK_ANY (-1)
+#define SYM_BANK_PORT (-2)
 
 typedef struct {
     uint16_t addr;
@@ -59,10 +63,14 @@ int  symtab_load(symtab *t, const char *path, char *msg, int msgsz);
 /* For completion: the i-th label name, NULL past the end. */
 const char *symtab_name_at(symtab *t, int i);
 
+/* The name of an I/O port (the first one given it), or NULL. */
+const char *symtab_port_name(symtab *t, unsigned port);
+
 /* The name of a console address inside the FujiNet cartridge's mailbox
- * ($2B00-$2FFF) that the plain labels do not cover -- the hotspot ranges
- * ("FN_H_REGSEL+05", "FN_HOT_BANK+03") -- or NULL. The returned text is in a
- * static buffer, valid until the next call. */
+ * ($F800-$FFFF) that the plain labels do not cover -- the reply window, the
+ * register and page-select hotspots and the TX page ("REPLY+0010",
+ * "REGSEL+05", "APPBANK_SEL+03", "TXDATA+7F") -- or NULL. The returned text
+ * is in a static buffer, valid until the next call. */
 const char *chf_mailbox_name(uint16_t addr);
 
 /* symbols_builtin.c */

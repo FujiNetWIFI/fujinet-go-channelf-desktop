@@ -36,10 +36,10 @@ find_package(Git QUIET)
 # protocol 2 (APPBANK pages and the 60 Hz tick, #1988) and the real CONFIG
 # (fujinet-config channelf/) baked into pico/channelf/firmware/baked/. Until
 # that bake merges this is its branch on tschak909's fork, channelf-bake-config
-# (master 9a547fbd9 + the bake + its re-bake); never delete the branch before the re-pin.
+# (master 9a547fbd9 + the bake and its re-bakes); never delete the branch before the re-pin.
 # Recorded in three places -- here and in both flatpak manifests
 # (build-aux/flatpak/*.yml).
-set(FUJINET_COMMIT "356b0d65b1c548cddcb333cf5864669cd14d4bcb")
+set(FUJINET_COMMIT "31f38886f3d3323aa71e8e102659bebb5b5c499d")
 set(FUJINET_URL "https://github.com/tschak909/fujinet-firmware")
 
 # chf_provide_dependency(NAME <n> PATH <p> SENTINEL <file> OVERRIDE <VAR>

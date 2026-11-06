@@ -1,20 +1,28 @@
 # chf_core: the toolkit-agnostic, SDL-free Fairchild Channel F core.
 #
-#   chf/                the emulator: MAME's Channel F driver, the
-#                      Signetics 2650 and its disassembler, the 2637 UVI
-#                      (video, pots, beeper) and the cart mappers transposed
-#                      to C; the paced host thread and the FujiNet cartridge
-#                      device. There is no BIOS and no character ROM to
-#                      import: the glyph table is MAME's source.
+#   chf/                the emulator, MAME's Channel F driver transposed to C:
+#                      f8 and dasmf8 (the Fairchild F8 / F3850 CPU, ROMC state
+#                      by ROMC state, and its disassembler), video (the 128 x 64
+#                      VRAM, the four port latches, the per-row palettes and the
+#                      picture), sound (the DDS tone), carts (the Videocart
+#                      mappers: standard, Maze and Hangman with their 2102 RAM,
+#                      Schach and the multicarts; the type of a plain image from
+#                      the hashes in the generated carts_table.h), machine (the
+#                      memory map, the ports, the panel and controllers, the
+#                      vertical blank, the slot), stub (the app's own stand-in
+#                      for the console's BIOS) and the paced host thread. There
+#                      is no BIOS or ROM to ship: CONFIG and the FujiNet apps run
+#                      on the stand-in, and the user's own BIOS, imported, runs
+#                      the Videocarts.
 #
 #   chf/fuji-generated/ the cartridge firmware's OWN sources -- fujimail.c
-#                      (the mailbox), chfmap.c (the image planner), arcapp.h
-#                      (APPBANK serving), fujibus.c (the SLIP + FujiBus wire
-#                      codec) and the baked CONFIG client -- staged by
-#                      cmake/StageFujiProto.cmake. Compiling these rather
-#                      than reimplementing them is what makes the emulated
-#                      cartridge and the real RP2040 one identical by
-#                      construction.
+#                      (the mailbox), chfmap.c (the image planner), fujibus.c
+#                      (the SLIP + FujiBus wire codec), channelf_cart.h (the bus
+#                      decode, chf_read / chf_write), fuji_mailbox.h and the
+#                      baked CONFIG client -- staged by
+#                      cmake/StageFujiProto.cmake. Compiling these rather than
+#                      reimplementing them is what makes the emulated cartridge
+#                      and the real RP2040 one identical by construction.
 #
 #   debugger/          the debugger engine (core/include/chfdebug.h).
 #
@@ -44,13 +52,17 @@ set(CHF_FUJI_SOURCES
   ${FUJI_GEN}/chfmap.c)
 
 # The emulator's own modules. A module that has not landed yet is skipped, so
-# the library builds at every step of the bring-up.
+# the library builds at every step of the bring-up. Until stub.c (the stand-in
+# BIOS) exists, stub_placeholder.c supplies an image that only parks the machine.
 set(CHF_EMU_SOURCES)
 foreach(_f f8 dasmf8 video sound carts machine stub fujinet_cart fujitcp_host host)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/${_f}.c")
     list(APPEND CHF_EMU_SOURCES chf/${_f}.c)
   endif()
 endforeach()
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/stub.c")
+  list(APPEND CHF_EMU_SOURCES chf/stub_placeholder.c)
+endif()
 
 # The debugger drives the machine, so it joins once the machine and the
 # debugger's own Channel F port (vidview.c is its marker) exist.
@@ -67,6 +79,13 @@ endif()
 
 add_library(chf_core STATIC
   ${CHF_EMU_SOURCES} ${CHF_FUJI_SOURCES} ${CHF_DEBUGGER_SOURCES})
+# Development only: a stand-in for the debugger engine while it is written,
+# so the session and the frontends link. Never set when debugger/ builds.
+set(CHF_DEBUG_SHIM "" CACHE FILEPATH "A debugger stand-in source (development only)")
+if(CHF_DEBUG_SHIM AND NOT CHF_DEBUGGER_SOURCES)
+  target_sources(chf_core PRIVATE "${CHF_DEBUG_SHIM}")
+  target_include_directories(chf_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/debugger")
+endif()
 set_target_properties(chf_core PROPERTIES
   C_STANDARD 11
   POSITION_INDEPENDENT_CODE ON)

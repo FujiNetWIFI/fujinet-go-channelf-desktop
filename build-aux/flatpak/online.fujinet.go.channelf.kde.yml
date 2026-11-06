@@ -115,7 +115,7 @@ modules:
       # skips its own fetch once it finds build.sh (the SENTINEL) already here.
       - type: git
         url: https://github.com/tschak909/fujinet-firmware.git
-        commit: 945f9009d12ad84086a97d3714b0e8555704dc15
+        commit: 356b0d65b1c548cddcb333cf5864669cd14d4bcb
         dest: third_party/fujinet-firmware
       # Same reasoning: the sandboxed build step has no network access, but
       # tools/fujinet/build-fujinet-desktop.sh needs mbedTLS 3.x and

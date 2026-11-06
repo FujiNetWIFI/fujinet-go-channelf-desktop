@@ -34,11 +34,18 @@ endif()
 set(FRONTEND "all" CACHE STRING
     "Frontend to build: gnome, kde, macos, windows, all, none")
 
-# There is no console BIOS to ship or import (the Channel F has none), and
-# the games are the user's own cartridge files, opened from disk. Nothing
-# copyrighted is embedded in any build; core/tests/no_embedded_roms.py checks
-# the shipped binaries against the games a developer keeps in tools/roms/ (it
-# SKIPs when there are none, as in CI). See COMPLIANCE.md.
+# The console's BIOS is never shipped: FujiNet's programs run on the app's
+# own stand-in (core/chf/stub.asm) and the user imports the real one for
+# Videocarts ("Import BIOS..."). WITH_CHF_ROMS:
+#   OFF (default) -- nothing copyrighted is embedded. Every artifact this
+#                    repository publishes is built this way, and
+#                    core/tests/no_embedded_roms.py checks the claim against
+#                    the shipped binaries with a developer's own dumps in
+#                    tools/roms/local (it SKIPs when there are none, as in CI).
+#   ON            -- embed the BIOS found in tools/roms/local so a development
+#                    build has it from the first start. NOT for redistribution.
+# See COMPLIANCE.md.
+option(WITH_CHF_ROMS "Embed the Channel F BIOS found in tools/roms/local (see COMPLIANCE.md)" OFF)
 
 # Included here, at the top of the tree, so every subdirectory sees the
 # *variables* it defines: GNUInstallDirs caches CMAKE_INSTALL_DATADIR as an
@@ -98,7 +105,7 @@ endif()
 # Registered at the top level rather than in core/ so it can be pointed at the
 # frontend executables: those are the artifacts a user actually downloads, and
 # they link differently from the test binaries.
-if(TRUE)
+if(NOT WITH_CHF_ROMS)
   find_package(Python3 COMPONENTS Interpreter)
   set(CHF_ROM_CHECK_TARGETS "")
   if(TARGET boot_smoke)
@@ -115,7 +122,7 @@ if(TRUE)
                COMMAND "${Python3_EXECUTABLE}"
                        "${CMAKE_SOURCE_DIR}/core/tests/no_embedded_roms.py"
                        "$<TARGET_FILE:${_t}>"
-                       "${CMAKE_SOURCE_DIR}/tools/roms")
+                       "${CMAKE_SOURCE_DIR}/tools/roms/local")
       # SKIPs (ctest 77) rather than fails when tools/roms has no real ROM to
       # probe with -- true of every CI/release checkout.
       set_tests_properties(no_embedded_roms_${_t} PROPERTIES SKIP_RETURN_CODE 77)

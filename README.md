@@ -1,75 +1,68 @@
 # FujiNet Go Channel F Desktop
 
 A native desktop emulator of the **Fairchild Channel F** with FujiNet built
-in: boot the FujiNet CONFIG, browse a network host with the disc and keypad,
+in: boot the FujiNet CONFIG, browse a network host with the hand controller,
 load games and FujiNet apps over the network, play them. Part of the FujiNet
 Go desktop family (Linux GNOME and KDE, Windows, macOS).
 
 | | |
 |---|---|
-| **Emulator** | MAME's Channel F driver, its Signetics 2650 and its 2637 UVI video and sound chip, transposed to C (the Studio II and O2 siblings' way). The 2650 runs one instruction at a time and the UVI draws lazily, so the core uses a small fraction of one CPU core. |
-| **Machines** | Channel F (NTSC, 60 Hz, 262 lines) and a PAL clone row (50 Hz, 312 lines, 4.433619/5 MHz; **not verified against MAME**, which runs every clone at NTSC). Two hand controllers: 12-key keypad, disc and side fire each, plus the console's START, OPTION, SELECT and RESET. |
-| **No BIOS, no ROMs to import** | The Channel F has no BIOS and the character set is part of the UVI source, so nothing but your games is needed. CONFIG and every FujiNet app run as they are. |
-| **Cartridge** | The FujiNet Channel F cartridge (`fujinet-firmware` `pico/channelf`): the 8K program window, up to 70K of paged app image (APPBANK), 1K of cart RAM, a 60 Hz tick, the mailbox at `$2B00-$2FFF`, and CONFIG baked in. Its mailbox service (`fujimail`), connector decode (`chfmap`), APPBANK serving (`arcapp`) and wire codec (`fujibus`) are the cartridge firmware's own sources, staged verbatim. A game opened from disk gets its own mapper cartridge instead (standard 4K/8K, Golf), as a real console would have it. |
-| **Frontends** | GNOME (GTK4/libadwaita), KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32/D3D11) — each with the display, a Controllers window, Preferences, a live FujiNet console log, and a debugger. |
-| **Packages** | Linux: Flatpak (GNOME and KDE runtimes), DEB, RPM, tar.gz. Windows: ZIP and an NSIS installer. macOS: signed/notarised zips (unsigned without secrets). |
+| **Emulator** | MAME's Channel F driver (`channelf.cpp`, its video and sound) and its F8 CPU, transposed to C (the Arcadia, O2 and Studio II siblings' way). The F8 is ROMC-faithful: one function per bus state, the firmware's own ROMC decoder shadows it cycle for cycle in the tests. |
+| **Machines** | Channel F (1976, NTSC), Channel F System II (NTSC), Saba Videoplay and Saba Videoplay 2 / Luxor (PAL, 50 Hz), all checked against MAME. Two hand controllers, each a knob with four axes (tilt eight ways, twist, pull, push), and the console's RESET, TIME, MODE, HOLD and START. |
+| **BIOS** | None ships. FujiNet's CONFIG and every FujiNet app run on the app's own stand-in BIOS, written from a behavioural specification (`tools/stub/SPEC.md`). Videocarts need the console's BIOS: **Import BIOS…** takes your own `sl31253.rom` / `sl90025.rom` / `sl31254.rom`, a zip such as MAME's `channelf.zip`, or a folder. |
+| **Cartridge** | The FujiNet Channel F cartridge (`fujinet-firmware` `pico/channelf`): a peer on the F8 bus with the 16K window at `$0800`, up to six 8K APPBANK pages at `$4800`, 30K of RAM at `$8000`, a 60 Hz tick and the mailbox at `$F800-$FFFF`, with CONFIG baked in. Its bus decode (`channelf_cart.h`), image planner (`chfmap`), mailbox service (`fujimail`) and wire codec (`fujibus`) are the cartridge firmware's own sources, staged verbatim. A Videocart opened from disk gets its own cartridge instead (std, maze, hangman, chess, multi), as a real console would have it. |
+| **Frontends** | GNOME (GTK4/libadwaita), KDE (Qt6 Widgets), macOS (AppKit), Windows (Win32/D3D11), each with the display, a Controllers window, Preferences, BIOS import, a live FujiNet console log, built-in Help and a debugger. |
+| **Packages** | Linux: Flatpak (GNOME and KDE runtimes), DEB, RPM, tar.gz. Windows: ZIP and an NSIS installer. macOS: zips for Apple Silicon and Intel. |
 
-The icon is the family mark in the console's own colours, sampled from the
-photograph: charcoal case (`#2D2928`), keypad and disc gold (`#F2C300`) and
-the wood-grain strip's brown (`#5B3B26`) for the centre disc. The UI accent is
-the gold (dark variant `#8A6D00` on light themes), marking held keys, the Map
-target, the current line in the disassembly and the status dot.
+The icon is the family mark in the console's colours: a Videocart-yellow tile
+(`#F2C300`), the case's charcoal (`#302F2F`) for the mark and the walnut trim
+(`#6E4A30`) for the centre disc. The UI accent is the Videocart yellow with
+dark text on it (dark variant `#8A6D00` on light themes).
 
 ## Your games
 
-Open a cartridge with **File ▸ Open cartridge…** (or drop it on the window):
-a `.bin`, `.rom` or `.chf` image of up to 8 KB, or a `.zip` holding one.
-A FujiNet app (an image that claims the mailbox) runs on the FujiNet
-cartridge; any other image gets the mapper a real cartridge would have, and
-FujiNet is not reachable until the next power cycle. Nothing copyrighted is
-embedded in any build: see `COMPLIANCE.md`. The **Palladium Video-Computer-Game**
-(16 keys) is not emulated, as MAME marks it not working.
+Open a cartridge with **Machine ▸ Open Cartridge…** (or drop it on the
+window): a `.bin` or `.chf` image, or a `.zip` holding one. A FujiNet app (a
+16K image with the `FUJI` claim at `$47FC`) runs on the FujiNet cartridge; a
+Videocart gets the cartridge MAME's software list gives it, and needs the
+imported BIOS. **Import Cartridge to SD…** copies an image into FujiNet's SD
+folder for CONFIG to boot; Videocarts with their own RAM or banking (Maze,
+Hangman, Chess, the multicarts) cannot run through the FujiNet cartridge and
+are refused with the reason. Nothing copyrighted is embedded in any build:
+see `COMPLIANCE.md`.
 
-## Controllers window (F9)
+## Controllers (F9)
 
-A fixed-size floating window drawn like the console: two hand controllers with
-the **12-key keypad** (1-9, CLEAR, 0, ENTER), the **disc** and the side fire
-button, and the panel's START, OPTION, SELECT and the red RESET. Click a key to
-press it, drag the disc to steer it (the pots follow the pointer, analog); held keys light up in the accent colour
-whoever holds them. **Map** rebinds any key, disc direction or fire to a host
-key or a gamepad button (a key moves to its new target and leaves its old
-one), **Defaults** puts them back. Fire is the keypad's `2` wire, as on the
-hardware.
+The Controllers window floats at a fixed size and draws both hand controllers
+from above (the knob in a ring of eight direction wedges, the twist arrows
+either side) and from the side (PULL and PUSH), and the console's buttons.
+Drag from the knob to tilt it, press it to push, right-press to pull, use the
+wheel to twist. Held controls light up whoever holds them.
 
-| | Default |
-|---|---|
-| Player 1 keypad | `1`-`9`, **Backspace** = CLEAR, `0`, **Enter** = ENTER |
-| Player 1 disc | arrow keys, **Right Ctrl** = fire |
-| Player 2 keypad | `Q W E` / `A S D` / `Z X C` / `V B N` |
-| Player 2 disc | keypad **8 4 6 2**, keypad **0** = fire |
-| START / OPTION / SELECT | F2 / F3 / F4 |
-| Gamepads | the left stick drives the disc **proportionally** (Preferences ▸ analog stick; off = eight-way switch), D-pad = directions, South = fire, Start = START, X = OPTION, Back = SELECT |
-| RESET / Reset to CONFIG | **F1** / **Escape** |
-| Controllers / Fullscreen / Debugger | F9 / F11 / F12 (debugger: F5 run/stop, F7 step, F8 step over, Shift+F8 step out) |
+| | Player 1 (right controller) | Player 2 (left controller) |
+|---|---|---|
+| Stick | arrow keys | keypad 8 2 4 6 |
+| Twist counter-clockwise / clockwise | Z / X | keypad 7 / 9 |
+| Pull / push | C / Space | keypad . / keypad 0 |
+| Gamepad | D-pad or left stick = stick, shoulders = twist, East = pull, South = push; the right stick twists (x) and pulls/pushes (y) | the second pad, the same |
 
-RESET holds the 2650's reset line only, as the console's button does, so a
-running FujiNet app restarts from the cartridge's current image; **Reset to
-CONFIG** is the power cycle.
+The console's 1 TIME, 2 MODE, 3 HOLD and 4 START are the keys 1-4 (gamepad
+West, Back, North, Start); RESET is **F1** and Reset to CONFIG **Escape**.
+RESET resets the F8 only, as the console's button does, so a running FujiNet
+app restarts from the cartridge's current image with its RAM; **Reset to
+CONFIG** is the power cycle. Every control can be given another key or button.
 
 ## Debugger (F12)
 
-Prompt · CPU & RAM · Disassembly · **Video (the 2637 UVI)** · Sound & I/O ·
-Breakpoints · Cart · FujiNet. The CPU tab shows R0, R1-R3 in both register
-banks, PSU and PSL decoded flag by flag, the 15-bit IAR and the 8-deep return
-stack; breakpoints are on execution, read and write, with step, step over and
-step out. The Video tab shows the rendered display (live frame, re-rendered
-from the registers, or the frame in progress up to the beam) with the
-background and the four objects switchable and boxed; every object with its
-position, size, glyph and colour and a rendered bitmap; the 16×13 / 16×26
-character screen with its colour bits; the user-defined characters; every
-register decoded and editable; collisions; and the font and palette sheets.
-The FujiNet tab decodes the cartridge's FujiBus traffic from the moment the
-app starts.
+Prompt · CPU & RAM · Disassembly · **Video** · Sound & I/O · Breakpoints ·
+Cart · FujiNet. The CPU tab shows A, W flag by flag, ISAR in octal, PC0, PC1,
+DC0, DC1, J/H/K/Q, the 64-byte scratchpad as an octal grid and the BIOS's K
+stack. The Video tab shows the whole 128 × 64 video memory with its hidden
+columns, each row's palette from columns 125/126, the palette table, the four
+ports raw and decoded, every VRAM write (cell, value, PC, frame, line), a
+cell's history under the pointer, and a beam view that shows what a CRT draws
+mid-frame. Breakpoints are on execution, memory read and write, port in and
+out, VRAM cells and scratchpad registers, with conditions.
 
 ## External FujiNet
 
@@ -85,39 +78,35 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-fujinet-firmware is fetched at its pinned commit by the configure step — a
-plain `git clone` with no `--recurse-submodules` is enough. To develop against
-a working checkout of the cartridge firmware (use an absolute path):
+fujinet-firmware is fetched at its pinned commit by the configure step, so a
+plain `git clone` is enough. To develop against a working checkout of the
+cartridge firmware (absolute path):
 
 ```sh
 cmake -B build -DFUJINET_SRC=$HOME/Workspace/fujinet-firmware
 ```
 
 `-DFRONTEND=none` builds just the core, the session and the tests;
-`-DARC_CORE_ONLY=ON` builds only the core and its tests (no SDL3);
+`-DCHF_CORE_ONLY=ON` builds only the core and its tests (no SDL3);
 `-DWITH_FUJINET=OFF` skips the firmware build (the machine boots CONFIG
-reporting the link down).
+reporting the link down). `-DWITH_CHF_ROMS=ON` embeds a BIOS from
+`tools/roms/local/` for a private build; never for distribution.
 
 The core is C11. Qt >= 6.7 and GTK >= 4.16 are needed for the Linux
-frontends (an older toolkit makes CMake skip that frontend). The macOS bundle
-needs macOS 13.3 or later. Nothing needs an assembler.
+frontends. The macOS bundle needs macOS 13.3 or later. Building needs no
+assembler: the stand-in BIOS is committed as `core/chf/stub.c`
+(`tools/stub/build-stub.sh` rebuilds it with the Macroassembler AS).
 
 ### Against MAME
 
-`tools/ab/` runs the core against MAME's own Channel F driver (the MAME build with
-the firmware's FujiNet graft, `pico/channelf/emu/apply.sh`, for CONFIG):
-
-- `cart_ab.py` / `all_carts.sh` — whole cartridges, frame for frame, with a
-  scripted input session (panel, both keypads, both discs, fire), using your
-  own dumps.
-- `uvi_probes.py` — generated stress carts for the UVI (objects at every edge,
-  zoom, collisions, both screen modes).
-- `config_golden.py` — regenerates `core/tests/config_golden.h`, MAME's frame
-  hashes of CONFIG (no ROM needed to run the test that holds the core to them:
-  `config_frames`).
-- `s2650_ab.py` — the 2650 against MAME's, instruction by instruction on 12
-  generated probe carts; `gen_dasm2650_golden.sh` — the disassembler's text for
-  all 256 opcodes.
+`tools/ab/` runs the core against MAME's own Channel F (a MAME tree with the
+firmware's FujiNet graft, `pico/channelf/emu/apply.sh`); see
+`tools/ab/README.md`. `f8_ab.py` and `romc_ab.py` hold the CPU to MAME
+instruction by instruction and ROMC record by record; `cart_ab.py`,
+`video_probes.py`, `sound_ab.py`, `softlist_ab.py` and `app_ab.py` the whole
+machine frame by frame; `config_golden.py` regenerates
+`core/tests/config_golden.h`. `tools/stub/observe.py` checks a stand-in BIOS
+against the real one's observed behaviour.
 
 ### Cross-building Windows on Linux
 
@@ -129,18 +118,16 @@ cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake \
       -DCMAKE_PREFIX_PATH="$PWD/SDL3-3.4.12/x86_64-w64-mingw32"
 cmake --build build-win
 cp SDL3-3.4.12/x86_64-w64-mingw32/bin/SDL3.dll build-win/frontends/windows/
-wine build-win/frontends/windows/fujinet-go-channelf-windows.exe
 ```
 
-This is the desk-side check. `fujinet.dll` does not cross-build — the
-firmware's PC target needs mingw builds of its dependencies — so the release
-build is native MSYS2/UCRT64, which builds it.
+`fujinet.dll` does not cross-build, so the release build is native
+MSYS2/UCRT64.
 
 ## Ports
 
-FujiNet's BoIP listener is on **11526** and its web admin UI on **11527** —
-high ports of this app's own, continuing the family's table, so a standalone
-`fujinet-pc` or a sibling app never collides:
+FujiNet's BoIP listener is on **11526** and its web admin UI on **11527**,
+continuing the family's table so a standalone `fujinet-pc` or a sibling app
+never collides:
 
 | App | BoIP | Web UI |
 |---|---|---|
@@ -160,69 +147,23 @@ high ports of this app's own, continuing the family's table, so a standalone
 | MS-DOS | 11516 | 11517 |
 | Studio II | 11518 | 11519 |
 | Odyssey 2 | 11520 | 11521 |
+| Arcadia 2001 | 11522 | 11523 |
+| Atari 5200 | 11524 | 11525 |
 | **Channel F** | **11526** | **11527** |
-
-FujiNet listens and the cartridge dials in, so the session starts FujiNet
-first and waits for its listener before powering on. The cartridge's mailbox
-service runs on its own thread, as it runs on the cartridge's second core, so a
-slow network transaction never stalls the picture.
-
-## How this was verified
-
-- **The core against MAME** (all run on this machine, with MAME's own driver and
-  the author's own cartridge dumps; none of them are in the repo):
-  - the 2650: 12 generated probe programs, 358,415 instructions, traces
-    (PC, PSU/PSL, R0-R3, exact cycles) identical; 245 of 256 opcodes executed
-    (the rest are HALT and the illegal ones); the disassembler's text, length
-    and flags for all 256 opcodes. Interrupts and HALT could not be compared
-    (MAME's Channel F never raises an IRQ) and rest on hand-written tests;
-  - the whole machine: all 48 cartridges identical to MAME for 900 of 900
-    frames under a scripted input session, and 13 generated UVI stress
-    carts, frame for frame from frame 0; CONFIG's frames match from frame 0
-    (`config_frames`, no ROM needed). A MAME quirk — a doubled object near the
-    bottom reads past its background buffer — is reproduced on purpose;
-  - **Not verified:** the PAL row against MAME (MAME runs every clone at NTSC)
-    and the beeper against a recording.
-- **Live FujiNet:** CONFIG reaches the hosts page, browses and boots a game
-  from a real in-process FujiNet; a FujiNet app that claims the mailbox keeps
-  it and runs.
-- **`ctest`**: the core alone with no SDL, the 2650 and UVI, the machine and
-  cartridges, the cartridge against a loopback FujiNet (a pushed image staged,
-  swapped in at the next `$2DFE` read, the trace tap byte for byte with the
-  wire), the paced host (60.00 Hz measured), the session, bindings, the
-  keypad layout, media routing, gamepads, and the debugger contract.
-- **GNOME, KDE, Windows, macOS** — see `TODO` for each frontend's state.
 
 ## Cutting a release
 
 Pushing a `v*` tag builds every platform and, only if all of it passes,
-publishes what it produced as a **draft** release:
-
-| Asset | Contents |
-|---|---|
-| `fujinet-go-channelf-gnome-<version>-Linux.{deb,rpm,tar.gz}` | the GNOME frontend, packaged with CPack |
-| `fujinet-go-channelf-kde-<version>-Linux.{deb,rpm,tar.gz}` | the KDE frontend, packaged with CPack |
-| `fujinet-go-channelf-<version>-windows.zip` | the exe, `fujinet.dll`, and the `fujinet/` runtime tree |
-| `fujinet-go-channelf-<version>-windows-setup.exe` | NSIS installer, per-user, no admin rights |
-| `fujinet-go-channelf-<version>-macos-{arm64,x86_64}.zip` | the `.app` bundle for Apple Silicon and Intel, FujiNet inside |
-| `online.fujinet.go.channelf.{gnome,kde}.flatpak` | single-file bundles: `flatpak install ./…flatpak` |
-
-The version is declared in the tree (`project(… VERSION …)` and both metainfo
-files, which template it), not derived from the tag; `check-version` stops the
-release if they disagree. To release 0.1.1: set the version in
-`CMakeLists.txt`, add a `<release>` entry with its date to both
-`frontends/*/data/*.metainfo.xml.in`, commit, then
-`git tag -a v0.1.1 && git push origin v0.1.1`. Running the workflow by hand
-(Actions → Release → Run workflow) is a dry run: everything is built and
-tested and the artifacts are attached to the run, but no release is made.
-
-The Windows release build is native MSYS2/UCRT64, and the `release.yml` job
-checks the exe's and `fujinet.dll`'s import tables against a system-DLL
-whitelist. The macOS jobs sign and notarise when the `MACOS_*` secrets are
-set, and check the bundle for leaked Homebrew dylibs.
+publishes a **draft** release with `fujinet-go-channelf-{gnome,kde}-<version>-Linux.{deb,rpm,tar.gz}`,
+`fujinet-go-channelf-<version>-windows.zip` and `-windows-setup.exe`,
+`fujinet-go-channelf-<version>-macos-{arm64,x86_64}.zip` and
+`online.fujinet.go.channelf.{gnome,kde}.flatpak`. The version is declared in
+the tree (`project(… VERSION …)` and both metainfo files, which template it);
+`check-version` stops the release if they disagree. Running the workflow by
+hand is a dry run.
 
 ## Licence
 
-GPL-3.0-or-later. See `COMPLIANCE.md` for per-component provenance. "Emerson"
-and "Channel F" are trademarks of their owners, used to name the machine
-emulated; this project is not affiliated with them.
+GPL-3.0-or-later. See `COMPLIANCE.md` for per-component provenance.
+"Fairchild", "Channel F" and "Videocart" are trademarks of their owners, used
+to name the machine emulated; this project is not affiliated with them.

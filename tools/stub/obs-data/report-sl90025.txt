@@ -1,0 +1,69 @@
+==============================================================================
+BIOS sl90025  (2640 cases)
+==============================================================================
+reset_rand     ran-to-return 200/200, model-checked 200: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1470/1470/1471
+clr_r3zero     ran-to-return 200/200, model-checked 200: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1143217/1143273/1143278
+clr_r3sweepA   ran-to-return 256/256, model-checked 256: tier1 mismatches 0, tier2 0, tier3 152; ticks min/med/max 1118729/1143431/1192332
+      mismatch r44       tier 3  x40
+      mismatch r45       tier 3  x40
+      mismatch r32       tier 3  x8
+      mismatch r33       tier 3  x8
+      mismatch r17       tier 3  x8
+      mismatch r18       tier 3  x8
+      mismatch r21       tier 3  x8
+      mismatch r24       tier 3  x8
+      mismatch r25       tier 3  x8
+      mismatch r26       tier 3  x8
+      mismatch r27       tier 3  x8
+clr_r3sweepB   ran-to-return 256/256, model-checked 256: tier1 mismatches 0, tier2 0, tier3 152; ticks min/med/max 1124434/1143438/1181052
+      mismatch r44       tier 3  x40
+      mismatch r45       tier 3  x40
+      mismatch r32       tier 3  x8
+      mismatch r33       tier 3  x8
+      mismatch r17       tier 3  x8
+      mismatch r18       tier 3  x8
+      mismatch r21       tier 3  x8
+      mismatch r24       tier 3  x8
+      mismatch r25       tier 3  x8
+      mismatch r26       tier 3  x8
+      mismatch r27       tier 3  x8
+clr_r3rand     ran-to-return 95/100, model-checked 95: tier1 mismatches 0, tier2 0, tier3 63; ticks min/med/max 1118730/1143472/1192327
+      mismatch vram      tier 3  x8
+      mismatch r17       tier 3  x5
+      mismatch r18       tier 3  x5
+      mismatch r26       tier 3  x3
+      mismatch r27       tier 3  x3
+      mismatch r21       tier 3  x3
+      mismatch r33       tier 3  x3
+      mismatch r24       tier 3  x3
+      mismatch r25       tier 3  x3
+      mismatch r41       tier 3  x2
+      mismatch r42       tier 3  x2
+      mismatch r45       tier 3  x2
+clr_colour     ran-to-return 90/90, model-checked 90: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1143217/1143223/1143278
+clr_r59sweep   ran-to-return 160/256, model-checked 140: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 50358/1143277/1143278
+clr_vram       ran-to-return 4/4, model-checked 4: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1143223/1143278/1143278
+clr_sens       ran-to-return 146/146, model-checked 146: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1143277/1143278/1143477
+contract_reset ran-to-return 12/12, model-checked 12: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1470/1470/1471
+contract_clr   ran-to-return 34/34, model-checked 34: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 1143222/1143277/1143278
+contract_push  ran-to-return 87/87, model-checked 87: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 61/61/61
+contract_pop   ran-to-return 87/87, model-checked 87: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 63/63/63
+push_rand      ran-to-return 200/200, model-checked 200: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 56/61/61
+push_r59sweep  ran-to-return 256/256, model-checked 256: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 56/61/61
+pop_rand       ran-to-return 200/200, model-checked 200: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 58/63/63
+pop_r59sweep   ran-to-return 256/256, model-checked 256: tier1 mismatches 0, tier2 0, tier3 0; ticks min/med/max 58/63/63
+clr r59 sweep: pointer values (r59 & 63) that always returned: 9-10, 14-48, 55, 60, 62
+                values that never returned:                  0-8, 11-13, 49-54, 56-59, 61, 63
+                values that depend on the other state:       
+clr hidden table: pattern independent of colour bits True, colour 0 = same pattern written as 0 True, r3 bit 4 ignored True, anomalies none
+
+clr: sensitivity (input -> outputs that changed beyond the same-named field)
+   p5    -> port-writes
+   r4    -> r54
+   vram  -> vram
+   (every other input: no effect beyond being preserved/clobbered in place; the cycle count varies by a few hundred ticks of 1.14M with the state)
+clr: random-r3 cases that did not return: r3 = ['0x61', '0x85', '0xb1', '0xe2']
+
+cold boot: entered=1 after 1457 ticks; A=08 W=07 IS=3b DC0=0801 DC1=0000 PC1=0000; regs set: {59: 40}; port writes 0; cart reads ['0x800']; IN reads {}
+cart signature: byte at $0800 values that enter the cartridge: ['0x55'] (of 256 tested); byte at $0801 irrelevant: True
+elapsed 23 s

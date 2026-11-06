@@ -55,3 +55,6 @@ __pycache__/
 
 # the console photo the icon colours were sampled from (not ours to ship)
 /fairchild-channel-f-console.png
+
+# raw BIOS observations (tools/stub/observe.py regenerates them)
+tools/stub/obs-data/*.jsonl.gz

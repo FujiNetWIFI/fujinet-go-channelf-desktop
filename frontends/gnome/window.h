@@ -21,12 +21,14 @@ void chf_window_toast(ChfWindow *self, const char *text);
 /* A message the user has to read (a toast would vanish before the reason
  * was read): an alert with an OK button. */
 void chf_window_message(ChfWindow *self, const char *heading, const char *body);
-/* The display's shape: 0 = the television's 4:3, 1 = square pixels. */
+/* The display's shape: 0 = the television's 4:3, 1 = square pixels. Also
+ * follows the machine (the PAL pair's square pixels are a different shape). */
 void chf_window_apply_aspect(ChfWindow *self, int aspect);
 /* Smooth (bilinear) scaling of the picture, or the sharp pixels. */
 void chf_window_apply_smooth(ChfWindow *self, gboolean smooth);
-/* A dropped or command-line file: a cartridge is
- * opened, anything else copied to FujiNet's SD folder. */
+/* A dropped or command-line file: a BIOS dump is imported, a cartridge is
+ * copied to the cartridge folder and run, anything else goes to FujiNet's SD
+ * folder. */
 void chf_window_load_media(ChfWindow *self, const char *path);
 /* A system action (CHF_SYSACT_*) from any window's keys, with the main
  * window's feedback: Reset to CONFIG toasts, Debugger Stop opens the
@@ -41,9 +43,23 @@ gboolean chf_window_key(ChfWindow *self, guint keyval, guint keycode,
  * holds (and forget which system-action keys were down). */
 void chf_window_release_keys(ChfWindow *self);
 
-/* The accent colour (CHFSESSION_ACCENT_RGB, the keypad gold) as
- * CSS classes every window can use: ".chf-accent" paints a widget's
- * background in it (with white text), ".chf-accent-text" its label (a tint of
- * it on a dark theme, the darker red on a light one), and ".chf-pill" makes a
- * label a small rounded indicator. Installed once by the main window. */
+/* Import BIOS: a chooser for files (several, zips allowed) or one folder,
+ * then one result dialog over `over` (the window when NULL). `apply`
+ * power-cycles the console when the import supplied a BIOS that was missing
+ * (or, with `retry`, a cartridge the BIOS rule refused, opens it again).
+ * `done` gets the number of items imported, or -1 if the chooser was
+ * cancelled. */
+void chf_window_import_bios(ChfWindow *self, GtkWidget *over, gboolean folder,
+                            gboolean apply, const char *retry,
+                            void (*done)(int imported, gpointer user_data),
+                            gpointer user_data);
+/* The Help context the main window shows now: "main", "nobios" while the
+ * Needs BIOS message is up, or "prefs/<page>" in Preferences. */
+const char *chf_window_help_context(ChfWindow *self);
+
+/* The accent colour (CHFSESSION_ACCENT_RGB, the Videocart yellow) as CSS
+ * classes every window can use: ".chf-accent" paints a widget's background in
+ * it (with dark text), ".chf-accent-text" its label (a tint of it on a dark
+ * theme, the darker bronze on a light one), and ".chf-pill" makes a label a
+ * small rounded indicator. Installed once by the main window. */
 void chf_install_accent_css(void);

@@ -1,21 +1,19 @@
 /*
- * Debugger window (GTK4/libadwaita) over the session's Signetics 2650 / 2637
- * UVI debugger engine, via core/include/chfdebug.h.
+ * Debugger window (GTK4/libadwaita) over the session's Fairchild F8 / Channel F
+ * debugger engine, via core/include/chfdebug.h.
  *
  * Tabs, in order: a Prompt (the contract's command set, with tab completion
- * and a command history), the 2650's registers (R0, both R1-R3 sets, PSU and
- * PSL decoded, the 15-bit PC and the IAR, the 8-deep return stack) with a
- * memory viewer over the three address spaces (PROG, UVI, CART), the
- * disassembly with a breakpoint gutter, the Video tab (the 2637 UVI: the
- * frame, the re-render from the registers and the beam-progress view, the
- * layers, objects boxed and indexed, the 16x13/26 character screen, the
- * glyph/UDC sheet, decoded editable registers, collisions, the palette:
- * dbg_video.c), Sound & I/O (the keypads, discs and panel live, the pots,
- * the beeper), breakpoints, the cartridge (its state and the mailbox page)
- * and FujiNet: every FujiBus packet on the cartridge's link, both ways, with
- * hex. A toolbar carries the stepping controls, symbol loading and file
- * saves; the family's keys apply (F5 run/stop, F7 step, F8 step over,
- * Shift+F8 step out, F12 close).
+ * and a command history); CPU & RAM (dbg_cpu.c: A, W, ISAR in octal, PC0/PC1
+ * and the data counters, J H K Q, the scratchpad as an 8 x 8 octal grid, the
+ * BIOS K stack, and a hex view over the five spaces); the disassembly with a
+ * breakpoint gutter; Video (dbg_video.c: the six views with their overlays,
+ * the cell readout, the row palettes, the ports and the VRAM write log);
+ * Sound & I/O (dbg_io.c); Breakpoints (all seven kinds); Cart (dbg_cart.c); and
+ * FujiNet: every FujiBus packet on the cartridge's link, both ways, with hex. A
+ * toolbar carries the stepping controls, symbol loading and file saves; the
+ * family's keys apply (F5 run/stop, F7 step, F8 step over, Shift+F8 step out,
+ * F12 close, F1 Help). The header bar's Help button opens the topic of the tab
+ * that shows.
  *
  * The engine exists only while this window is showing: showing it attaches
  * (which stops the machine, as on every sibling), hiding it detaches and
@@ -38,14 +36,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../help/help_window.h"
 #include "../window.h"
 #include "dbg_common.h"
 
-#define DISASM_WINDOW 48
+#define DISASM_MAX 160
 #define TRACE_MAX 512
-#define MBOX_BASE 0x2B00
-#define MBOX_SIZE 0x500
-#define MEM_ROWS 16
+#define GUTTER 26
 
 /* The tabs, in order, by the names CHF_DEBUGGER_TAB takes. */
 enum {
@@ -55,29 +52,26 @@ enum {
 static const struct { const char *name; int tab; } k_tab_names[] = {
     { "prompt", TAB_PROMPT }, { "cpu", TAB_CPU }, { "ram", TAB_CPU },
     { "memory", TAB_CPU }, { "disassembly", TAB_DISASM }, { "video", TAB_VIDEO },
-    { "uvi", TAB_VIDEO }, { "sound", TAB_IO }, { "io", TAB_IO },
+    { "vram", TAB_VIDEO }, { "sound", TAB_IO }, { "io", TAB_IO },
     { "breakpoints", TAB_BREAKS }, { "cart", TAB_CART }, { "fujinet", TAB_FUJINET },
 };
+/* Help's contexts (chfhelp.h), one per tab */
+static const char *const k_tab_contexts[TAB_COUNT] = {
+    "debugger/prompt", "debugger/cpu", "debugger/disassembly", "debugger/video",
+    "debugger/io", "debugger/breakpoints", "debugger/cart", "debugger/fujinet",
+};
 
-/* The 2650's registers as entries: how many hex digits each shows. R1-R3 are
- * the set RS selects; R1'-R3' the other. */
-static const struct { const char *name; int reg; int digits; } k_regs[] = {
-    { "R0", CHF_REG_R0, 2 },
-    { "R1", CHF_REG_R1, 2 }, { "R2", CHF_REG_R2, 2 }, { "R3", CHF_REG_R3, 2 },
-    { "R1'", CHF_REG_R1B, 2 }, { "R2'", CHF_REG_R2B, 2 }, { "R3'", CHF_REG_R3B, 2 },
-    { "PC", CHF_REG_PC, 4 }, { "IAR", CHF_REG_IAR, 4 },
-    { "PSU", CHF_REG_PSU, 2 }, { "PSL", CHF_REG_PSL, 2 },
-    { "SP", CHF_REG_SP, 1 }, { "CC", CHF_REG_CC, 1 },
+/* The breakpoint kinds the form offers, with the space each one's range is in. */
+static const struct { const char *name; int type; int space; const char *hint; } k_bp_kinds[] = {
+    { "Execute", CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, "$0802 or a label" },
+    { "Read", CHFDEBUG_BP_READ, CHF_SPACE_PROG, "$8000 or a label" },
+    { "Write", CHFDEBUG_BP_WRITE, CHF_SPACE_PROG, "$8000 or a label" },
+    { "Port in", CHFDEBUG_BP_IN, CHF_SPACE_IO, "port, e.g. 1 or $01" },
+    { "Port out", CHFDEBUG_BP_OUT, CHF_SPACE_IO, "port, e.g. 5 or $05" },
+    { "VRAM write", CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, "row,col e.g. 12,40" },
+    { "Scratchpad write", CHFDEBUG_BP_SCRATCH, CHF_SPACE_SCRATCH, "register, e.g. 9 or 40" },
 };
-#define NREGS ((int)G_N_ELEMENTS(k_regs))
-/* PSU and PSL bits as check buttons */
-static const struct { const char *name; int reg; } k_flags[] = {
-    { "F", CHF_REG_F }, { "II", CHF_REG_II },
-    { "C", CHF_REG_C }, { "COM", CHF_REG_COM }, { "OVF", CHF_REG_OVF },
-    { "WC", CHF_REG_WC }, { "RS", CHF_REG_RS }, { "IDC", CHF_REG_IDC },
-};
-#define NFLAGS ((int)G_N_ELEMENTS(k_flags))
-#define NPILLS 4
+#define NBPKINDS ((int)G_N_ELEMENTS(k_bp_kinds))
 
 typedef struct {
     GtkWindow *win;
@@ -101,45 +95,29 @@ typedef struct {
     GPtrArray *history;
     guint history_pos;
 
-    /* cpu + ram */
-    GtkEntry *reg[NREGS];
-    GtkWidget *flag[NFLAGS];
-    GtkWidget *pill[NPILLS];  /* S (sense), HALT, IRQ line, ILLEGAL */
-    GtkEntry *ras[8];         /* the return address stack */
-    GtkWidget *ras_label[8];
-    GtkWidget *bank_label[2];
-    GtkLabel *beam;
-    GtkLabel *cpu_info;
-    GtkDropDown *mem_space;   /* the memory viewer */
-    GtkEntry *mem_addr, *poke_addr, *poke_val;
-    GtkTextView *mem_text;
-    uint32_t mem_base;
-    gboolean syncing;
+    /* cpu + ram, video, sound & i/o, cart */
+    DbgCpu *cpu;
+    DbgVideo *video;
+    DbgIo *io;
+    DbgCart *cart;
 
     /* disassembly */
-    GtkTextView *disasm;
+    GtkWidget *dis_area;
     GtkCheckButton *follow_pc;
     GtkEntry *jump;
-    int disasm_top;           /* address of the first line (15-bit) */
-    uint16_t line_addr[DISASM_WINDOW];
-    int line_count;
-
-    /* video */
-    DbgVideo *video;
-
-    /* sound & i/o */
-    GtkTextView *io_text;
-    GtkWidget *keys_area, *sticks_area;
-    chfdebug_io io;            /* the last read, for the two drawings */
+    chfdebug_line dis_lines[DISASM_MAX];
+    int dis_count;
+    int dis_rows;             /* lines that fit */
+    int dis_top;              /* address of the first line */
+    int dis_sel;              /* the selected line's address, -1 none */
+    double dis_lh, dis_cw;    /* a line's height and a character's width */
+    gboolean dis_metrics;
 
     /* breakpoints */
     GtkListBox *bp_list;
     GtkDropDown *bp_type;
     GtkEntry *bp_start, *bp_end, *bp_cond;
     GtkLabel *bp_msg;
-
-    /* cart */
-    GtkTextView *cart_text, *mbox_text;
 
     /* fujinet */
     GtkLabel *fuji_note;
@@ -174,30 +152,30 @@ static GtkAdjustment *vadj(GtkTextView *view)
         ? gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(parent)) : NULL;
 }
 
-/* A log (the FujiNet packets) follows its end while its reader is there.
- * New text grows the view only once it is laid out (or its tab first
- * shows), so the end is pinned whenever the view's height changes; whether
- * to follow is decided as text arrives. */
-static gboolean following(GtkTextView *view)
+/* A log (the FujiNet packets, the VRAM writes, the I/O accesses) follows its
+ * end while its reader is there. New text grows the view only once it is laid
+ * out (or its tab first shows), so the end is pinned whenever the view's
+ * height changes; whether to follow is decided as text arrives. */
+gboolean dbg_log_following(GtkTextView *view)
 {
     return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(view), "follow")) != 0;
 }
 
 static void on_log_resized(GtkAdjustment *adj, gpointer view)
 {
-    if (following(view))
+    if (dbg_log_following(view))
         gtk_adjustment_set_value(adj, gtk_adjustment_get_upper(adj) -
                                       gtk_adjustment_get_page_size(adj));
 }
 
-static void make_log(GtkTextView *view)
+void dbg_log_make(GtkTextView *view)
 {
     g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(1));
     g_signal_connect(vadj(view), "changed", G_CALLBACK(on_log_resized), view);
 }
 
 /* Before new text: follow if the reader is at the end (or never looked). */
-static void log_note_reader(GtkTextView *view)
+void dbg_log_note_reader(GtkTextView *view)
 {
     GtkAdjustment *adj = vadj(view);
     g_object_set_data(G_OBJECT(view), "follow", GINT_TO_POINTER(
@@ -211,7 +189,7 @@ static void log_note_reader(GtkTextView *view)
  * top. The top line is noted and scrolled back to once the new text is laid
  * out (scroll_to_mark waits for that). A log that is following goes to its
  * end instead. */
-static void set_text_at(GtkTextView *view, const char *text, gboolean follow)
+void dbg_set_text_follow(GtkTextView *view, const char *text, gboolean follow)
 {
     GtkTextBuffer *b = gtk_text_view_get_buffer(view);
     GtkAdjustment *adj = vadj(view);
@@ -253,7 +231,7 @@ static void set_text_at(GtkTextView *view, const char *text, gboolean follow)
 
 void dbg_set_text(GtkTextView *view, const char *text)
 {
-    set_text_at(view, text, FALSE);
+    dbg_set_text_follow(view, text, FALSE);
 }
 
 static void append_text(GtkTextView *view, GtkScrolledWindow *scroll, const char *text)
@@ -281,6 +259,20 @@ int dbg_parse_num(const char *text, long *out)
     return 1;
 }
 
+int dbg_parse_dec(const char *text, long *out)
+{
+    char *end;
+    long v;
+    while (*text == ' ') text++;
+    if (*text == '$') v = strtol(text + 1, &end, 16);
+    else if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) v = strtol(text + 2, &end, 16);
+    else if (*text == 'r' || *text == 'R') v = strtol(text + 1, &end, 10);
+    else v = strtol(text, &end, 10);
+    if (end == text || *end) return 0;
+    *out = v;
+    return 1;
+}
+
 /* A label or a number, as typed into an address box. */
 static int parse_addr(DbgWin *w, const char *text, long *out)
 {
@@ -298,6 +290,27 @@ void dbg_set_entry(chfdebug *d, GtkEntry *e, const char *text)
         return;
     if (strcmp(gtk_editable_get_text(GTK_EDITABLE(e)), text) != 0)
         gtk_editable_set_text(GTK_EDITABLE(e), text);
+}
+
+GtkWidget *dbg_hex_entry(int digits)
+{
+    GtkWidget *e = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(e), digits + 2);
+    gtk_editable_set_width_chars(GTK_EDITABLE(e), digits + 1);
+    gtk_editable_set_max_width_chars(GTK_EDITABLE(e), digits + 1);
+    gtk_widget_add_css_class(e, "monospace");
+    return e;
+}
+
+void dbg_pill(GtkWidget *w, gboolean on)
+{
+    if (on) {
+        gtk_widget_add_css_class(w, "chf-accent");
+        gtk_widget_remove_css_class(w, "dim-label");
+    } else {
+        gtk_widget_remove_css_class(w, "chf-accent");
+        gtk_widget_add_css_class(w, "dim-label");
+    }
 }
 
 GtkWidget *dbg_labeled(const char *text, GtkWidget *child)
@@ -347,16 +360,8 @@ GtkWidget *dbg_mono_label(void)
     gtk_label_set_xalign(GTK_LABEL(l), 0);
     gtk_label_set_yalign(GTK_LABEL(l), 0);
     gtk_label_set_selectable(GTK_LABEL(l), TRUE);
+    gtk_widget_set_focusable(l, FALSE);       /* no caret; the mouse still selects */
     return l;
-}
-
-/* A line marked in the accent keeps dark text on either theme. */
-static void accent_tag(GtkTextView *view, const char *name)
-{
-    char rgb[16];
-    g_snprintf(rgb, sizeof rgb, "#%06x", CHFSESSION_ACCENT_RGB);
-    gtk_text_buffer_create_tag(gtk_text_view_get_buffer(view), name,
-                               "paragraph-background", rgb, "foreground", "#1e1a14", NULL);
 }
 
 void dbg_set_rgb(cairo_t *cr, guint32 rgb, double alpha)
@@ -374,9 +379,34 @@ void dbg_set_fg(cairo_t *cr, GtkWidget *w, double alpha)
 
 guint32 dbg_accent_line_rgb(void)
 {
-    /* the bronze alone is too dark to see as a line on a dark theme */
+    /* the yellow is a line colour on a dark theme; the bronze is on a light one */
     return adw_style_manager_get_dark(adw_style_manager_get_default())
-        ? 0xD9C08E : CHFSESSION_ACCENT_DARK_RGB;
+        ? CHFSESSION_ACCENT_RGB : CHFSESSION_ACCENT_DARK_RGB;
+}
+
+int dbg_draw_text(cairo_t *cr, GtkWidget *w, const char *text, double x, double y,
+                  gboolean mono, double px)
+{
+    PangoLayout *layout = gtk_widget_create_pango_layout(w, text);
+    int tw, th;
+    if (mono) {
+        PangoFontDescription *fd = pango_font_description_new();
+        pango_font_description_set_family(fd, "Monospace");
+        pango_font_description_set_absolute_size(fd, (px > 0 ? px : 13) * PANGO_SCALE);
+        pango_layout_set_font_description(layout, fd);
+        pango_font_description_free(fd);
+    } else if (px > 0) {
+        PangoFontDescription *fd = pango_font_description_new();
+        pango_font_description_set_absolute_size(fd, px * PANGO_SCALE);
+        pango_layout_set_font_description(layout, fd);
+        pango_font_description_free(fd);
+    }
+    pango_layout_get_pixel_size(layout, &tw, &th);
+    cairo_move_to(cr, x, y);
+    pango_cairo_show_layout(cr, layout);
+    cairo_new_path(cr);         /* the move_to would join the next arc with a line */
+    g_object_unref(layout);
+    return tw;
 }
 
 void dbg_draw_centred(cairo_t *cr, GtkWidget *w, const char *text, double x, double y,
@@ -410,349 +440,204 @@ static void install_css(void)
 {
     static gboolean done;
     GtkCssProvider *css;
+    char text[256];
     if (done) return;
     done = TRUE;
     css = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(css,
+    g_snprintf(text, sizeof text,
         "entry.chf-hex { padding: 1px 2px; min-height: 0; min-width: 0; }\n"
-        "entry.chf-hex > text { min-width: 0; }\n");
+        "entry.chf-hex > text { min-width: 0; }\n"
+        "levelbar.chf-meter block.filled { background-color: #%06x; }\n",
+        CHFSESSION_ACCENT_RGB);
+    gtk_css_provider_load_from_string(css, text);
     gtk_style_context_add_provider_for_display(gdk_display_get_default(),
         GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(css);
 }
 
-/* ---- the memory viewer ------------------------------------------------------ */
+/* ---- disassembly: the lines, a breakpoint gutter and the PC in the accent ---- */
 
-/* 16 rows of 16 bytes from mem_base, in the chosen space, with the ASCII. */
-static void refresh_mem(DbgWin *w)
+static void dis_measure(DbgWin *w)
 {
-    static char text[MEM_ROWS * 96];
-    uint8_t bytes[16];
-    const int space = (int)gtk_drop_down_get_selected(w->mem_space);
-    const uint32_t size = (uint32_t)chfdebug_space_size(w->dbg, space);
-    int r, len = 0;
-
-    for (r = 0; r < MEM_ROWS; r++) {
-        const uint32_t a = w->mem_base + (uint32_t)r * 16;
-        int i;
-        len += g_snprintf(text + len, sizeof text - len, "%05X:", a);
-        chfdebug_read(w->dbg, space, a, bytes, 16);
-        for (i = 0; i < 16; i++)
-            len += g_snprintf(text + len, sizeof text - len, a + (uint32_t)i < size
-                              ? " %02X" : " --", bytes[i]);
-        len += g_snprintf(text + len, sizeof text - len, "  ");
-        for (i = 0; i < 16; i++)
-            text[len++] = bytes[i] >= 0x20 && bytes[i] < 0x7F ? (char)bytes[i] : '.';
-        text[len++] = '\n';
-        text[len] = '\0';
-    }
-    dbg_set_text(w->mem_text, text);
-}
-
-/* ---- refresh -------------------------------------------------------------- */
-
-static void refresh_cpu(DbgWin *w)
-{
-    chfdebug_cpu c;
-    char buf[320];
-    int i;
-    chfdebug_cpu_get(w->dbg, &c);
-    {
-        const int v[NREGS] = { c.r0, c.r[0][1], c.r[0][2], c.r[0][3],
-                               c.r[1][1], c.r[1][2], c.r[1][3], c.pc, c.iar,
-                               c.psu, c.psl, c.sp, c.cc };
-        for (i = 0; i < NREGS; i++) {
-            g_snprintf(buf, sizeof buf, "%0*X", k_regs[i].digits, (unsigned)v[i]);
-            dbg_set_entry(w->dbg, w->reg[i], buf);
-        }
-    }
-    w->syncing = TRUE;
-    {
-        const int f[NFLAGS] = { c.flag, c.ii, c.c, c.com, c.ovf, c.wc, c.rs, c.idc };
-        for (i = 0; i < NFLAGS; i++)
-            gtk_check_button_set_active(GTK_CHECK_BUTTON(w->flag[i]), f[i] != 0);
-    }
-    w->syncing = FALSE;
-    {
-        const int p[NPILLS] = { c.sense, c.halted, c.irq_line, c.illegal_count != 0 };
-        for (i = 0; i < NPILLS; i++) {
-            if (p[i]) {
-                gtk_widget_add_css_class(w->pill[i], "chf-accent");
-                gtk_widget_remove_css_class(w->pill[i], "dim-label");
-            } else {
-                gtk_widget_remove_css_class(w->pill[i], "chf-accent");
-                gtk_widget_add_css_class(w->pill[i], "dim-label");
-            }
-        }
-    }
-    /* the register set RS selects is marked */
-    for (i = 0; i < 2; i++) {
-        if (c.rs == i) {
-            gtk_widget_add_css_class(w->bank_label[i], "chf-accent");
-            gtk_widget_remove_css_class(w->bank_label[i], "dim-label");
-        } else {
-            gtk_widget_remove_css_class(w->bank_label[i], "chf-accent");
-            gtk_widget_add_css_class(w->bank_label[i], "dim-label");
-        }
-    }
-    /* the return stack: SP names the top (it was incremented by the call) */
-    for (i = 0; i < 8; i++) {
-        g_snprintf(buf, sizeof buf, "%04X", c.ras[i]);
-        dbg_set_entry(w->dbg, w->ras[i], buf);
-        if (c.sp == i && i > 0) {
-            gtk_widget_add_css_class(w->ras_label[i], "chf-accent");
-            gtk_widget_remove_css_class(w->ras_label[i], "dim-label");
-        } else {
-            gtk_widget_remove_css_class(w->ras_label[i], "chf-accent");
-            gtk_widget_add_css_class(w->ras_label[i], "dim-label");
-        }
-    }
-    g_snprintf(buf, sizeof buf, "page $%04X   %s%s   illegal opcodes %u%s",
-               c.page, c.halted ? "halted, waiting for an interrupt   " : "",
-               c.ii ? "interrupts inhibited" : "interrupts enabled", c.illegal_count,
-               c.illegal_count ? " (last at $" : "");
-    if (c.illegal_count) {
-        char at[16];
-        g_snprintf(at, sizeof at, "%04X)", c.illegal_pc & 0x7FFF);
-        g_strlcat(buf, at, sizeof buf);
-    }
-    gtk_label_set_text(w->cpu_info, buf);
-    g_snprintf(buf, sizeof buf,
-               "%s   line %d   dot %d   frame %u   cycle %llu   instruction %llu",
-               chf_machine_name(c.machine), c.vpos, c.hpos, c.frame,
-               (unsigned long long)c.cycles, (unsigned long long)c.instructions);
-    gtk_label_set_text(w->beam, buf);
-    refresh_mem(w);
+    PangoLayout *l;
+    PangoFontDescription *fd;
+    int tw, th;
+    if (w->dis_metrics) return;
+    l = gtk_widget_create_pango_layout(w->dis_area, "0000000000");
+    fd = pango_font_description_new();
+    pango_font_description_set_family(fd, "Monospace");
+    pango_font_description_set_absolute_size(fd, 13 * PANGO_SCALE);
+    pango_layout_set_font_description(l, fd);
+    pango_layout_get_pixel_size(l, &tw, &th);
+    w->dis_cw = tw / 10.0;
+    w->dis_lh = th + 3;
+    w->dis_metrics = TRUE;
+    pango_font_description_free(fd);
+    g_object_unref(l);
 }
 
 static void refresh_disasm(DbgWin *w)
 {
-    static chfdebug_line lines[DISASM_WINDOW];
-    static char text[DISASM_WINDOW * 240];
-    int n, pc_line, i, len = 0;
-    GtkTextBuffer *b = gtk_text_view_get_buffer(w->disasm);
-    GtkTextIter s, e;
+    int pc_line, rows;
 
+    dis_measure(w);
+    rows = w->dis_rows > 4 ? w->dis_rows : 30;
+    if (rows > DISASM_MAX) rows = DISASM_MAX;
     /* Following, the PC sits a third of the way down the window. */
     if (gtk_check_button_get_active(w->follow_pc)) {
         chfdebug_cpu c;
         chfdebug_cpu_get(w->dbg, &c);
-        w->disasm_top = chfdebug_row_address(w->dbg, (uint16_t)c.pc, -(DISASM_WINDOW / 3));
-    }
-
-    n = chfdebug_disassemble(w->dbg, (uint16_t)w->disasm_top, lines, DISASM_WINDOW, &pc_line);
-    w->line_count = n;
-    for (i = 0; i < n; i++) {
-        w->line_addr[i] = lines[i].address;
-        len += g_snprintf(text + len, sizeof text - len, "%c%c %04X  %-9s %-16s %-24s %s%s\n",
-                          lines[i].has_breakpoint ? '*' : ' ',
-                          lines[i].is_pc ? '>' : ' ',
-                          lines[i].address, lines[i].bytes, lines[i].label,
-                          lines[i].disasm, lines[i].comment[0] ? "; " : "",
-                          lines[i].comment);
-    }
-    if (n == 0)
-        len += g_snprintf(text + len, sizeof text - len, "(no disassembly)\n");
-    gtk_text_buffer_set_text(b, text, -1);
-
-    /* the PC line in the accent colour */
-    if (pc_line >= 0 && pc_line < n) {
-        gtk_text_buffer_get_iter_at_line(b, &s, pc_line);
-        gtk_text_buffer_get_iter_at_line(b, &e, pc_line + 1);
-        gtk_text_buffer_apply_tag_by_name(b, "pc", &s, &e);
-    }
-}
-
-/* The console's inputs as the machine has latched them, the pots, the panel
- * and the beeper. */
-static void refresh_io(DbgWin *w)
-{
-    static chfdebug_uvi u;
-    chfdebug_io *io = &w->io;
-    chfdebug_io before = *io;
-    static char text[3072];
-    char sticks[2][24], tone[48];
-    int i;
-
-    chfdebug_io_get(w->dbg, io);
-    chfdebug_uvi_get(w->dbg, &u);
-    for (i = 0; i < 2; i++)
-        g_snprintf(sticks[i], sizeof sticks[i], "%s%s%s%s%s",
-                   io->sticks[i] & 1 ? "U" : "-", io->sticks[i] & 2 ? "R" : "-",
-                   io->sticks[i] & 4 ? "D" : "-", io->sticks[i] & 8 ? "L" : "-",
-                   io->sticks[i] & 16 ? "F" : "-");
-    /* the beeper: a divider of the line rate (MAME's arcadia_sound) */
-    if (u.sound_volume && u.sound_tone)
-        g_snprintf(tone, sizeof tone, "tone, divider %d", u.sound_pitch);
-    else if (u.sound_volume && u.sound_noise)
-        g_snprintf(tone, sizeof tone, "noise, divider %d", u.sound_pitch);
-    else
-        g_snprintf(tone, sizeof tone, "silent");
-    g_snprintf(text, sizeof text,
-        "%s   %s cartridge\n\n"
-        "RESET key     %s\n"
-        "SENSE         %d   (the UVI's vblank: line %d of %d)\n"
-        "FLAG          %d\n"
-        "\n"
-        "Keys latched  %07llX   (bit 0-11 pad 1, 12-23 pad 2, 24-26 panel)\n"
-        "Pad columns   %02X %02X %02X %02X %02X %02X %02X %02X   ($1900-$1907)\n"
-        "Panel $1908   %02X   %s%s%s\n"
-        "Discs         1: %s   2: %s   (U R D L F)\n"
-        "Pots          1: x $%02X y $%02X   2: x $%02X y $%02X\n"
-        "Analog disc   1: %d,%d   2: %d,%d   (0 = the digital directions)\n"
-        "\n"
-        "Beeper        %s   volume %d   ($18FD pitch %d, $18FE)\n"
-        "Audio         %llu samples made\n",
-        chf_machine_name(io->machine),
-        io->cart_type == 3 ? "FujiNet" : io->cart_type == 2 ? "Golf" : "Standard",
-        io->reset_held ? "held" : "-", io->sense, u.line, u.lines, io->flag,
-        (unsigned long long)io->keys,
-        io->pad[0], io->pad[1], io->pad[2], io->pad[3], io->pad[4], io->pad[5],
-        io->pad[6], io->pad[7],
-        io->panel, io->panel & 1 ? "START " : "", io->panel & 2 ? "OPTION " : "",
-        io->panel & 4 ? "SELECT" : "",
-        sticks[0], sticks[1],
-        io->pot[0][0], io->pot[0][1], io->pot[1][0], io->pot[1][1],
-        io->disc[0][0], io->disc[0][1], io->disc[1][0], io->disc[1][1],
-        tone, u.sound_volume, u.sound_pitch,
-        (unsigned long long)io->audio_samples);
-    dbg_set_text(w->io_text, text);
-
-    if (before.keys != io->keys || before.machine != io->machine ||
-        before.reset_held != io->reset_held)
-        gtk_widget_queue_draw(w->keys_area);
-    if (memcmp(before.sticks, io->sticks, sizeof before.sticks) != 0)
-        gtk_widget_queue_draw(w->sticks_area);
-}
-
-/* Both keypads and the panel as the console reads them, drawn from the
- * session's layout table: a held key is filled in the accent. */
-#define KY_UNIT 44
-
-static void draw_keys(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer ud)
-{
-    DbgWin *w = ud;
-    GtkWidget *wg = GTK_WIDGET(area);
-    int n, i;
-    float kw, kh;
-    const chf_keycap *caps = chfsession_keyboard_layout(w->io.machine, &n, &kw, &kh);
-    (void)width; (void)height;
-
-    for (i = 0; i < n; i++) {
-        const chf_keycap *c = &caps[i];
-        const gboolean held = c->target >= 0 ? (gboolean)((w->io.keys >> c->target) & 1)
-                                             : w->io.reset_held != 0;
-        const double x = c->x * KY_UNIT + 0.5, y = c->y * KY_UNIT + 0.5;
-        const double cw = c->w * KY_UNIT, ch = c->h * KY_UNIT;
-        cairo_rectangle(cr, x, y, cw, ch);
-        if (held) {
-            dbg_set_rgb(cr, CHFSESSION_ACCENT_RGB, 1.0);
-            cairo_fill_preserve(cr);
+        if (c.pc >= 0) {
+            const int top = chfdebug_row_address(w->dbg, (uint16_t)c.pc, -(rows / 3));
+            /* the rows before the start of the address space are not the end of it */
+            w->dis_top = (top & 0xFFFF) > c.pc ? 0 : top;
         }
-        dbg_set_fg(cr, wg, 0.35);
-        cairo_set_line_width(cr, 1);
-        cairo_stroke(cr);
-        if (held) cairo_set_source_rgb(cr, 0.12, 0.1, 0.08);
-        else dbg_set_fg(cr, wg, 1.0);
-        dbg_draw_centred(cr, wg, c->label, x, y, cw, ch, FALSE);
     }
+    w->dis_count = chfdebug_disassemble(w->dbg, (uint16_t)w->dis_top, w->dis_lines, rows, &pc_line);
+    gtk_widget_queue_draw(w->dis_area);
 }
 
-/* Both discs: five lamps each, lit while the console sees the control held. */
-#define ST_LAMP_W 58
-#define ST_LAMP_H 26
-
-static void draw_sticks(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer ud)
+static void draw_disasm(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer ud)
 {
-    static const char *const names[5] = { "UP", "RIGHT", "DOWN", "LEFT", "FIRE" };
     DbgWin *w = ud;
     GtkWidget *wg = GTK_WIDGET(area);
-    int s, a;
-    (void)width; (void)height;
-    for (s = 0; s < 2; s++) {
-        char t[16];
-        g_snprintf(t, sizeof t, "Disc %d", s + 1);
-        dbg_set_fg(cr, wg, 0.8);
-        dbg_draw_centred(cr, wg, t, 0, s * (ST_LAMP_H + 6) , 56, ST_LAMP_H, FALSE);
-        for (a = 0; a < 5; a++) {
-            const gboolean on = (w->io.sticks[s] >> a) & 1;
-            double x = 60 + a * (ST_LAMP_W + 4) + 0.5, y = s * (ST_LAMP_H + 6) + 0.5;
-            cairo_rectangle(cr, x, y, ST_LAMP_W, ST_LAMP_H - 1);
-            if (on) {
-                dbg_set_rgb(cr, CHFSESSION_ACCENT_RGB, 1.0);
-                cairo_fill_preserve(cr);
-            }
-            dbg_set_fg(cr, wg, 0.3);
+    const guint32 line_rgb = dbg_accent_line_rgb();
+    int i;
+    (void)height;
+
+    dis_measure(w);
+    for (i = 0; i < w->dis_count; i++) {
+        const chfdebug_line *l = &w->dis_lines[i];
+        const double y = i * w->dis_lh;
+        const double tx = GUTTER + 6;
+        const gboolean sel = w->dis_sel == l->address;
+        char text[160];
+        double x;
+
+        if (l->is_pc) {
+            dbg_set_rgb(cr, CHFSESSION_ACCENT_RGB, 1.0);
+            cairo_rectangle(cr, 0, y, width, w->dis_lh);
+            cairo_fill(cr);
+        } else if (sel) {
+            dbg_set_fg(cr, wg, 0.14);
+            cairo_rectangle(cr, 0, y, width, w->dis_lh);
+            cairo_fill(cr);
+        }
+        /* the gutter: a breakpoint is a dot, the PC a triangle */
+        if (l->has_breakpoint) {
+            cairo_arc(cr, GUTTER / 2.0 - 2, y + w->dis_lh / 2, 5.5, 0, 2 * G_PI);
+            dbg_set_rgb(cr, 0xD8362B, 1.0);
+            cairo_fill_preserve(cr);
+            dbg_set_rgb(cr, 0x000000, 0.4);
             cairo_set_line_width(cr, 1);
             cairo_stroke(cr);
-            if (on) cairo_set_source_rgb(cr, 0.12, 0.1, 0.08);
-            else dbg_set_fg(cr, wg, 0.8);
-            dbg_draw_centred(cr, wg, names[a], x, y, ST_LAMP_W, ST_LAMP_H - 1, FALSE);
+        }
+        if (l->is_pc) {
+            cairo_move_to(cr, GUTTER - 10, y + w->dis_lh / 2 - 4);
+            cairo_line_to(cr, GUTTER - 3, y + w->dis_lh / 2);
+            cairo_line_to(cr, GUTTER - 10, y + w->dis_lh / 2 + 4);
+            cairo_close_path(cr);
+            dbg_set_rgb(cr, 0x1E1A14, 1.0);
+            cairo_fill(cr);
+        }
+        if (l->is_pc) dbg_set_rgb(cr, 0x1E1A14, 1.0);
+        else dbg_set_fg(cr, wg, 1.0);
+        g_snprintf(text, sizeof text, "%04X  %-8s %-14s %s", l->address, l->bytes,
+                   l->label, l->disasm);
+        x = tx;
+        x += dbg_draw_text(cr, wg, text, x, y + 1, TRUE, 13);
+        if (l->comment[0]) {
+            if (l->is_pc) dbg_set_rgb(cr, 0x1E1A14, 0.7);
+            else dbg_set_fg(cr, wg, 0.55);
+            g_snprintf(text, sizeof text, "  ; %s", l->comment);
+            dbg_draw_text(cr, wg, text, x, y + 1, TRUE, 13);
         }
     }
+    (void)line_rgb;
+    if (w->dis_count == 0) {
+        dbg_set_fg(cr, wg, 0.6);
+        dbg_draw_text(cr, wg, "(no disassembly)", GUTTER + 6, 4, TRUE, 13);
+    }
+    /* the gutter's edge */
+    dbg_set_fg(cr, wg, 0.15);
+    cairo_set_line_width(cr, 1);
+    cairo_move_to(cr, GUTTER + 0.5, 0);
+    cairo_line_to(cr, GUTTER + 0.5, height);
+    cairo_stroke(cr);
 }
 
-static void refresh_cart(DbgWin *w)
+static void on_disasm_resize(GtkDrawingArea *area, int width, int height, gpointer ud)
 {
-    chfdebug_cart c;
-    char info[256];
-    static char text[4096], mbox[6144];
-    int len = 0, i;
-
-    chfdebug_cart_get(w->dbg, &c);
-    chfdebug_cart_info(w->dbg, info, sizeof info);
-    if (!c.present) {
-        dbg_set_text(w->cart_text, info);
-        dbg_set_text(w->mbox_text, "(no cartridge)");
-        return;
+    DbgWin *w = ud;
+    int rows;
+    (void)area; (void)width;
+    dis_measure(w);
+    rows = (int)(height / w->dis_lh) + 1;
+    if (rows != w->dis_rows) {
+        w->dis_rows = rows;
+        refresh_disasm(w);
     }
-    len += g_snprintf(text + len, sizeof text - len,
-        "%s\n\n"
-        "Type          %s\n",
-        info, c.type_name ? c.type_name : "?");
-    if (c.type != 3) {
-        len += g_snprintf(text + len, sizeof text - len,
-            "ROM           %u bytes\n", c.rom_size);
-    } else {
-        len += g_snprintf(text + len, sizeof text - len,
-            "Link          %s%s\n"
-            "Mailbox       %s\n"
-            "Live image    %u bytes   CRC-32 %08X   %s\n"
-            "Staged        %s   claims the mailbox %s   armed %d   %u bytes   CRC-32 %08X\n"
-            "Booted game   %s\n"
-            "Swaps         %d\n"
-            "Banks         %d   showing %d\n"
-            "Boot          state %d   %d%%   error %d\n"
-            "Mailbox regs  ACKSEQ $%02X   STATUS $%02X   last error %u   reply cmd $%02X   "
-            "RXLEN %u\n"
-            "Queue         %u events waiting\n",
-            c.link_up ? "up" : "down", c.link_off ? "   (switched off)" : "",
-            c.mailbox ? "open (a socket and fujimail)" : "closed (a game runs alone)",
-            c.live_size, c.live_crc, c.app_live ? "a FujiNet app" : "a game or CONFIG alone",
-            c.staged_app ? "an app" : "no", c.staged_mailbox ? "yes" : "no", c.armed,
-            c.staged_size, c.staged_crc,
-            c.booted_game ? "yes" : "no", c.swaps, c.nbanks, c.fbank,
-            c.boot_state, c.boot_pct, c.boot_err,
-            c.ackseq, c.status, c.last_error, c.reply_cmd, c.rxlen, c.queue_depth);
-    }
-    dbg_set_text(w->cart_text, text);
-
-    len = 0;
-    len += g_snprintf(mbox, sizeof mbox,
-                      "       0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F\n");
-    /* $2B00-$2FFF as the console reads it, 16 to a row */
-    for (i = 0; i < MBOX_SIZE; i++) {
-        if (i % 16 == 0)
-            len += g_snprintf(mbox + len, sizeof mbox - len, "$%04X: ", MBOX_BASE + i);
-        len += g_snprintf(mbox + len, sizeof mbox - len, "%02X ", c.mailbox_page[i]);
-        if (i % 16 == 15)
-            len += g_snprintf(mbox + len, sizeof mbox - len, "\n");
-    }
-    dbg_set_text(w->mbox_text, mbox);
 }
 
-/* The packet log is rebuilt only when it changed: a new packet, or a
- * repeat (which moves the newest serial on). */
+static int dis_line_at(DbgWin *w, double y)
+{
+    int i = (int)(y / w->dis_lh);
+    return i >= 0 && i < w->dis_count ? i : -1;
+}
+
+static void dis_toggle(DbgWin *w, int i)
+{
+    chfdebug_breakpoint_toggle(w->dbg, w->dis_lines[i].address);
+    refresh_disasm(w);
+    w->stale[TAB_BREAKS] = TRUE;
+}
+
+/* A click in the gutter toggles the line's breakpoint, anywhere else selects
+ * the line; a double-click toggles too. */
+static void on_disasm_click(GtkGestureClick *g, int n, double x, double y, gpointer ud)
+{
+    DbgWin *w = ud;
+    const int i = dis_line_at(w, y);
+    (void)g;
+    if (i < 0) return;
+    w->dis_sel = w->dis_lines[i].address;
+    if (n == 2 || x < GUTTER)
+        dis_toggle(w, i);
+    else
+        gtk_widget_queue_draw(w->dis_area);
+}
+
+static void on_follow_toggled(GtkCheckButton *b, gpointer ud)
+{
+    (void)b;
+    refresh_disasm(ud);
+}
+
+static void on_jump(GtkEntry *entry, gpointer ud)
+{
+    DbgWin *w = ud;
+    long a;
+    if (!parse_addr(w, gtk_editable_get_text(GTK_EDITABLE(entry)), &a)) return;
+    gtk_check_button_set_active(w->follow_pc, FALSE);
+    w->dis_top = (int)(a & 0xFFFF);
+    w->dis_sel = w->dis_top;
+    refresh_disasm(w);
+}
+
+static gboolean on_disasm_scroll(GtkEventControllerScroll *c, double dx, double dy, gpointer ud)
+{
+    DbgWin *w = ud;
+    int rows = (int)(dy * 3);
+    (void)c; (void)dx;
+    if (!rows) rows = dy > 0 ? 1 : -1;
+    gtk_check_button_set_active(w->follow_pc, FALSE);
+    w->dis_top = chfdebug_row_address(w->dbg, (uint16_t)w->dis_top, rows);
+    refresh_disasm(w);
+    return TRUE;
+}
+
+/* ---- refresh -------------------------------------------------------------- */
+
 static void refresh_fujinet(DbgWin *w, gboolean force)
 {
     static chfdebug_fuji_packet p[TRACE_MAX];
@@ -779,7 +664,7 @@ static void refresh_fujinet(DbgWin *w, gboolean force)
         return;
     w->fuji_count = n;
     w->fuji_last = n > 0 ? p[n - 1].serial : 0;
-    log_note_reader(w->fuji_text);
+    dbg_log_note_reader(w->fuji_text);
     t = g_string_new(NULL);
     for (i = 0; i < n; i++) {
         int k;
@@ -792,7 +677,7 @@ static void refresh_fujinet(DbgWin *w, gboolean force)
     }
     if (n == 0)
         g_string_append(t, "(no FujiBus packets since the trace was cleared)");
-    set_text_at(w->fuji_text, t->str, force || following(w->fuji_text));
+    dbg_set_text_follow(w->fuji_text, t->str, force || dbg_log_following(w->fuji_text));
     g_string_free(t, TRUE);
 }
 
@@ -801,22 +686,39 @@ static void bp_remove_clicked(GtkButton *b, gpointer ud);
 
 static const char *bp_type_name(int type)
 {
-    if (type & CHFDEBUG_BP_EXEC) return "Execute";
-    if ((type & (CHFDEBUG_BP_READ | CHFDEBUG_BP_WRITE)) ==
-        (CHFDEBUG_BP_READ | CHFDEBUG_BP_WRITE))
-        return "Read/Write";
-    if (type & CHFDEBUG_BP_READ) return "Read";
-    return "Write";
+    int i;
+    for (i = 0; i < NBPKINDS; i++)
+        if (type & k_bp_kinds[i].type)
+            return k_bp_kinds[i].name;
+    return "?";
 }
 
+static void bp_cell(char *dst, int n, unsigned v)
+{
+    g_snprintf(dst, n, "r%u,c%u", v / CHFDEBUG_VRAM_COLS, v % CHFDEBUG_VRAM_COLS);
+}
+
+/* The range as the kind's own units: addresses, ports, row,col cells, registers. */
 static const char *bp_where(const chfdebug_breakpoint *bp, char *buf, int n)
 {
-    if (bp->type & CHFDEBUG_BP_EXEC)
-        g_snprintf(buf, n, "$%04X", bp->start);
-    else if (bp->end != bp->start)
-        g_snprintf(buf, n, "$%04X-$%04X", bp->start, bp->end);
+    char a[24], b[24];
+    if (bp->type & (CHFDEBUG_BP_EXEC | CHFDEBUG_BP_READ | CHFDEBUG_BP_WRITE)) {
+        g_snprintf(a, sizeof a, "$%04X", bp->start);
+        g_snprintf(b, sizeof b, "$%04X", bp->end);
+    } else if (bp->type & (CHFDEBUG_BP_IN | CHFDEBUG_BP_OUT)) {
+        g_snprintf(a, sizeof a, "port $%02X", bp->start);
+        g_snprintf(b, sizeof b, "$%02X", bp->end);
+    } else if (bp->type & CHFDEBUG_BP_VRAM) {
+        bp_cell(a, sizeof a, bp->start);
+        bp_cell(b, sizeof b, bp->end);
+    } else {
+        g_snprintf(a, sizeof a, "r%u", bp->start);
+        g_snprintf(b, sizeof b, "r%u", bp->end);
+    }
+    if (bp->end != bp->start && !(bp->type & CHFDEBUG_BP_EXEC))
+        g_snprintf(buf, n, "%s-%s", a, b);
     else
-        g_snprintf(buf, n, "$%04X", bp->start);
+        g_snprintf(buf, n, "%s", a);
     return buf;
 }
 
@@ -829,7 +731,7 @@ static void refresh_bps(DbgWin *w)
     while ((child = gtk_widget_get_first_child(GTK_WIDGET(w->bp_list))) != NULL)
         gtk_list_box_remove(w->bp_list, child);
     if (n == 0) {
-        GtkWidget *l = gtk_label_new("No breakpoints. Click a disassembly line, or add one below.");
+        GtkWidget *l = gtk_label_new("No breakpoints. Click a disassembly line's margin, or add one below.");
         gtk_widget_add_css_class(l, "dim-label");
         gtk_list_box_append(w->bp_list, l);
         return;
@@ -839,8 +741,8 @@ static void refresh_bps(DbgWin *w)
         GtkWidget *en = gtk_check_button_new();
         GtkWidget *rm = gtk_button_new_from_icon_name("user-trash-symbolic");
         GtkWidget *l;
-        char text[320], where[48];
-        g_snprintf(text, sizeof text, "#%-3d %-10s %-26s hits %-6u %s%s", bps[i].id,
+        char text[360], where[64];
+        g_snprintf(text, sizeof text, "#%-3d %-17s %-24s hits %-6u %s%s", bps[i].id,
                    bp_type_name(bps[i].type), bp_where(&bps[i], where, sizeof where),
                    bps[i].hits, bps[i].condition[0] ? "if " : "", bps[i].condition);
         l = gtk_label_new(text);
@@ -882,14 +784,15 @@ static void refresh_status(DbgWin *w)
  * refreshed; the others catch up when selected (stale). */
 static void refresh_tab(DbgWin *w, int tab)
 {
+    const gboolean live = !chfdebug_is_stopped(w->dbg);
     w->stale[tab] = FALSE;
     switch (tab) {
-    case TAB_CPU: refresh_cpu(w); break;
+    case TAB_CPU: dbg_cpu_refresh(w->cpu, live); break;
     case TAB_DISASM: refresh_disasm(w); break;
-    case TAB_VIDEO: dbg_video_refresh(w->video, !chfdebug_is_stopped(w->dbg)); break;
-    case TAB_IO: refresh_io(w); break;
+    case TAB_VIDEO: dbg_video_refresh(w->video, live); break;
+    case TAB_IO: dbg_io_refresh(w->io, live); break;
     case TAB_BREAKS: refresh_bps(w); break;
-    case TAB_CART: refresh_cart(w); break;
+    case TAB_CART: dbg_cart_refresh(w->cart, live); break;
     case TAB_FUJINET: refresh_fujinet(w, FALSE); break;
     default: break;
     }
@@ -909,6 +812,11 @@ static void refresh_all(DbgWin *w)
     for (t = 0; t < TAB_COUNT; t++)
         w->stale[t] = TRUE;
     refresh_current(w);
+}
+
+static void on_tab_changed(gpointer ud)
+{
+    refresh_all(ud);
 }
 
 static void attach_and_refresh(DbgWin *w);
@@ -961,6 +869,20 @@ static void on_step_over(GtkButton *b, gpointer ud) { (void)b; chfdebug_step_ove
 static void on_step_out(GtkButton *b, gpointer ud) { (void)b; chfdebug_step_out(((DbgWin *)ud)->dbg); refresh_all(ud); }
 static void on_scanline(GtkButton *b, gpointer ud) { (void)b; chfdebug_scanline(((DbgWin *)ud)->dbg, 1); refresh_all(ud); }
 static void on_frame(GtkButton *b, gpointer ud) { (void)b; chfdebug_frame(((DbgWin *)ud)->dbg, 1); refresh_all(ud); }
+
+/* Run to the line selected in the Disassembly. */
+static void on_run_to(GtkButton *b, gpointer ud)
+{
+    DbgWin *w = ud;
+    (void)b;
+    if (w->dis_sel < 0) {
+        adw_toast_overlay_add_toast(w->toasts,
+            adw_toast_new("Select a line in the Disassembly first"));
+        return;
+    }
+    chfdebug_run_to(w->dbg, (uint16_t)w->dis_sel);
+    refresh_all(w);
+}
 
 static void on_prompt(GtkEntry *entry, gpointer ud)
 {
@@ -1038,114 +960,6 @@ static gboolean on_prompt_key(GtkEventControllerKey *c, guint keyval, guint code
     return TRUE;
 }
 
-static void on_reg_activate(GtkEntry *entry, gpointer ud)
-{
-    DbgWin *w = ud;
-    int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(entry), "reg"));
-    long v;
-    if (dbg_parse_num(gtk_editable_get_text(GTK_EDITABLE(entry)), &v))
-        chfdebug_cpu_set(w->dbg, k_regs[i].reg, (int)v);
-    refresh_all(w);
-}
-
-static void on_flag_toggled(GtkCheckButton *b, gpointer ud)
-{
-    DbgWin *w = ud;
-    int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "flag"));
-    if (w->syncing) return;
-    chfdebug_cpu_set(w->dbg, k_flags[i].reg, gtk_check_button_get_active(b) ? 1 : 0);
-    refresh_all(w);
-}
-
-/* A slot of the return address stack. */
-static void on_ras_activate(GtkEntry *entry, gpointer ud)
-{
-    DbgWin *w = ud;
-    int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(entry), "ras"));
-    long v;
-    if (dbg_parse_num(gtk_editable_get_text(GTK_EDITABLE(entry)), &v))
-        chfdebug_cpu_set(w->dbg, CHF_REG_RAS0 + i, (int)(v & 0x7FFF));
-    refresh_all(w);
-}
-
-/* The viewer's address box and space: show from there (16-byte aligned). */
-static void on_mem_go(GtkWidget *wgt, gpointer ud)
-{
-    DbgWin *w = ud;
-    long a;
-    (void)wgt;
-    if (parse_addr(w, gtk_editable_get_text(GTK_EDITABLE(w->mem_addr)), &a))
-        w->mem_base = (uint32_t)a & ~0xFu;
-    refresh_mem(w);
-}
-
-static void on_mem_space(GObject *o, GParamSpec *ps, gpointer ud)
-{
-    DbgWin *w = ud;
-    (void)o; (void)ps;
-    w->mem_base = 0;
-    gtk_editable_set_text(GTK_EDITABLE(w->mem_addr), "0");
-    refresh_mem(w);
-}
-
-/* A byte poked into the viewer's space (the UVI takes it with its write
- * effects; a cartridge buffer or RAM-like space takes it as data). */
-static void on_poke(GtkWidget *wgt, gpointer ud)
-{
-    DbgWin *w = ud;
-    long a, v;
-    (void)wgt;
-    if (!parse_addr(w, gtk_editable_get_text(GTK_EDITABLE(w->poke_addr)), &a) ||
-        !dbg_parse_num(gtk_editable_get_text(GTK_EDITABLE(w->poke_val)), &v))
-        return;
-    chfdebug_write(w->dbg, (int)gtk_drop_down_get_selected(w->mem_space),
-                   (uint32_t)a, (uint8_t)v);
-    refresh_all(w);
-}
-
-static void on_disasm_click(GtkGestureClick *g, int n, double x, double y, gpointer ud)
-{
-    DbgWin *w = ud;
-    GtkTextIter it;
-    int bx, by, line;
-    (void)g; (void)n;
-    gtk_text_view_window_to_buffer_coords(w->disasm, GTK_TEXT_WINDOW_WIDGET, (int)x, (int)y, &bx, &by);
-    gtk_text_view_get_iter_at_location(w->disasm, &it, bx, by);
-    line = gtk_text_iter_get_line(&it);
-    if (line < 0 || line >= w->line_count) return;
-    chfdebug_breakpoint_toggle(w->dbg, w->line_addr[line]);
-    refresh_disasm(w);
-    w->stale[TAB_BREAKS] = TRUE;
-}
-
-static void on_follow_toggled(GtkCheckButton *b, gpointer ud)
-{
-    (void)b;
-    refresh_disasm(ud);
-}
-
-static void on_jump(GtkEntry *entry, gpointer ud)
-{
-    DbgWin *w = ud;
-    long a;
-    if (!parse_addr(w, gtk_editable_get_text(GTK_EDITABLE(entry)), &a)) return;
-    gtk_check_button_set_active(w->follow_pc, FALSE);
-    w->disasm_top = (int)(a & 0x7FFF);
-    refresh_disasm(w);
-}
-
-static gboolean on_disasm_scroll(GtkEventControllerScroll *c, double dx, double dy, gpointer ud)
-{
-    DbgWin *w = ud;
-    int rows = (int)(dy * 3);
-    (void)c; (void)dx;
-    if (!rows) rows = dy > 0 ? 1 : -1;
-    gtk_check_button_set_active(w->follow_pc, FALSE);
-    w->disasm_top = chfdebug_row_address(w->dbg, (uint16_t)w->disasm_top, rows);
-    refresh_disasm(w);
-    return TRUE;
-}
-
 static void bp_enable_toggled(GtkCheckButton *b, gpointer ud)
 {
     DbgWin *w = ud;
@@ -1161,34 +975,71 @@ static void bp_remove_clicked(GtkButton *b, gpointer ud)
     refresh_all(w);
 }
 
+/* One end of a breakpoint's range, in the kind's own units. */
+static int bp_parse(DbgWin *w, int kind, const char *text, long *out)
+{
+    long row, col;
+    char *comma;
+
+    switch (k_bp_kinds[kind].space) {
+    case CHF_SPACE_PROG:
+        return parse_addr(w, text, out);
+    case CHF_SPACE_VRAM:
+        /* row,col, or a bare cell number */
+        if ((comma = strchr(text, ',')) != NULL) {
+            g_autofree char *r = g_strndup(text, (gsize)(comma - text));
+            if (!dbg_parse_dec(r, &row) || !dbg_parse_dec(comma + 1, &col) ||
+                row < 0 || row >= CHFDEBUG_VRAM_ROWS || col < 0 || col >= CHFDEBUG_VRAM_COLS)
+                return 0;
+            *out = row * CHFDEBUG_VRAM_COLS + col;
+            return 1;
+        }
+        return dbg_parse_dec(text, out);
+    default:
+        return dbg_parse_dec(text, out);
+    }
+}
+
+static void on_bp_type_changed(GObject *o, GParamSpec *ps, gpointer ud)
+{
+    DbgWin *w = ud;
+    guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(o));
+    (void)ps;
+    if (sel < (guint)NBPKINDS)
+        gtk_entry_set_placeholder_text(w->bp_start, k_bp_kinds[sel].hint);
+}
+
 static void on_bp_add(GtkWidget *wgt, gpointer ud)
 {
     DbgWin *w = ud;
-    static const int types[4] = { CHFDEBUG_BP_EXEC, CHFDEBUG_BP_READ, CHFDEBUG_BP_WRITE,
-                                  CHFDEBUG_BP_READ | CHFDEBUG_BP_WRITE };
     guint sel = gtk_drop_down_get_selected(w->bp_type);
     long a = 0, b = 0;
     int id;
     const char *end = gtk_editable_get_text(GTK_EDITABLE(w->bp_end));
     (void)wgt;
-    if (sel >= G_N_ELEMENTS(types)) sel = 0;
-    if (!parse_addr(w, gtk_editable_get_text(GTK_EDITABLE(w->bp_start)), &a)) {
-        gtk_label_set_text(w->bp_msg, "Not an address or a label");
+    if (sel >= (guint)NBPKINDS) sel = 0;
+    if (!bp_parse(w, (int)sel, gtk_editable_get_text(GTK_EDITABLE(w->bp_start)), &a)) {
+        gtk_label_set_text(w->bp_msg, "Not a valid start for this kind of breakpoint");
         return;
     }
     b = a;
-    if (end && *end && !parse_addr(w, end, &b)) {
-        gtk_label_set_text(w->bp_msg, "The end is not an address or a label");
+    if (end && *end && !bp_parse(w, (int)sel, end, &b)) {
+        gtk_label_set_text(w->bp_msg, "The end is not valid");
         return;
     }
     if (b < a) {
         gtk_label_set_text(w->bp_msg, "The end comes before the start");
         return;
     }
-    id = chfdebug_breakpoint_add(w->dbg, types[sel], CHF_SPACE_PROG, (uint16_t)a, (uint16_t)b,
+    if (a < 0 || b > 0xFFFF) {
+        gtk_label_set_text(w->bp_msg, "Out of range");
+        return;
+    }
+    id = chfdebug_breakpoint_add(w->dbg, k_bp_kinds[sel].type, k_bp_kinds[sel].space,
+                                 (uint16_t)a, (uint16_t)b,
                                  gtk_editable_get_text(GTK_EDITABLE(w->bp_cond)));
     if (id < 0) {
-        gtk_label_set_text(w->bp_msg, "The condition does not parse, or the range is outside $0000-$7FFF");
+        gtk_label_set_text(w->bp_msg, "The condition does not parse, or the range is outside its space");
         return;
     }
     gtk_label_set_text(w->bp_msg, "");
@@ -1244,7 +1095,7 @@ static void on_symbols(GtkWidget *b, gpointer ud)
     gtk_file_filter_add_pattern(all, "*");
     g_list_store_append(filters, syms);
     g_list_store_append(filters, all);
-    gtk_file_dialog_set_title(dlg, "Load Symbols (AS .map / .lst, WLA-DX .sym, AAAA name)");
+    gtk_file_dialog_set_title(dlg, "Load Symbols (AS .map / .lst, or AAAA name)");
     gtk_file_dialog_set_filters(dlg, G_LIST_MODEL(filters));
     /* a program's symbols usually sit beside it */
     if (cart && *cart) {
@@ -1259,7 +1110,7 @@ static void on_symbols(GtkWidget *b, gpointer ud)
     g_object_unref(dlg);
 }
 
-/* <cart>.map/.lst/.sym next to the opened cartridge, no picker needed. */
+/* <cart>.map/.lst next to the opened cartridge, no picker needed. */
 static void on_symbols_beside(GtkButton *b, gpointer ud)
 {
     DbgWin *w = ud;
@@ -1306,12 +1157,15 @@ static void on_fuji_clear(GtkButton *b, gpointer ud)
     refresh_fujinet(w, TRUE);
 }
 
+/* Each tab has its own Help topic; the header bar's button follows it. */
 static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, gpointer ud)
 {
     DbgWin *w = ud;
     (void)nb; (void)page;
-    if (num < TAB_COUNT)
+    if (num < TAB_COUNT) {
+        chf_help_set_context(w->win, k_tab_contexts[num]);
         refresh_tab(w, (int)num);
+    }
 }
 
 static void hide_window(DbgWin *w)
@@ -1326,6 +1180,7 @@ static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint code,
     DbgWin *w = ud;
     (void)c; (void)code;
     switch (keyval) {
+    case GDK_KEY_F1: chf_help_for(w->win); return TRUE;
     case GDK_KEY_F5: on_run(NULL, w); return TRUE;
     case GDK_KEY_F7: on_step(NULL, w); return TRUE;
     case GDK_KEY_F8:
@@ -1369,12 +1224,13 @@ static GtkWidget *build_toolbar(DbgWin *w)
     GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     GtkWidget *b, *sym, *sympop, *beside, *save, *pop, *popbox;
     static const struct { const char *kind, *title, *file; } saves[] = {
-        { "dis", "Disassembly ($0000-$7FFF as code)", "disassembly.asm" },
-        { "mailbox", "Mailbox page ($2B00-$2FFF)", "mailbox.bin" },
-        { "uvi", "UVI registers (768 bytes)", "uvi.bin" },
-        { "font", "Glyph table (64 x 8 bytes)", "font.bin" },
+        { "dis", "Disassembly ($0000-$47FF as code)", "disassembly.asm" },
+        { "mailbox", "Mailbox ($F800-$FFFF)", "mailbox.bin" },
+        { "vram", "Video RAM (8192 bytes)", "vram.bin" },
+        { "scratch", "Scratchpad (64 bytes)", "scratch.bin" },
         { "cart", "Cartridge image", "cartridge.bin" },
         { "screen", "Screen (PPM)", "screen.ppm" },
+        { "vramshot", "Whole VRAM view (PPM)", "vram.ppm" },
         { "regs", "Registers (text)", "registers.txt" } };
     unsigned i;
 
@@ -1390,17 +1246,18 @@ static GtkWidget *build_toolbar(DbgWin *w)
     TB("Step (F7)", on_step);
     TB("Step Over (F8)", on_step_over);
     TB("Step Out (\xe2\x87\xa7""F8)", on_step_out);
-    TB("Scanline+1", on_scanline);
-    TB("Frame+1", on_frame);
+    TB("Frame", on_frame);
+    TB("Scanline", on_scanline);
+    TB("Run to Cursor", on_run_to);
 #undef TB
 
     /* Load Symbols: a file, or (the arrow) the files beside the cartridge */
     sym = adw_split_button_new();
-    adw_split_button_set_label(ADW_SPLIT_BUTTON(sym), "Load Symbols\xe2\x80\xa6");
+    adw_split_button_set_label(ADW_SPLIT_BUTTON(sym), "Symbols\xe2\x80\xa6");
     adw_split_button_set_dropdown_tooltip(ADW_SPLIT_BUTTON(sym), "More ways to load symbols");
     g_signal_connect(sym, "clicked", G_CALLBACK(on_symbols), w);
     sympop = gtk_popover_new();
-    beside = gtk_button_new_with_label("Beside the Cartridge (.map, .lst, .sym)");
+    beside = gtk_button_new_with_label("Beside the Cartridge (.map, .lst)");
     gtk_widget_add_css_class(beside, "flat");
     g_signal_connect(beside, "clicked", G_CALLBACK(on_symbols_beside), w);
     gtk_popover_set_child(GTK_POPOVER(sympop), beside);
@@ -1436,8 +1293,8 @@ static GtkWidget *build_prompt(DbgWin *w)
     gtk_text_view_set_wrap_mode(w->prompt_out, GTK_WRAP_WORD_CHAR);
     w->prompt_in = GTK_ENTRY(gtk_entry_new());
     gtk_entry_set_placeholder_text(w->prompt_in,
-        "Command (help, step, break, bpw, print, mem, poke, uvi, objects, screen, io, cart, "
-        "disasm, ...) \xe2\x80\x94 Tab completes, Up/Down recall");
+        "Command (help, step, break, bpv, print, mem, poke, scratch, kstack, vram, pal, ports, "
+        "cart, disasm, ...) \xe2\x80\x94 Tab completes, Up/Down recall");
     gtk_widget_set_hexpand(GTK_WIDGET(w->prompt_in), TRUE);
     g_signal_connect(w->prompt_in, "activate", G_CALLBACK(on_prompt), w);
     /* ahead of the entry's own text handling, so Tab and Up/Down are ours */
@@ -1449,160 +1306,8 @@ static GtkWidget *build_prompt(DbgWin *w)
 
     gtk_box_append(GTK_BOX(box), scroll);
     gtk_box_append(GTK_BOX(box), GTK_WIDGET(w->prompt_in));
-    dbg_set_text(w->prompt_out, "Channel F debugger prompt (the Signetics 2650 and the 2637 "
-                                "UVI). Type 'help' for every command.\n");
-    return dbg_padded(box);
-}
-
-static GtkWidget *reg_entry(DbgWin *w, int i)
-{
-    w->reg[i] = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_max_length(w->reg[i], 4);
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->reg[i]), k_regs[i].digits + 1);
-    gtk_editable_set_max_width_chars(GTK_EDITABLE(w->reg[i]), k_regs[i].digits + 1);
-    gtk_widget_add_css_class(GTK_WIDGET(w->reg[i]), "monospace");
-    g_object_set_data(G_OBJECT(w->reg[i]), "reg", GINT_TO_POINTER(i));
-    g_signal_connect(w->reg[i], "activate", G_CALLBACK(on_reg_activate), w);
-    return GTK_WIDGET(w->reg[i]);
-}
-
-/* One row of R1-R3 (index `first` in k_regs) under a label that says which
- * RS selects them. */
-static GtkWidget *bank_row(DbgWin *w, int bank, int first)
-{
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    int i;
-
-    w->bank_label[bank] = gtk_label_new(bank ? "RS=1" : "RS=0");
-    gtk_widget_add_css_class(w->bank_label[bank], "arc-pill");
-    gtk_widget_set_size_request(w->bank_label[bank], 52, -1);
-    gtk_box_append(GTK_BOX(row), w->bank_label[bank]);
-    for (i = 0; i < 3; i++)
-        gtk_box_append(GTK_BOX(row), dbg_labeled(k_regs[first + i].name, reg_entry(w, first + i)));
-    return row;
-}
-
-static GtkWidget *build_cpu(DbgWin *w)
-{
-    static const char *const pills[NPILLS] = { "S (sense)", "HALT", "IRQ", "ILLEGAL" };
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 32);
-    GtkWidget *regs = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *stack = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *row0 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *rowp = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *flags = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *pinrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GtkWidget *memtools = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *poketools = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    GtkWidget *grid = gtk_grid_new();
-    GtkWidget *l, *go, *poke, *memscroll;
-    static const char *const spaces[] = { "PROG (CPU view)", "UVI registers", "Cartridge", NULL };
-    int i;
-
-    /* R0, then the two sets of R1-R3 */
-    gtk_box_append(GTK_BOX(row0), dbg_labeled("R0", reg_entry(w, 0)));
-    gtk_box_append(GTK_BOX(regs), row0);
-    gtk_box_append(GTK_BOX(regs), bank_row(w, 0, 1));
-    gtk_box_append(GTK_BOX(regs), bank_row(w, 1, 4));
-    /* PC and IAR, PSU, PSL, SP, CC */
-    for (i = 7; i < 9; i++)
-        gtk_box_append(GTK_BOX(rowp), dbg_labeled(k_regs[i].name, reg_entry(w, i)));
-    for (i = 9; i < NREGS; i++)
-        gtk_box_append(GTK_BOX(rowp), dbg_labeled(k_regs[i].name, reg_entry(w, i)));
-    gtk_box_append(GTK_BOX(regs), rowp);
-    l = gtk_label_new("Flags");
-    gtk_widget_add_css_class(l, "dim-label");
-    gtk_box_append(GTK_BOX(flags), l);
-    for (i = 0; i < NFLAGS; i++) {
-        w->flag[i] = gtk_check_button_new_with_label(k_flags[i].name);
-        g_object_set_data(G_OBJECT(w->flag[i]), "flag", GINT_TO_POINTER(i));
-        g_signal_connect(w->flag[i], "toggled", G_CALLBACK(on_flag_toggled), w);
-        gtk_box_append(GTK_BOX(flags), w->flag[i]);
-    }
-    gtk_box_append(GTK_BOX(regs), flags);
-    for (i = 0; i < NPILLS; i++) {
-        w->pill[i] = gtk_label_new(pills[i]);
-        gtk_widget_add_css_class(w->pill[i], "arc-pill");
-        gtk_widget_add_css_class(w->pill[i], "dim-label");
-        gtk_box_append(GTK_BOX(pinrow), w->pill[i]);
-    }
-    gtk_box_append(GTK_BOX(regs), pinrow);
-    w->cpu_info = GTK_LABEL(gtk_label_new(""));
-    gtk_widget_add_css_class(GTK_WIDGET(w->cpu_info), "dim-label");
-    gtk_label_set_xalign(w->cpu_info, 0);
-    gtk_label_set_ellipsize(w->cpu_info, PANGO_ELLIPSIZE_END);
-    gtk_box_append(GTK_BOX(regs), GTK_WIDGET(w->cpu_info));
-    gtk_box_append(GTK_BOX(regs), dbg_hint("PSU = S F II . . SP(3); PSL = CC IDC RS WC OVF COM C. "
-                                           "Enter in a register or flag writes it; PC is the 15-bit "
-                                           "address, IAR its low 13 bits.", 44));
-
-    /* the return stack: a call increments SP and stores the return address
-     * at that slot, so slot SP is the top and slots 1..SP are live */
-    gtk_box_append(GTK_BOX(stack), dbg_heading("Return address stack"));
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 6);
-    for (i = 0; i < 8; i++) {
-        char name[8];
-        g_snprintf(name, sizeof name, "%d", i);
-        w->ras_label[i] = gtk_label_new(name);
-        gtk_widget_add_css_class(w->ras_label[i], "arc-pill");
-        gtk_widget_add_css_class(w->ras_label[i], "dim-label");
-        w->ras[i] = GTK_ENTRY(gtk_entry_new());
-        gtk_entry_set_max_length(w->ras[i], 5);
-        gtk_editable_set_width_chars(GTK_EDITABLE(w->ras[i]), 5);
-        gtk_editable_set_max_width_chars(GTK_EDITABLE(w->ras[i]), 5);
-        gtk_widget_add_css_class(GTK_WIDGET(w->ras[i]), "monospace");
-        g_object_set_data(G_OBJECT(w->ras[i]), "ras", GINT_TO_POINTER(i));
-        g_signal_connect(w->ras[i], "activate", G_CALLBACK(on_ras_activate), w);
-        gtk_grid_attach(GTK_GRID(grid), w->ras_label[i], 0, i, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(w->ras[i]), 1, i, 1, 1);
-    }
-    gtk_box_append(GTK_BOX(stack), grid);
-    gtk_box_append(GTK_BOX(top), regs);
-    gtk_box_append(GTK_BOX(top), stack);
-
-    w->beam = GTK_LABEL(gtk_label_new(""));
-    gtk_widget_add_css_class(GTK_WIDGET(w->beam), "dim-label");
-    gtk_label_set_xalign(w->beam, 0);
-    gtk_label_set_ellipsize(w->beam, PANGO_ELLIPSIZE_END);
-
-    /* the memory viewer: the console has no RAM, so this is the CPU's view
-     * (cartridge, UVI), the UVI's own register file, and the cartridge's
-     * buffer */
-    w->mem_space = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(spaces));
-    g_signal_connect(w->mem_space, "notify::selected", G_CALLBACK(on_mem_space), w);
-    w->mem_addr = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->mem_addr, "$1800 or label");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->mem_addr), 14);
-    g_signal_connect(w->mem_addr, "activate", G_CALLBACK(on_mem_go), w);
-    go = gtk_button_new_with_label("Go");
-    g_signal_connect(go, "clicked", G_CALLBACK(on_mem_go), w);
-    gtk_box_append(GTK_BOX(memtools), dbg_heading("Memory"));
-    gtk_box_append(GTK_BOX(memtools), GTK_WIDGET(w->mem_space));
-    gtk_box_append(GTK_BOX(memtools), dbg_labeled("From", GTK_WIDGET(w->mem_addr)));
-    gtk_box_append(GTK_BOX(memtools), go);
-    w->poke_addr = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->poke_addr, "address");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->poke_addr), 10);
-    w->poke_val = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->poke_val, "value");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->poke_val), 6);
-    g_signal_connect(w->poke_val, "activate", G_CALLBACK(on_poke), w);
-    poke = gtk_button_new_with_label("Poke");
-    g_signal_connect(poke, "clicked", G_CALLBACK(on_poke), w);
-    gtk_box_append(GTK_BOX(poketools), dbg_labeled("Poke", GTK_WIDGET(w->poke_addr)));
-    gtk_box_append(GTK_BOX(poketools), GTK_WIDGET(w->poke_val));
-    gtk_box_append(GTK_BOX(poketools), poke);
-    gtk_box_append(GTK_BOX(poketools),
-                   dbg_hint("The UVI takes a poke with its write effects; ROM ignores it.", 30));
-    memscroll = dbg_mono_view(&w->mem_text, FALSE);
-
-    gtk_box_append(GTK_BOX(box), top);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(w->beam));
-    gtk_box_append(GTK_BOX(box), memtools);
-    gtk_box_append(GTK_BOX(box), memscroll);
-    gtk_box_append(GTK_BOX(box), poketools);
+    dbg_set_text(w->prompt_out, "Channel F debugger prompt (the Fairchild F8 / F3850, the 128 x 64 "
+                                "video RAM and the FujiNet cartridge). Type 'help' for every command.\n");
     return dbg_padded(box);
 }
 
@@ -1610,76 +1315,46 @@ static GtkWidget *build_disasm(DbgWin *w)
 {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *scroll = dbg_mono_view(&w->disasm, FALSE);
     GtkGesture *click = gtk_gesture_click_new();
     GtkEventController *scrollc = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
-    GtkWidget *hint;
-
-    accent_tag(w->disasm, "pc");
+    GtkWidget *hint, *frame;
 
     w->follow_pc = GTK_CHECK_BUTTON(gtk_check_button_new_with_label("Follow PC"));
     gtk_check_button_set_active(w->follow_pc, TRUE);
     g_signal_connect(w->follow_pc, "toggled", G_CALLBACK(on_follow_toggled), w);
     w->jump = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->jump, "$0400 or label");
+    gtk_entry_set_placeholder_text(w->jump, "$0802 or label");
     gtk_editable_set_width_chars(GTK_EDITABLE(w->jump), 14);
     g_signal_connect(w->jump, "activate", G_CALLBACK(on_jump), w);
-    hint = gtk_label_new("Click a line to toggle its breakpoint; scroll to browse");
+    hint = gtk_label_new("Click the margin or double-click a line for a breakpoint; scroll to browse");
     gtk_widget_add_css_class(hint, "dim-label");
+    gtk_label_set_ellipsize(GTK_LABEL(hint), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(hint), 1);
+    gtk_widget_set_hexpand(hint, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(hint), 0);
     gtk_box_append(GTK_BOX(row), GTK_WIDGET(w->follow_pc));
     gtk_box_append(GTK_BOX(row), dbg_labeled("Go to", GTK_WIDGET(w->jump)));
     gtk_box_append(GTK_BOX(row), hint);
 
+    /* a drawing area of any height: the lines that fit are the ones read */
+    w->dis_area = gtk_drawing_area_new();
+    w->dis_sel = -1;
+    gtk_widget_set_hexpand(w->dis_area, TRUE);
+    gtk_widget_set_vexpand(w->dis_area, TRUE);
+    gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(w->dis_area), 120);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(w->dis_area), draw_disasm, w, NULL);
+    g_signal_connect(w->dis_area, "resize", G_CALLBACK(on_disasm_resize), w);
     g_signal_connect(click, "pressed", G_CALLBACK(on_disasm_click), w);
-    gtk_widget_add_controller(GTK_WIDGET(w->disasm), GTK_EVENT_CONTROLLER(click));
+    gtk_widget_add_controller(w->dis_area, GTK_EVENT_CONTROLLER(click));
     g_signal_connect(scrollc, "scroll", G_CALLBACK(on_disasm_scroll), w);
-    gtk_widget_add_controller(GTK_WIDGET(w->disasm), scrollc);
-    /* No vertical scrollbar (the wheel walks the disassembly instead), and
-     * EXTERNAL rather than NEVER: NEVER would make the window's minimum
-     * height all 48 lines. */
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_EXTERNAL);
+    gtk_widget_add_controller(w->dis_area, scrollc);
+    frame = gtk_frame_new(NULL);
+    gtk_frame_set_child(GTK_FRAME(frame), w->dis_area);
+    gtk_widget_set_vexpand(frame, TRUE);
 
     gtk_box_append(GTK_BOX(box), row);
-    gtk_box_append(GTK_BOX(box), scroll);
-    w->disasm_top = 0;
-    return dbg_padded(box);
-}
-
-/* The text on the left; on the right the keypads and panel, and both discs. */
-static GtkWidget *build_io(DbgWin *w)
-{
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    float kw, kh;
-
-    chfsession_keyboard_layout(CHF_MACHINE_ARCADIA, NULL, &kw, &kh);
-    w->keys_area = gtk_drawing_area_new();
-    gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(w->keys_area), (int)(kw * KY_UNIT) + 2);
-    gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(w->keys_area), (int)(kh * KY_UNIT) + 2);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(w->keys_area), draw_keys, w, NULL);
-    gtk_widget_set_halign(w->keys_area, GTK_ALIGN_START);
-
-    w->sticks_area = gtk_drawing_area_new();
-    gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(w->sticks_area), 60 + 5 * (ST_LAMP_W + 4));
-    gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(w->sticks_area), 2 * (ST_LAMP_H + 6));
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(w->sticks_area), draw_sticks, w, NULL);
-    gtk_widget_set_halign(w->sticks_area, GTK_ALIGN_START);
-
-    w->io.machine = CHF_MACHINE_ARCADIA;
-    {
-        GtkWidget *text = dbg_mono_view(&w->io_text, FALSE);
-        gtk_text_view_set_wrap_mode(w->io_text, GTK_WRAP_WORD_CHAR);
-        gtk_widget_set_size_request(text, 560, -1);
-        gtk_widget_set_hexpand(text, FALSE);
-        gtk_box_append(GTK_BOX(box), text);
-    }
-    gtk_box_append(GTK_BOX(right), dbg_heading("Keypads and panel (as the console latched them)"));
-    gtk_box_append(GTK_BOX(right), w->keys_area);
-    gtk_box_append(GTK_BOX(right), dbg_hint("Held keys are filled.", 30));
-    gtk_box_append(GTK_BOX(right), dbg_heading("Discs"));
-    gtk_box_append(GTK_BOX(right), w->sticks_area);
-    gtk_box_append(GTK_BOX(box), right);
+    gtk_box_append(GTK_BOX(box), frame);
+    w->dis_top = 0;
     return dbg_padded(box);
 }
 
@@ -1689,23 +1364,27 @@ static GtkWidget *build_breaks(DbgWin *w)
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     GtkWidget *scroll = gtk_scrolled_window_new();
     GtkWidget *add, *clear;
-    static const char *const types[] = { "Execute", "Read", "Write", "Read/Write", NULL };
+    GtkStringList *kinds = gtk_string_list_new(NULL);
+    int i;
 
+    for (i = 0; i < NBPKINDS; i++)
+        gtk_string_list_append(kinds, k_bp_kinds[i].name);
     w->bp_list = GTK_LIST_BOX(gtk_list_box_new());
     gtk_list_box_set_selection_mode(w->bp_list, GTK_SELECTION_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), GTK_WIDGET(w->bp_list));
     gtk_widget_set_vexpand(scroll, TRUE);
 
-    w->bp_type = GTK_DROP_DOWN(gtk_drop_down_new_from_strings(types));
+    w->bp_type = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(kinds), NULL));
     w->bp_start = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->bp_start, "$0400 / label");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_start), 14);
+    gtk_entry_set_placeholder_text(w->bp_start, k_bp_kinds[0].hint);
+    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_start), 18);
     w->bp_end = GTK_ENTRY(gtk_entry_new());
     gtk_entry_set_placeholder_text(w->bp_end, "(end)");
-    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_end), 8);
+    gtk_editable_set_width_chars(GTK_EDITABLE(w->bp_end), 9);
     w->bp_cond = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(w->bp_cond, "condition (r0 == $FF && vpos > 100) \xe2\x80\x94 optional");
+    gtk_entry_set_placeholder_text(w->bp_cond, "condition (a == $FF && vpos > 100) \xe2\x80\x94 optional");
     gtk_widget_set_hexpand(GTK_WIDGET(w->bp_cond), TRUE);
+    g_signal_connect(w->bp_type, "notify::selected", G_CALLBACK(on_bp_type_changed), w);
     g_signal_connect(w->bp_start, "activate", G_CALLBACK(on_bp_add), w);
     g_signal_connect(w->bp_end, "activate", G_CALLBACK(on_bp_add), w);
     g_signal_connect(w->bp_cond, "activate", G_CALLBACK(on_bp_add), w);
@@ -1722,30 +1401,11 @@ static GtkWidget *build_breaks(DbgWin *w)
     w->bp_msg = GTK_LABEL(gtk_label_new(""));
     gtk_widget_add_css_class(GTK_WIDGET(w->bp_msg), "chf-accent-text");
     gtk_label_set_xalign(w->bp_msg, 0);
+    g_object_unref(kinds);
 
     gtk_box_append(GTK_BOX(box), scroll);
     gtk_box_append(GTK_BOX(box), row);
     gtk_box_append(GTK_BOX(box), GTK_WIDGET(w->bp_msg));
-    return dbg_padded(box);
-}
-
-/* The state as text on the left; the mailbox page the console reads on the
- * right. */
-static GtkWidget *build_cart(DbgWin *w)
-{
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *mbox = dbg_mono_view(&w->mbox_text, FALSE);
-    GtkWidget *text = dbg_mono_view(&w->cart_text, FALSE);
-
-    gtk_text_view_set_wrap_mode(w->cart_text, GTK_WRAP_WORD_CHAR);
-    gtk_widget_set_size_request(text, 480, -1);
-    gtk_widget_set_hexpand(text, FALSE);
-    gtk_widget_set_size_request(mbox, 420, -1);
-    gtk_box_append(GTK_BOX(right), dbg_heading("Mailbox page ($2B00-$2FFF) as the console reads it"));
-    gtk_box_append(GTK_BOX(right), mbox);
-    gtk_box_append(GTK_BOX(box), text);
-    gtk_box_append(GTK_BOX(box), right);
     return dbg_padded(box);
 }
 
@@ -1770,18 +1430,19 @@ static GtkWidget *build_fujinet(DbgWin *w)
     gtk_box_append(GTK_BOX(left), dbg_heading("FujiBus packets (SLIP-decoded)"));
     gtk_box_append(GTK_BOX(left), row);
     gtk_box_append(GTK_BOX(left), dbg_mono_view(&w->fuji_text, FALSE));
-    make_log(w->fuji_text);
+    dbg_log_make(w->fuji_text);
 
     gtk_box_append(GTK_BOX(right), dbg_heading("The cartridge's mailbox"));
     gtk_box_append(GTK_BOX(right), dbg_mono_view(&w->fuji_state, FALSE));
+    gtk_text_view_set_wrap_mode(w->fuji_state, GTK_WRAP_WORD_CHAR);
 
     gtk_paned_set_start_child(GTK_PANED(paned), left);
     gtk_paned_set_end_child(GTK_PANED(paned), right);
     gtk_paned_set_shrink_start_child(GTK_PANED(paned), FALSE);
     gtk_paned_set_shrink_end_child(GTK_PANED(paned), FALSE);
     gtk_paned_set_resize_end_child(GTK_PANED(paned), FALSE);
-    gtk_widget_set_size_request(left, 620, -1);
-    gtk_widget_set_size_request(right, 320, -1);
+    gtk_widget_set_size_request(left, 560, -1);
+    gtk_widget_set_size_request(right, 460, -1);
     w->fuji_count = -1;
     return dbg_padded(paned);
 }
@@ -1792,7 +1453,10 @@ static void on_destroy(GtkWidget *widget, gpointer ud)
     (void)widget;
     if (w->timer) g_source_remove(w->timer);
     chfdebug_detach(w->dbg);
+    dbg_cpu_free(w->cpu);
     dbg_video_free(w->video);
+    dbg_io_free(w->io);
+    dbg_cart_free(w->cart);
     if (w->history) g_ptr_array_unref(w->history);
     if (g_win == w) g_win = NULL;
     g_free(w);
@@ -1826,7 +1490,7 @@ static int tab_from_env(void)
 void chf_debugger_show(GtkWindow *parent, chfsession *session)
 {
     DbgWin *w;
-    GtkWidget *toolbar, *header, *root, *notebook, *overlay, *video;
+    GtkWidget *toolbar, *header, *root, *notebook, *overlay, *cpu, *video, *io, *cart;
     GtkEventController *keys;
     int tab;
 
@@ -1852,7 +1516,10 @@ void chf_debugger_show(GtkWindow *parent, chfsession *session)
     g_signal_connect(w->win, "map", G_CALLBACK(on_window_map), w);
     g_signal_connect(w->win, "unmap", G_CALLBACK(on_window_unmap), w);
 
-    w->video = dbg_video_new(session, w->dbg, &video);
+    w->cpu = dbg_cpu_new(session, w->dbg, on_tab_changed, w, &cpu);
+    w->video = dbg_video_new(session, w->dbg, on_tab_changed, w, &video);
+    w->io = dbg_io_new(session, w->dbg, &io);
+    w->cart = dbg_cart_new(session, w->dbg, &cart);
 
     root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_append(GTK_BOX(root), build_toolbar(w));
@@ -1860,16 +1527,17 @@ void chf_debugger_show(GtkWindow *parent, chfsession *session)
     w->notebook = GTK_NOTEBOOK(notebook);
     gtk_widget_set_vexpand(notebook, TRUE);
     gtk_notebook_append_page(w->notebook, build_prompt(w), gtk_label_new("Prompt"));
-    gtk_notebook_append_page(w->notebook, build_cpu(w), gtk_label_new("CPU & RAM"));
+    gtk_notebook_append_page(w->notebook, cpu, gtk_label_new("CPU & RAM"));
     gtk_notebook_append_page(w->notebook, build_disasm(w), gtk_label_new("Disassembly"));
     gtk_notebook_append_page(w->notebook, video, gtk_label_new("Video"));
-    gtk_notebook_append_page(w->notebook, build_io(w), gtk_label_new("Sound & I/O"));
+    gtk_notebook_append_page(w->notebook, io, gtk_label_new("Sound & I/O"));
     gtk_notebook_append_page(w->notebook, build_breaks(w), gtk_label_new("Breakpoints"));
-    gtk_notebook_append_page(w->notebook, build_cart(w), gtk_label_new("Cart"));
+    gtk_notebook_append_page(w->notebook, cart, gtk_label_new("Cart"));
     gtk_notebook_append_page(w->notebook, build_fujinet(w), gtk_label_new("FujiNet"));
     gtk_box_append(GTK_BOX(root), notebook);
     tab = tab_from_env();
     if (tab >= 0) gtk_notebook_set_current_page(w->notebook, tab);
+    chf_help_set_context(w->win, k_tab_contexts[tab >= 0 ? tab : 0]);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), w);
 
     overlay = adw_toast_overlay_new();
@@ -1880,6 +1548,7 @@ void chf_debugger_show(GtkWindow *parent, chfsession *session)
     header = adw_header_bar_new();
     w->title = ADW_WINDOW_TITLE(adw_window_title_new("Debugger", ""));
     adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), GTK_WIDGET(w->title));
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), chf_help_button(NULL));
     toolbar = adw_toolbar_view_new();
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), overlay);

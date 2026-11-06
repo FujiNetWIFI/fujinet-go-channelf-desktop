@@ -115,7 +115,7 @@ static gboolean on_link(GtkLabel *label, const char *uri, gpointer ud)
 {
     (void)ud;
     if (uri[0] == '#') {
-        msdos_help_show(NULL, uri);
+        chf_help_show(NULL, uri);
     } else {
         GtkUriLauncher *l = gtk_uri_launcher_new(uri);
         gtk_uri_launcher_launch(l, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(label))),
@@ -322,8 +322,8 @@ static GtkWidget *list_row(const char *title, const char *sub, int topic, int bl
         gtk_box_append(GTK_BOX(box), s);
     }
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
-    g_object_set_data(G_OBJECT(row), "msdos-topic", GINT_TO_POINTER(topic));
-    g_object_set_data(G_OBJECT(row), "msdos-block", GINT_TO_POINTER(block));
+    g_object_set_data(G_OBJECT(row), "chf-topic", GINT_TO_POINTER(topic));
+    g_object_set_data(G_OBJECT(row), "chf-block", GINT_TO_POINTER(block));
     return row;
 }
 
@@ -359,8 +359,8 @@ static void on_row_selected(GtkListBox *list, GtkListBoxRow *row, gpointer ud)
     (void)list;
     if (h->filling || !row)
         return;
-    show_topic(h, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "msdos-topic")),
-               GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "msdos-block")),
+    show_topic(h, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "chf-topic")),
+               GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "chf-block")),
                gtk_editable_get_text(GTK_EDITABLE(h->search)));
 }
 
@@ -498,7 +498,7 @@ static void build(GtkWindow *parent)
     fill_list(h);
 }
 
-void msdos_help_show(GtkWindow *parent, const char *id)
+void chf_help_show(GtkWindow *parent, const char *id)
 {
     int t = 0, b = -1;
     if (!g_help)
@@ -521,44 +521,44 @@ void msdos_help_show(GtkWindow *parent, const char *id)
     gtk_window_present(g_help->win);
 }
 
-void msdos_help_set_context(GtkWindow *window, const char *context)
+void chf_help_set_context(GtkWindow *window, const char *context)
 {
-    g_object_set_data_full(G_OBJECT(window), "msdos-help-context", g_strdup(context), g_free);
+    g_object_set_data_full(G_OBJECT(window), "chf-help-context", g_strdup(context), g_free);
 }
 
-const char *msdos_help_get_context(GtkWindow *window)
+const char *chf_help_get_context(GtkWindow *window)
 {
     const char *c;
-    if (MSDOS_IS_WINDOW(window))
-        return msdos_window_help_context(MSDOS_WINDOW(window));
-    c = window ? g_object_get_data(G_OBJECT(window), "msdos-help-context") : NULL;
+    if (CHF_IS_WINDOW(window))
+        return chf_window_help_context(CHF_WINDOW(window));
+    c = window ? g_object_get_data(G_OBJECT(window), "chf-help-context") : NULL;
     return c ? c : "main";
 }
 
-void msdos_help_for(GtkWindow *window)
+void chf_help_for(GtkWindow *window)
 {
     if (g_help && window == g_help->win) {
         gtk_widget_grab_focus(GTK_WIDGET(g_help->search));
         return;
     }
-    msdos_help_show(window, msdos_help_get_context(window));
+    chf_help_show(window, chf_help_get_context(window));
 }
 
 static void on_help_clicked(GtkButton *b, gpointer ud)
 {
     GtkWindow *win = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(b)));
     (void)ud;
-    const char *ctx = g_object_get_data(G_OBJECT(b), "msdos-help-context");
-    msdos_help_show(win, ctx ? ctx : msdos_help_get_context(win));
+    const char *ctx = g_object_get_data(G_OBJECT(b), "chf-help-context");
+    chf_help_show(win, ctx ? ctx : chf_help_get_context(win));
 }
 
-GtkWidget *msdos_help_button(const char *context)
+GtkWidget *chf_help_button(const char *context)
 {
     GtkWidget *b = gtk_button_new_from_icon_name("help-browser-symbolic");
     gtk_widget_set_tooltip_text(b, "Help");
     gtk_widget_add_css_class(b, "flat");
     gtk_widget_set_valign(b, GTK_ALIGN_CENTER);
-    g_object_set_data_full(G_OBJECT(b), "msdos-help-context", g_strdup(context), g_free);
+    g_object_set_data_full(G_OBJECT(b), "chf-help-context", g_strdup(context), g_free);
     g_signal_connect(b, "clicked", G_CALLBACK(on_help_clicked), NULL);
     return b;
 }

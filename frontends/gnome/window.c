@@ -24,11 +24,12 @@
 #include "debugger/dbg_window.h"
 #include "display.h"
 #include "fujilog.h"
+#include "help/help_window.h"
 #include "prefs.h"
 
 #include <string.h>
 
-struct _ArcWindow {
+struct _ChfWindow {
     AdwApplicationWindow parent_instance;
 
     chfsession *session;
@@ -43,6 +44,8 @@ struct _ArcWindow {
     gboolean sysact_down[CHF_SYSACT_COUNT];
     unsigned pad_generation;
     gboolean fullscreen;
+    gboolean needs_bios_shown;  /* the alert is up for this stand-in park */
+    AdwDialog *bios_alert;      /* weak: the Needs BIOS message, while up */
 };
 
 G_DEFINE_FINAL_TYPE(ChfWindow, chf_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -58,7 +61,7 @@ void chf_window_toast(ChfWindow *self, const char *text)
 static GtkCssProvider *s_accent_css;
 
 /* The accent moved toward white by t, for text on a dark theme: the
- * keypad gold is too dark to read as a thin line there. */
+ * Videocart yellow is too dim to read as a thin line there. */
 static guint32 tint(guint32 rgb, double t)
 {
     guint32 out = 0;
@@ -73,7 +76,7 @@ static guint32 tint(guint32 rgb, double t)
 static void load_accent_css(gboolean dark)
 {
     char buf[1024];
-    /* Dark text sits on the gold everywhere; as a text colour the gold is
+    /* Dark text sits on the yellow everywhere; as a text colour it is
      * only readable lightened on a dark theme, and the darker bronze
      * stands in on a light one. */
     g_snprintf(buf, sizeof buf,
@@ -210,8 +213,16 @@ static gboolean on_key_pressed(GtkEventControllerKey *ctrl, guint keyval,
                                guint keycode, GdkModifierType state,
                                gpointer user_data)
 {
+    ChfWindow *self = user_data;
     (void)ctrl;
-    return chf_window_key(user_data, keyval, keycode, state, TRUE);
+    /* F1 is the console's RESET in the window itself, and Help while
+     * Preferences or a dialog is open */
+    if (keyval == GDK_KEY_F1 && ui_has_keyboard(self) &&
+        !(state & GDK_MODIFIER_MASK & ~GDK_LOCK_MASK)) {
+        chf_help_for(GTK_WINDOW(self));
+        return TRUE;
+    }
+    return chf_window_key(self, keyval, keycode, state, TRUE);
 }
 
 static gboolean on_key_released(GtkEventControllerKey *ctrl, guint keyval,
@@ -271,6 +282,7 @@ static void sync_console_menu(ChfWindow *self)
 /* ---- messages and file pickers ---------------------------------------------------- */
 
 static void open_cart_path(ChfWindow *self, const char *path);
+static void show_bios_needed(ChfWindow *self, const char *retry);
 
 /* A dialog for anything the user has to read: a toast would vanish before
  * the reason was read, and the reason is the whole point. */
@@ -315,11 +327,266 @@ static GtkFileDialog *file_dialog(const char *title, const char *filter_name,
     return dlg;
 }
 
-static const char *const k_cart_exts[] = { "bin", "rom", "chf", "zip", NULL };
+static const char *const k_cart_exts[] = { "bin", "chf", "zip", NULL };
+static const char *const k_bios_exts[] = { "bin", "rom", "zip", NULL };
+
+static int machine_now(ChfWindow *self)
+{
+    int m = chfsession_get_int(self->session, "machine", CHF_MACHINE_CHANNELF);
+    return m >= 0 && m < CHF_MACHINE_COUNT ? m : CHF_MACHINE_CHANNELF;
+}
+
+/* ---- the display's shape ------------------------------------------------------------ */
+
+/* The picture's shape from the "aspect" setting and the machine: the PAL pair
+ * draws its cells taller, so square pixels are a different shape. */
+static void apply_shape(ChfWindow *self)
+{
+    int num = 4, den = 3;
+    chfsession_display_aspect(machine_now(self),
+                              chfsession_get_int(self->session, "aspect", 0) != 0,
+                              &num, &den);
+    chf_display_set_aspect(CHF_DISPLAY(self->display), num, den);
+}
+
+/* ---- Import BIOS ------------------------------------------------------------------- */
+
+/* Imports every path in turn and says what happened, always: that it takes
+ * effect at the next power cycle, that a ROM's CRC is not one MAME knows, that
+ * nothing here was recognised. A BIOS that was missing is brought in at once:
+ * the console is power-cycled onto it, or the cartridge the BIOS rule refused
+ * is opened again. Returns the items taken. */
+static int import_paths(ChfWindow *self, GtkWidget *over, char *const *paths, int n,
+                        gboolean apply, const char *retry)
+{
+    GString *log = g_string_new(NULL);
+    const gboolean had = chfsession_have_bios(self->session, machine_now(self)) != 0;
+    gboolean failed = FALSE;
+    int total = 0, i;
+
+    for (i = 0; i < n; i++) {
+        char msg[2048];
+        int rc = chfsession_rom_import(self->session, paths[i], msg, sizeof msg);
+        if (rc > 0)
+            total += rc;
+        else if (rc < 0)
+            failed = TRUE;
+        if (msg[0])
+            g_string_append_printf(log, "%s%s", log->len ? "\n" : "", msg);
+        else if (rc < 0)
+            g_string_append_printf(log, "%s%s", log->len ? "\n" : "",
+                                   chfsession_last_error(self->session));
+    }
+    if (total > 0 && apply && !had &&
+        chfsession_have_bios(self->session, machine_now(self))) {
+        if (retry && *retry) {
+            open_cart_path(self, retry);
+            g_string_append(log, "\n\nThe cartridge was opened again with it.");
+        } else if (chfsession_restart(self->session) == 0) {
+            g_string_append(log, "\n\nThe console was power-cycled so it takes effect now.");
+        }
+    }
+    show_message(over ? over : GTK_WIDGET(self),
+                 total > 0 ? "BIOS Imported" : failed ? "Cannot Import BIOS" : "Nothing Imported",
+                 log->len ? log->str : "Nothing was recognised.");
+    g_string_free(log, TRUE);
+    return total;
+}
+
+typedef struct {
+    ChfWindow *self;
+    GtkWidget *over;            /* weak: the dialog may be gone by now */
+    gboolean folder, apply;
+    char *retry;
+    void (*done)(int, gpointer);
+    gpointer user_data;
+} ImportCtx;
+
+static void import_ctx_free(ImportCtx *c)
+{
+    if (c->over)
+        g_object_remove_weak_pointer(G_OBJECT(c->over), (gpointer *)&c->over);
+    g_free(c->retry);
+    g_free(c);
+}
+
+static void on_bios_chosen(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    ImportCtx *c = user_data;
+    GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+    int imported = -1;
+
+    if (c->folder) {
+        g_autoptr(GFile) dir = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
+        char *path = dir ? g_file_get_path(dir) : NULL;
+        if (path)
+            g_ptr_array_add(paths, path);
+    } else {
+        g_autoptr(GListModel) files = gtk_file_dialog_open_multiple_finish(GTK_FILE_DIALOG(src), res, NULL);
+        guint i;
+        for (i = 0; files && i < g_list_model_get_n_items(files); i++) {
+            g_autoptr(GFile) f = g_list_model_get_item(files, i);
+            char *path = g_file_get_path(f);
+            if (path)
+                g_ptr_array_add(paths, path);
+        }
+    }
+    if (paths->len > 0)
+        imported = import_paths(c->self, c->over, (char *const *)paths->pdata,
+                                (int)paths->len, c->apply, c->retry);
+    if (c->done)
+        c->done(imported, c->user_data);
+    g_ptr_array_free(paths, TRUE);
+    import_ctx_free(c);
+}
+
+void chf_window_import_bios(ChfWindow *self, GtkWidget *over, gboolean folder,
+                            gboolean apply, const char *retry,
+                            void (*done)(int imported, gpointer user_data),
+                            gpointer user_data)
+{
+    ImportCtx *c = g_new0(ImportCtx, 1);
+    GtkFileDialog *dlg = file_dialog(folder ? "Import BIOS from a Folder" : "Import BIOS",
+        "BIOS ROMs, or zips of them (*.bin, *.rom, *.zip)", k_bios_exts, NULL);
+
+    c->self = self;
+    c->over = over;
+    if (over)
+        g_object_add_weak_pointer(G_OBJECT(over), (gpointer *)&c->over);
+    c->folder = folder;
+    c->apply = apply;
+    c->retry = g_strdup(retry);
+    c->done = done;
+    c->user_data = user_data;
+    if (folder)
+        gtk_file_dialog_select_folder(dlg, GTK_WINDOW(self), NULL, on_bios_chosen, c);
+    else
+        gtk_file_dialog_open_multiple(dlg, GTK_WINDOW(self), NULL, on_bios_chosen, c);
+    g_object_unref(dlg);
+}
+
+static void action_import_bios(GSimpleAction *a, GVariant *p, gpointer user_data)
+{
+    (void)a; (void)p;
+    chf_window_import_bios(user_data, GTK_WIDGET(user_data), FALSE, TRUE, NULL, NULL, NULL);
+}
+
+static void action_import_bios_folder(GSimpleAction *a, GVariant *p, gpointer user_data)
+{
+    (void)a; (void)p;
+    chf_window_import_bios(user_data, GTK_WIDGET(user_data), TRUE, TRUE, NULL, NULL, NULL);
+}
+
+/* ---- what the running configuration is missing ------------------------------------- */
+
+/* Import BIOS out of the Needs BIOS message: once the console's BIOS is
+ * there, carry straight on -- open the refused cartridge again, or (a game
+ * CONFIG booted from the network) power-cycle back to CONFIG on the real
+ * BIOS, so booting the game again just works. Anything short of that (a
+ * folder without it, a bad file) is said in a dialog instead. Help opens the
+ * topic and puts the message back, so the Import button is still there. */
+static void on_bios_needed_response(AdwAlertDialog *dlg, const char *response,
+                                    gpointer user_data)
+{
+    ChfWindow *self = user_data;
+    const char *retry = g_object_get_data(G_OBJECT(dlg), "retry");
+
+    if (strcmp(response, "import") == 0) {
+        chf_window_import_bios(self, GTK_WIDGET(self), FALSE, TRUE, retry, NULL, NULL);
+    } else if (strcmp(response, "help") == 0) {
+        chf_help_show(GTK_WINDOW(self), "nobios");
+        show_bios_needed(self, retry);
+    }
+}
+
+/* "This needs the Channel F's BIOS": a Videocart calls the BIOS's routines,
+ * and only the real BIOS runs them -- the app's stand-in runs CONFIG and
+ * FujiNet apps only. `retry` is a cartridge Open refused (opened again after
+ * the import), or NULL for a game CONFIG booted from the network or a call
+ * the stand-in does not have. */
+static void show_bios_needed(ChfWindow *self, const char *retry)
+{
+    AdwDialog *dlg;
+    char why[400];
+    GString *body = g_string_new(NULL);
+    GString *tail = g_string_new(NULL);
+    gboolean switched_off = FALSE;
+    int i;
+
+    chfsession_missing_reason(self->session, why, sizeof why);
+    if (chfsession_get_int(self->session, "bios", CHF_BIOS_AUTO) == CHF_BIOS_STANDIN)
+        for (i = 0; i < chfsession_rom_item_count(); i++)
+            if (chfsession_rom_item_available(self->session, i))
+                switched_off = TRUE;
+
+    /* the session's reason, when it already says what to do, is the message */
+    if (why[0])
+        g_string_append_printf(body, "%s%s\n\n", why, g_str_has_suffix(why, ".") ? "" : ".");
+    if (!strstr(why, "Import BIOS"))
+        g_string_append(body,
+            "This needs the Channel F's BIOS. Videocarts call it, so only the real one runs "
+            "them; CONFIG and FujiNet apps run without it. ");
+    if (switched_off)
+        g_string_append(body,
+            "A BIOS is imported, but Preferences \xe2\x96\xb8 Machine \xe2\x96\xb8 BIOS is set "
+            "to the app's stand-in. Choose Automatic there.");
+    else {
+        g_string_printf(tail, "%s takes MAME's channelf.zip, or the sl31253.rom (or sl90025.rom) "
+                        "and sl31254.rom dumps, or a folder that holds them.",
+                        strstr(why, "Import BIOS") ? "It" : "Import BIOS\xe2\x80\xa6");
+        g_string_append(body, tail->str);
+    }
+
+    dlg = adw_alert_dialog_new("Needs BIOS", body->str);
+    g_string_free(body, TRUE);
+    g_string_free(tail, TRUE);
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(dlg),
+                                   "later", "_Not Now",
+                                   "help", "_Help",
+                                   "import", "_Import BIOS\xe2\x80\xa6", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(dlg), "import",
+                                             ADW_RESPONSE_SUGGESTED);
+    adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(dlg), "import");
+    adw_alert_dialog_set_close_response(ADW_ALERT_DIALOG(dlg), "later");
+    g_object_set_data_full(G_OBJECT(dlg), "retry", g_strdup(retry), g_free);
+    g_signal_connect(dlg, "response", G_CALLBACK(on_bios_needed_response), self);
+    self->needs_bios_shown = TRUE;
+    self->bios_alert = dlg;
+    g_object_add_weak_pointer(G_OBJECT(dlg), (gpointer *)&self->bios_alert);
+    adw_dialog_present(dlg, GTK_WIDGET(self));
+}
+
+const char *chf_window_help_context(ChfWindow *self)
+{
+    static char ctx[64];
+    AdwDialog *d = adw_application_window_get_visible_dialog(ADW_APPLICATION_WINDOW(self));
+
+    if (d && ADW_IS_PREFERENCES_DIALOG(d)) {
+        const char *page = adw_preferences_dialog_get_visible_page_name(ADW_PREFERENCES_DIALOG(d));
+        if (page) {
+            g_snprintf(ctx, sizeof ctx, "prefs/%s", page);
+            return ctx;
+        }
+    }
+    if (d && d == self->bios_alert)
+        return "nobios";
+    return "main";
+}
+
+static GtkFileDialog *cart_dialog(ChfWindow *self, const char *title)
+{
+    const char *cart = chfsession_cart_path(self->session);
+    g_autofree char *dir = cart && *cart ? g_path_get_dirname(cart) : NULL;
+    /* where the last cartridge came from: the next one is usually beside it */
+    return file_dialog(title, "Channel F cartridges (*.bin, *.chf, *.zip)", k_cart_exts, dir);
+}
 
 /* The gamepad thread cannot call into GTK; it posts system actions and this
  * timer takes them. It also watches for gamepads coming and going, and says
- * so: a pad that drops off Bluetooth mid-game should not be a mystery. */
+ * so: a pad that drops off Bluetooth mid-game should not be a mystery. And
+ * it watches for the stand-in meeting a game it cannot run (CONFIG booted
+ * one from the network with no BIOS imported): one message per time that
+ * happens. */
 static gboolean sysact_drain_tick(gpointer user_data)
 {
     ChfWindow *self = user_data;
@@ -338,6 +605,12 @@ static gboolean sysact_drain_tick(gpointer user_data)
             chf_window_toast(self, text);
     }
 
+    if (chfsession_needs_bios(self->session)) {
+        if (!self->needs_bios_shown)
+            show_bios_needed(self, NULL);
+    } else {
+        self->needs_bios_shown = FALSE;
+    }
     sync_console_menu(self);
     /* the session pauses too (the debugger's Run/Stop is separate): the menu's
      * check follows it */
@@ -378,11 +651,11 @@ static gboolean update_status(gpointer user_data)
     }
     gtk_label_set_text(GTK_LABEL(self->status), text);
     if (on) {
-        gtk_widget_add_css_class(self->status_dot, "arc-dot-on");
-        gtk_widget_remove_css_class(self->status_dot, "arc-dot-off");
+        gtk_widget_add_css_class(self->status_dot, "chf-dot-on");
+        gtk_widget_remove_css_class(self->status_dot, "chf-dot-off");
     } else {
-        gtk_widget_add_css_class(self->status_dot, "arc-dot-off");
-        gtk_widget_remove_css_class(self->status_dot, "arc-dot-on");
+        gtk_widget_add_css_class(self->status_dot, "chf-dot-off");
+        gtk_widget_remove_css_class(self->status_dot, "chf-dot-on");
     }
     return G_SOURCE_CONTINUE;
 }
@@ -395,11 +668,16 @@ static const char *base_name(const char *p)
     return s ? s + 1 : p;
 }
 
-/* A cartridge the console cannot map says why in a dialog. */
+/* A cartridge the console cannot map says why in a dialog. A game refused
+ * for want of the BIOS gets the message that offers to import one instead. */
 static void open_cart_path(ChfWindow *self, const char *path)
 {
     char msg[1200];
     if (chfsession_load_cart(self->session, path) != 0) {
+        if (chfsession_needs_bios(self->session)) {
+            show_bios_needed(self, path);
+            return;
+        }
         show_message(GTK_WIDGET(self), "Cannot Open Cartridge",
                      chfsession_last_error(self->session));
         return;
@@ -408,30 +686,28 @@ static void open_cart_path(ChfWindow *self, const char *path)
     chf_window_toast(self, msg);
 }
 
-/* A dropped file: a cartridge runs, anything else goes to FujiNet's SD
- * folder. */
+/* A dropped file: a BIOS dump is imported (the ROM test comes first: dumps
+ * are .bin and .rom too, and are recognised by size and CRC, not by name), a
+ * cartridge is copied to the cartridge folder and run, anything else goes to
+ * FujiNet's SD folder. */
 void chf_window_load_media(ChfWindow *self, const char *path)
 {
     char dest[1024];
 
-    if (chfsession_media_is_cartridge(path)) {
-        open_cart_path(self, path);
+    if (chfsession_media_is_rom(path)) {
+        char *paths[1] = { (char *)path };
+        import_paths(self, GTK_WIDGET(self), paths, 1, TRUE, NULL);
         return;
     }
     if (chfsession_import_media(self->session, path, dest, sizeof dest) != 0) {
         chf_window_toast(self, chfsession_last_error(self->session));
         return;
     }
-    chf_window_toast(self, "Copied to FujiNet's SD folder \xe2\x80\x94 mount it "
-                           "from the CONFIG client");
-}
-
-static GtkFileDialog *cart_dialog(ChfWindow *self, const char *title)
-{
-    const char *cart = chfsession_cart_path(self->session);
-    g_autofree char *dir = cart && *cart ? g_path_get_dirname(cart) : NULL;
-    /* where the last cartridge came from: the next one is usually beside it */
-    return file_dialog(title, "Channel F cartridges (*.bin, *.rom, *.chf, *.zip)", k_cart_exts, dir);
+    if (chfsession_media_is_cartridge(path))
+        open_cart_path(self, dest);
+    else
+        chf_window_toast(self, "Copied to FujiNet's SD folder \xe2\x80\x94 mount it "
+                               "from the CONFIG client");
 }
 
 static void on_cart_chosen(GObject *src, GAsyncResult *res, gpointer user_data)
@@ -480,6 +756,24 @@ static void action_import_sd(GSimpleAction *a, GVariant *p, gpointer user_data)
     g_object_unref(dlg);
 }
 
+/* Media > Open SD Folder: FujiNet's SD folder in the file manager. */
+static void action_open_sd(GSimpleAction *a, GVariant *p, gpointer user_data)
+{
+    ChfWindow *self = user_data;
+    const char *path = chfsession_sd_path(self->session);
+    g_autoptr(GFile) dir = path && *path ? g_file_new_for_path(path) : NULL;
+    GtkFileLauncher *launcher;
+    (void)a; (void)p;
+    if (!dir) {
+        chf_window_toast(self, "FujiNet's SD folder is not available");
+        return;
+    }
+    g_mkdir_with_parents(path, 0755);
+    launcher = gtk_file_launcher_new(dir);
+    gtk_file_launcher_launch(launcher, GTK_WINDOW(self), NULL, NULL, NULL);
+    g_object_unref(launcher);
+}
+
 static void action_eject(GSimpleAction *a, GVariant *p, gpointer user_data)
 {
     ChfWindow *self = user_data;
@@ -516,8 +810,8 @@ static void action_pause(GSimpleAction *a, GVariant *p, gpointer user_data)
 
 /* The console's RESET key from the menu: the session holds it for a few
  * frames, long enough for the console to see it (it samples the keys once a
- * frame). It resets the 2650 only: a FujiNet app restarts from the
- * cartridge's current image. */
+ * frame). It resets the F8 only: the cartridge keeps what it has, and a
+ * FujiNet app restarts from the cartridge's current image. */
 static void action_reset(GSimpleAction *a, GVariant *p, gpointer user_data)
 {
     ChfWindow *self = user_data;
@@ -590,6 +884,7 @@ static void restart_session(ChfWindow *self)
                      chfsession_last_error(self->session));
         return;
     }
+    apply_shape(self);
     chf_window_toast(self, "Machine options applied (power cycled)");
 }
 
@@ -616,16 +911,17 @@ static void action_about(GSimpleAction *a, GVariant *p, gpointer user_data)
     adw_about_dialog_set_application_icon(ADW_ABOUT_DIALOG(about), chf_icon_name());
     adw_about_dialog_set_version(ADW_ABOUT_DIALOG(about), CHF_VERSION_STRING);
     adw_about_dialog_set_developer_name(ADW_ABOUT_DIALOG(about), "Thomas Cherryhomes");
+    adw_about_dialog_set_copyright(ADW_ABOUT_DIALOG(about), "\xc2\xa9 2026 Thomas Cherryhomes");
     adw_about_dialog_set_website(ADW_ABOUT_DIALOG(about), "https://fujinet.online/");
     adw_about_dialog_set_issue_url(ADW_ABOUT_DIALOG(about),
         "https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop/issues");
     adw_about_dialog_set_license_type(ADW_ABOUT_DIALOG(about), GTK_LICENSE_GPL_3_0);
     adw_about_dialog_set_comments(ADW_ABOUT_DIALOG(about),
-        "Fairchild Channel F (and its clones) with a built-in FujiNet cartridge. The "
-        "emulator is MAME's Channel F (Signetics 2650 and 2637 UVI; BSD-3-Clause "
-        "and GPL-2.0-or-later) transposed to C; the FujiNet firmware and the "
+        "Fairchild Channel F with a built-in FujiNet cartridge. The console is "
+        "MAME's Channel F driver (the Fairchild F8 processor, BSD-3-Clause and "
+        "GPL-2.0-or-later) transposed to C; the FujiNet firmware and the "
         "cartridge are by Thomas Cherryhomes and the FujiNet contributors "
-        "(GPL-3.0-or-later).");
+        "(GPL-3.0-or-later). No BIOS is included: import your own.");
     adw_dialog_present(about, GTK_WIDGET(self));
 }
 
@@ -636,9 +932,9 @@ static void action_aspect(GSimpleAction *a, GVariant *p, gpointer user_data)
     gboolean tv = !g_variant_get_boolean(state);
     (void)p;
     g_simple_action_set_state(a, g_variant_new_boolean(tv));
-    chf_display_set_tv_aspect(CHF_DISPLAY(self->display), tv);
     /* "aspect": 0 = the television's 4:3, 1 = square pixels */
     chfsession_set_int(self->session, "aspect", tv ? 0 : 1);
+    apply_shape(self);
 }
 
 static void action_smooth(GSimpleAction *a, GVariant *p, gpointer user_data)
@@ -655,7 +951,7 @@ static void action_smooth(GSimpleAction *a, GVariant *p, gpointer user_data)
 void chf_window_apply_aspect(ChfWindow *self, int aspect)
 {
     GAction *a = g_action_map_lookup_action(G_ACTION_MAP(self), "tv-aspect");
-    chf_display_set_tv_aspect(CHF_DISPLAY(self->display), aspect == 0);
+    apply_shape(self);
     if (a)
         g_simple_action_set_state(G_SIMPLE_ACTION(a), g_variant_new_boolean(aspect == 0));
 }
@@ -668,10 +964,25 @@ void chf_window_apply_smooth(ChfWindow *self, gboolean smooth)
         g_simple_action_set_state(G_SIMPLE_ACTION(a), g_variant_new_boolean(smooth));
 }
 
+/* app.help: every window's Ctrl+Shift+H, for what it shows. Not a cast of
+ * the active window: it can be the debugger, the controllers or the log. */
+static void action_help(GSimpleAction *a, GVariant *p, gpointer user_data)
+{
+    (void)a; (void)p;
+    chf_help_for(gtk_application_get_active_window(GTK_APPLICATION(user_data)));
+}
+
+static const GActionEntry app_actions[] = {
+    { "help", action_help, NULL, NULL, NULL, { 0 } },
+};
+
 static const GActionEntry win_actions[] = {
     { "open", action_open, NULL, NULL, NULL, { 0 } },
     { "eject", action_eject, NULL, NULL, NULL, { 0 } },
     { "import-sd", action_import_sd, NULL, NULL, NULL, { 0 } },
+    { "open-sd", action_open_sd, NULL, NULL, NULL, { 0 } },
+    { "import-bios", action_import_bios, NULL, NULL, NULL, { 0 } },
+    { "import-bios-folder", action_import_bios_folder, NULL, NULL, NULL, { 0 } },
     { "pause", action_pause, NULL, "false", NULL, { 0 } },
     { "reset", action_reset, NULL, NULL, NULL, { 0 } },
     { "reset-config", action_reset_config, NULL, NULL, NULL, { 0 } },
@@ -693,6 +1004,7 @@ static GMenu *build_menu(ChfWindow *self)
 {
     GMenu *menu = g_menu_new();
     GMenu *cart = g_menu_new();
+    GMenu *bios = g_menu_new();
     GMenu *view = g_menu_new();
     GMenu *fuji = g_menu_new();
     GMenu *app = g_menu_new();
@@ -700,7 +1012,12 @@ static GMenu *build_menu(ChfWindow *self)
     g_menu_append(cart, "_Open Cartridge\xe2\x80\xa6", "win.open");
     g_menu_append(cart, "E_ject Cartridge", "win.eject");
     g_menu_append(cart, "Import Cartridge to _SD\xe2\x80\xa6", "win.import-sd");
+    g_menu_append(cart, "Open SD Fol_der", "win.open-sd");
     g_menu_append_section(menu, NULL, G_MENU_MODEL(cart));
+
+    g_menu_append(bios, "Import _BIOS\xe2\x80\xa6", "win.import-bios");
+    g_menu_append(bios, "Import BIOS from a _Folder\xe2\x80\xa6", "win.import-bios-folder");
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(bios));
 
     /* filled (and kept current) by sync_console_menu */
     self->console_menu = g_menu_new();
@@ -718,11 +1035,13 @@ static GMenu *build_menu(ChfWindow *self)
     g_menu_append_section(menu, "FujiNet", G_MENU_MODEL(fuji));
 
     g_menu_append(app, "Pr_eferences", "win.prefs");
+    g_menu_append(app, "_Help", "app.help");
     g_menu_append(app, "_About FujiNet Go Channel F", "win.about");
     g_menu_append(app, "_Quit", "win.quit");
     g_menu_append_section(menu, NULL, G_MENU_MODEL(app));
 
     g_object_unref(cart);
+    g_object_unref(bios);
     g_object_unref(view);
     g_object_unref(fuji);
     g_object_unref(app);
@@ -740,6 +1059,9 @@ static void chf_window_dispose(GObject *object)
         g_source_remove(self->sysact_id);
         self->sysact_id = 0;
     }
+    if (self->bios_alert)
+        g_object_remove_weak_pointer(G_OBJECT(self->bios_alert), (gpointer *)&self->bios_alert);
+    self->bios_alert = NULL;
     g_clear_object(&self->console_menu);
     G_OBJECT_CLASS(chf_window_parent_class)->dispose(object);
 }
@@ -766,17 +1088,22 @@ GtkWidget *chf_window_new(AdwApplication *app, chfsession *session)
 
     gtk_window_set_title(GTK_WINDOW(self), "FujiNet Go Channel F");
     gtk_window_set_icon_name(GTK_WINDOW(self), chf_icon_name());
-    /* The picture at the television's 4:3, 3x the 262-line frame's height
-     * (786) wide at 4:3 = 1048 x 786 under the header bar. */
-    gtk_window_set_default_size(GTK_WINDOW(self), 1048, 786 + 46);
+    /* The picture at the television's 4:3, 3x the 232-line frame's height
+     * (696) wide at 4:3 = 928 x 696 under the header bar. */
+    gtk_window_set_default_size(GTK_WINDOW(self), 928, 696 + 46);
 
     g_action_map_add_action_entries(G_ACTION_MAP(self), win_actions,
                                     G_N_ELEMENTS(win_actions), self);
+    if (!g_action_map_lookup_action(G_ACTION_MAP(app), "help"))
+        g_action_map_add_action_entries(G_ACTION_MAP(app), app_actions,
+                                        G_N_ELEMENTS(app_actions), app);
     {
         static const char *const prefs_accels[] = { "<Control>comma", NULL };
         static const char *const open_accels[] = { "<Control>o", NULL };
         static const char *const reboot_accels[] = { "<Control>r", NULL };
         static const char *const quit_accels[] = { "<Control>q", NULL };
+        static const char *const help_accels[] = { "<Control><Shift>h", NULL };
+        gtk_application_set_accels_for_action(GTK_APPLICATION(app), "app.help", help_accels);
         gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.prefs", prefs_accels);
         gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.open", open_accels);
         gtk_application_set_accels_for_action(GTK_APPLICATION(app), "win.reset-config", reboot_accels);
@@ -794,8 +1121,8 @@ GtkWidget *chf_window_new(AdwApplication *app, chfsession *session)
 
     status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     self->status_dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class(self->status_dot, "arc-dot");
-    gtk_widget_add_css_class(self->status_dot, "arc-dot-off");
+    gtk_widget_add_css_class(self->status_dot, "chf-dot");
+    gtk_widget_add_css_class(self->status_dot, "chf-dot-off");
     gtk_widget_set_valign(self->status_dot, GTK_ALIGN_CENTER);
     self->status = gtk_label_new("Starting...");
     gtk_widget_add_css_class(self->status, "dim-label");
@@ -805,8 +1132,7 @@ GtkWidget *chf_window_new(AdwApplication *app, chfsession *session)
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), status_box);
 
     self->display = chf_display_new(session);
-    chf_display_set_tv_aspect(CHF_DISPLAY(self->display),
-        chfsession_get_int(session, "aspect", 0) == 0);
+    apply_shape(self);
     chf_display_set_smooth(CHF_DISPLAY(self->display),
         chfsession_get_int(session, "smooth", 0) != 0);
     {

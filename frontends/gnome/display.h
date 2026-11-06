@@ -15,7 +15,7 @@
 G_DECLARE_FINAL_TYPE(ChfDisplay, chf_display, CHF, DISPLAY, GtkWidget)
 
 GtkWidget *chf_display_new(chfsession *session);
-/* The picture a television showed (the whole 360 x 243 area at 4:3), or
- * square pixels (360:243). */
-void chf_display_set_tv_aspect(ChfDisplay *self, gboolean tv);
+/* The picture's shape, width : height (chfsession_display_aspect: the
+ * television's 4:3, or square pixels). */
+void chf_display_set_aspect(ChfDisplay *self, int num, int den);
 void chf_display_set_smooth(ChfDisplay *self, gboolean smooth);

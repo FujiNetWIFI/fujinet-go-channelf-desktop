@@ -9,6 +9,8 @@
 
 #include "fujilog.h"
 
+#include "help/help_window.h"
+
 #include <string.h>
 
 typedef struct {
@@ -66,6 +68,16 @@ static gboolean refresh(gpointer user_data)
     return G_SOURCE_CONTINUE;
 }
 
+static gboolean on_key(GtkEventControllerKey *c, guint keyval, guint code,
+                       GdkModifierType st, gpointer ud)
+{
+    (void)c; (void)code; (void)st;
+    if (keyval != GDK_KEY_F1)
+        return FALSE;
+    chf_help_for(ud);
+    return TRUE;
+}
+
 void chf_fujilog_show(GtkWindow *parent, chfsession *session)
 {
     static GtkWindow *existing;
@@ -100,10 +112,15 @@ void chf_fujilog_show(GtkWindow *parent, chfsession *session)
 
     {
         GtkWidget *toolbar = adw_toolbar_view_new();
-        adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar),
-                                     adw_header_bar_new());
+        GtkWidget *header = adw_header_bar_new();
+        GtkEventController *keys = gtk_event_controller_key_new();
+        adw_header_bar_pack_end(ADW_HEADER_BAR(header), chf_help_button("fujilog"));
+        chf_help_set_context(lw->win, "fujilog");
+        adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
         adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), scroll);
         adw_window_set_content(ADW_WINDOW(lw->win), toolbar);
+        g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key), lw->win);
+        gtk_widget_add_controller(GTK_WIDGET(lw->win), keys);
     }
 
     g_signal_connect(lw->win, "destroy", G_CALLBACK(on_destroy), lw);

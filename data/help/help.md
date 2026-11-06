@@ -232,7 +232,7 @@ jobs in the same way.
 
 ## Changing the controls
 
-<!-- only: gnome kde windows -->
+<!-- only: kde windows -->
 
 Preferences ▸ Input has every control the console has (23 in all: both
 controllers' eight contacts, the four buttons, RESET and the app's own
@@ -243,11 +243,26 @@ the settings, and only what differs from the defaults is written.
 
 <!-- end -->
 
+<!-- only: gnome -->
+
+On GNOME the controls are changed in the Controllers window
+(<kbd>F9</kbd>) rather than in Preferences: click **Map**, then click a
+control on the picture (23 in all: both controllers' eight contacts, the
+four buttons, RESET and the app's own actions; a diagonal wedge is two
+contacts at once, so it has no key of its own), then press the key or the
+gamepad button to give it. **Clear** takes the job off the key and
+button of the control you picked, **Defaults** puts every control back (so
+does **Reset Controls** in Preferences ▸ Input), **Show bindings** writes
+each control's key on it and <kbd>Escape</kbd> leaves Map. The map is kept in
+the settings, and only what differs from the defaults is written.
+
+<!-- end -->
+
 <!-- only: macos -->
 
 On a Mac the controls are changed in the Controllers window
 (<kbd>F9</kbd>) rather than in Settings: click **Map**, then click a
-control on the picture or choose one (all 23 are in the list: both
+control on the picture or choose one from the list (23 in all: both
 controllers' eight contacts, the four buttons, RESET and the app's own
 actions), then press the key or the gamepad button to give it. **Show
 bindings** writes each control's key on it. **Reset Controls** (there and in

@@ -12,19 +12,19 @@
 G_BEGIN_DECLS
 
 /* Shows the Help at id: a heading's slug or a context ("debugger/cpu",
- * "prefs/Storage"), or "?words" to search; NULL stays where it was. */
-void msdos_help_show(GtkWindow *parent, const char *id);
+ * "prefs/ROMs"), or "?words" to search; NULL stays where it was. */
+void chf_help_show(GtkWindow *parent, const char *id);
 
-/* What app.help (Ctrl+Shift+H, F1 where F1 isn't the PC's) opens for a
+/* What app.help (Ctrl+Shift+H; F1 outside the main window) opens for a
  * window: set by the windows that have one; the main window's own is
- * worked out by msdos_window_help_context. */
-void msdos_help_set_context(GtkWindow *window, const char *context);
-const char *msdos_help_get_context(GtkWindow *window);
+ * worked out by chf_window_help_context. */
+void chf_help_set_context(GtkWindow *window, const char *context);
+const char *chf_help_get_context(GtkWindow *window);
 
 /* Opens the Help for window (or, in the Help, finds). */
-void msdos_help_for(GtkWindow *window);
+void chf_help_for(GtkWindow *window);
 
 /* A Help button: opens context, or with NULL its window's. */
-GtkWidget *msdos_help_button(const char *context);
+GtkWidget *chf_help_button(const char *context);
 
 G_END_DECLS

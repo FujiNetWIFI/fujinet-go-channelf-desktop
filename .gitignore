@@ -22,7 +22,7 @@ tools/fujinet/work/
 # no_embedded_roms check and WITH_CHF_ROMS builds (see COMPLIANCE.md). Never
 # committed.
 tools/roms/local/
-roms/
+/roms/
 
 # Cartridge images that stray into the tree while testing. The only image
 # this project ships is FujiNet's own CONFIG client, staged from the

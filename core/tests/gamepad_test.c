@@ -1,6 +1,9 @@
 /*
- * gamepad_test -- the gamepad layer's pure helpers (no hardware), and that
- * the SDL gamepad subsystem starts and stops cleanly with nothing attached.
+ * gamepad_test -- the gamepad layer's pure helpers (no hardware): the sticks'
+ * hysteresis (0.5 in, 0.35 out), the left stick and D-pad as the controller's
+ * stick, the right stick as the knob's twist, pull and push, port assignment
+ * and the SDL button tables; and that the SDL gamepad subsystem starts and
+ * stops cleanly with nothing attached.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -24,58 +27,52 @@ int main(void)
 {
     int assign[4];
 
-    /* stick hysteresis */
-    check(chf_dir_from_stick(0.f, 0.f, 0, 0.35f, 0.15f) == 0, "centered stick is no direction");
-    check(chf_dir_from_stick(0.5f, 0.f, 0, 0.35f, 0.15f) == CHF_DIR_RIGHT, "half right engages right");
-    check(chf_dir_from_stick(0.2f, 0.f, 0, 0.35f, 0.15f) == 0, "a fifth right does not engage");
-    check(chf_dir_from_stick(0.2f, 0.f, CHF_DIR_RIGHT, 0.35f, 0.15f) == CHF_DIR_RIGHT, "but holds once engaged");
-    check(chf_dir_from_stick(0.1f, 0.f, CHF_DIR_RIGHT, 0.35f, 0.15f) == 0, "and releases below exit");
-    check(chf_dir_from_stick(-0.6f, -0.6f, 0, 0.35f, 0.15f) == (CHF_DIR_LEFT | CHF_DIR_UP), "diagonals are two bits");
-    check(chf_dir_from_stick(0.6f, 0.05f, 0, 0.35f, 0.15f) == CHF_DIR_RIGHT,
+    /* stick hysteresis: in at half deflection, out below 0.35 */
+    check(CHF_STICK_ENTER == 0.5f && CHF_STICK_EXIT == 0.35f, "the thresholds are 0.5 and 0.35");
+#define IN  CHF_STICK_ENTER, CHF_STICK_EXIT
+    check(chf_dir_from_stick(0.f, 0.f, 0, IN) == 0, "centered stick is no direction");
+    check(chf_dir_from_stick(0.6f, 0.f, 0, IN) == CHF_DIR_RIGHT, "past half right engages right");
+    check(chf_dir_from_stick(0.4f, 0.f, 0, IN) == 0, "two fifths right does not engage");
+    check(chf_dir_from_stick(0.4f, 0.f, CHF_DIR_RIGHT, IN) == CHF_DIR_RIGHT, "but holds once engaged");
+    check(chf_dir_from_stick(0.3f, 0.f, CHF_DIR_RIGHT, IN) == 0, "and releases below exit");
+    check(chf_dir_from_stick(-0.6f, -0.6f, 0, IN) == (CHF_DIR_LEFT | CHF_DIR_UP), "diagonals are two bits");
+    check(chf_dir_from_stick(0.6f, 0.05f, 0, IN) == CHF_DIR_RIGHT,
           "a pure horizontal picks up no vertical noise");
+    check(chf_dir_from_stick(0.f, 0.9f, CHF_DIR_RIGHT, IN) == CHF_DIR_DOWN,
+          "an axis is judged on its own: a stick that left right is down");
 
-    /* the analog disc */
-    {
-        int dx = 99, dy = 99;
-        chf_disc_from_stick(0.f, 0.f, &dx, &dy);
-        check(dx == 0 && dy == 0, "a centred stick is a centred disc");
-        chf_disc_from_stick(0.08f, -0.08f, &dx, &dy);
-        check(dx == 0 && dy == 0, "a tremor inside the dead zone is nothing");
-        chf_disc_from_stick(1.f, 0.f, &dx, &dy);
-        check(dx == 127 && dy == 0, "full right is +127");
-        chf_disc_from_stick(-1.f, 0.f, &dx, &dy);
-        check(dx == -127 && dy == 0, "full left is -127");
-        chf_disc_from_stick(0.f, 1.f, &dx, &dy);
-        check(dx == 0 && dy == 127, "full down is +127 (SDL's y)");
-        chf_disc_from_stick(1.f, 1.f, &dx, &dy);
-        check(dx > 80 && dx < 127 && dx == dy, "a corner is clamped to the circle");
-        chf_disc_from_stick(0.5f, 0.f, &dx, &dy);
-        check(dx > 40 && dx < 90 && dy == 0, "half deflection is part way (past the dead zone)");
-        chf_disc_from_stick(0.13f, 0.f, &dx, &dy);
-        check(dx >= 0 && dx < 5, "just past the dead zone starts from zero, not a jump");
-    }
-
-    /* directions as the stick's switches */
+    /* directions as the controller's stick contacts */
 #define ACT(a) (1u << (a))
-    check(chf_acts_from_dir(CHF_DIR_UP) == ACT(CHF_ACT_UP) &&
-          chf_acts_from_dir(CHF_DIR_DOWN) == ACT(CHF_ACT_DOWN) &&
+    check(chf_acts_from_dir(CHF_DIR_UP) == ACT(CHF_ACT_FORWARD) &&
+          chf_acts_from_dir(CHF_DIR_DOWN) == ACT(CHF_ACT_BACK) &&
           chf_acts_from_dir(CHF_DIR_LEFT) == ACT(CHF_ACT_LEFT) &&
           chf_acts_from_dir(CHF_DIR_RIGHT) == ACT(CHF_ACT_RIGHT),
-          "up, down, left, right are the stick's four switches");
-    check(chf_acts_from_dir(CHF_DIR_UP | CHF_DIR_LEFT) == (ACT(CHF_ACT_UP) | ACT(CHF_ACT_LEFT)) &&
-          chf_acts_from_dir(CHF_DIR_DOWN | CHF_DIR_RIGHT) == (ACT(CHF_ACT_DOWN) | ACT(CHF_ACT_RIGHT)),
-          "a diagonal is two switches");
+          "up is forward, down is back, left and right are the stick's four contacts");
+    check(chf_acts_from_dir(CHF_DIR_UP | CHF_DIR_LEFT) == (ACT(CHF_ACT_FORWARD) | ACT(CHF_ACT_LEFT)) &&
+          chf_acts_from_dir(CHF_DIR_DOWN | CHF_DIR_RIGHT) == (ACT(CHF_ACT_BACK) | ACT(CHF_ACT_RIGHT)),
+          "a diagonal is two contacts");
     check(chf_acts_from_dir(CHF_DIR_UP | CHF_DIR_DOWN) == 0 && chf_acts_from_dir(0) == 0 &&
           chf_acts_from_dir(CHF_DIR_LEFT | CHF_DIR_RIGHT) == 0,
           "opposites cancel");
     check(chf_acts_from_dir(CHF_DIR_UP | CHF_DIR_DOWN | CHF_DIR_LEFT) == ACT(CHF_ACT_LEFT),
           "a cancelled axis leaves the other one alone");
 
+    /* the right stick: the knob's twist, pull and push */
+    check(chf_knob_acts_from_dir(CHF_DIR_LEFT) == ACT(CHF_ACT_TWIST_CCW) &&
+          chf_knob_acts_from_dir(CHF_DIR_RIGHT) == ACT(CHF_ACT_TWIST_CW) &&
+          chf_knob_acts_from_dir(CHF_DIR_UP) == ACT(CHF_ACT_PULL) &&
+          chf_knob_acts_from_dir(CHF_DIR_DOWN) == ACT(CHF_ACT_PUSH),
+          "left and right twist, up pulls, down pushes");
+    check(chf_knob_acts_from_dir(CHF_DIR_RIGHT | CHF_DIR_UP) == (ACT(CHF_ACT_TWIST_CW) | ACT(CHF_ACT_PULL)),
+          "twisting and pulling together are two contacts");
+    check(chf_knob_acts_from_dir(CHF_DIR_LEFT | CHF_DIR_RIGHT) == 0 && chf_knob_acts_from_dir(CHF_DIR_UP | CHF_DIR_DOWN) == 0
+          && chf_knob_acts_from_dir(0) == 0, "and opposites cancel");
+
     /* port assignment */
     assign[0] = -1; assign[1] = -1; assign[2] = -1;
     check(chf_pad_for_port(assign, 2, 0) == 0 && chf_pad_for_port(assign, 2, 1) == 1,
-          "connection order: first pad disc 1, second pad disc 2");
-    check(chf_pad_for_port(assign, 1, 1) == -1, "one pad leaves disc 2 to the keyboard");
+          "connection order: first pad player 1, second pad player 2");
+    check(chf_pad_for_port(assign, 1, 1) == -1, "one pad leaves player 2 to the keyboard");
     assign[0] = 1; assign[1] = -1;
     check(chf_pad_for_port(assign, 2, 1) == 0 && chf_pad_for_port(assign, 2, 0) == 1,
           "an explicit assignment wins and the other pad fills the gap");

@@ -1,10 +1,14 @@
 /*
  * media -- routing a file the user dropped on the window to the right place.
  *
- * Two destinations:
+ * Three destinations:
  *
- *   Cartridges (.bin, .rom, .chf, or a .zip of one) go to the cartridge
- *   directory and are opened from there (load_cart plans every image itself).
+ *   BIOS ROMs (sl31253.rom and its two siblings, or a zip of them), by size
+ *   and CRC-32 whatever they are called, go to the ROM directory: they are
+ *   .rom or .bin files too, so this is decided before the extension.
+ *
+ *   Cartridges (.bin, .chf, or a .zip of one) go to the cartridge directory
+ *   and are opened from there (load_cart identifies every image itself).
  *
  *   Anything else goes to the FujiNet SD folder, because FujiNet is what
  *   serves it.
@@ -50,10 +54,10 @@ static int ext_is(const char *path, const char *const *exts)
     return 0;
 }
 
-/* What a cartridge file is called (MAME's slot takes bin and rom; arc is the
- * emulators' own; a zip holds one). The extension only routes the file: load_cart identifies
- * every image by its contents. */
-static const char *const cart_exts[] = { "bin", "rom", "chf", "zip", NULL };
+/* What a cartridge file is called (MAME's slot takes bin and chf; a zip holds
+ * one). The extension only routes the file: load_cart identifies every image
+ * by its contents. */
+static const char *const cart_exts[] = { "bin", "chf", "zip", NULL };
 
 static int is_zip(const char *name)
 {
@@ -98,6 +102,20 @@ int chfsession_import_media(chfsession *s, const char *src_path,
     src_path = paths_resolve(src_path, abs, sizeof abs);
     name = base_name(src_path);
 
+    /* A BIOS dump is a ROM, not a cartridge, though it is a .rom or .bin. */
+    if (chfsession_media_is_rom(src_path)) {
+        char msg[512], first[CHF_PATH_MAX];
+        int n = roms_import_ex(s, src_path, msg, sizeof msg, first, sizeof first);
+        if (n < 0)
+            return -1;
+        if (n == 0) {
+            session_set_error(s, "%s", msg);
+            return -1;
+        }
+        snprintf(dest_out, (size_t)dest_sz, "%s", first[0] ? first : s->roms_dir);
+        return 0;
+    }
+
     if (ext_is(src_path, cart_exts)) {
         dir = s->carts_dir;
     } else {
@@ -127,12 +145,14 @@ int chfsession_import_media(chfsession *s, const char *src_path,
 
 int chfsession_media_is_cartridge(const char *path)
 {
-    return path ? ext_is(path, cart_exts) : 0;
+    return path ? ext_is(path, cart_exts) && !chfsession_media_is_rom(path) : 0;
 }
 
 /* Into the SD root, so CONFIG shows it at the top of the SD host with no
- * navigation. FujiNet pushes cartridge files to the cartridge, which plans
- * whatever its chfmap can. */
+ * navigation. FujiNet pushes cartridge files to the cartridge, which serves
+ * what its chfmap can: refused here, with the reason, is a Videocart with
+ * hardware of its own (Maze, Hangman, Chess, the multi-game cartridges) and
+ * anything it cannot plan. */
 int chfsession_import_cart_to_sd(chfsession *s, const char *src_path,
                                  char *dest_out, int dest_sz)
 {

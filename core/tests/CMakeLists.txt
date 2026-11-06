@@ -21,13 +21,13 @@ add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 # Module tests live in <name>.test.cmake fragments beside their sources, each
 # registering its own tests with chf_test() / add_test(); they are picked up
 # here so a module can land with its tests without touching this file.
-file(GLOB _arc_test_fragments "${CMAKE_CURRENT_SOURCE_DIR}/*.test.cmake")
-list(SORT _arc_test_fragments)
+file(GLOB _chf_test_fragments "${CMAKE_CURRENT_SOURCE_DIR}/*.test.cmake")
+list(SORT _chf_test_fragments)
 if(CHF_CORE_ONLY)
   # the debugger's tests need the debugger, which this build leaves out
-  list(FILTER _arc_test_fragments EXCLUDE REGEX "debugger\\.test\\.cmake$")
+  list(FILTER _chf_test_fragments EXCLUDE REGEX "debugger\\.test\\.cmake$")
 endif()
-foreach(_frag IN LISTS _arc_test_fragments)
+foreach(_frag IN LISTS _chf_test_fragments)
   include("${_frag}")
 endforeach()
 
@@ -53,31 +53,47 @@ endfunction()
 chf_session_test(chf_drive chf_drive.c)
 
 # The frontend contract, against a real temporary XDG tree: settings persist,
-# paths resolve, CONFIG boots, input reaches the machine, a FujiNet app opens
-# and runs, RESET restarts it, Reset to CONFIG ejects it, a 4K game and a zip
-# of one load, an image the console cannot take is refused with a reason, and
-# the PAL clone runs at 50 Hz.
+# paths resolve, CONFIG boots on the stand-in, the hand controllers, the
+# pointer, a wheel pulse and the console's buttons reach the machine, a
+# FujiNet app opens and runs, RESET restarts it, Reset to CONFIG ejects it, a
+# game is refused without the console's BIOS (and runs with MAME's, when it
+# is on this machine), an image the console cannot take is refused with a
+# reason, and the PAL clone runs at 50 Hz.
 chf_session_test(session_test session_test.c)
 add_test(NAME session COMMAND session_test)
-set_tests_properties(session PROPERTIES TIMEOUT 120)
+set_tests_properties(session PROPERTIES TIMEOUT 180)
 
-# The remappable binding table and the keyboard translator, pure: the two
-# keypads and the panel, two sticks and fire buttons, F1 for RESET,
+# The remappable binding table and the keyboard translator, pure: both hand
+# controllers' eight contacts, the four console buttons, F1 for RESET,
 # steal-on-rebind, persistence, names.
 chf_session_test(bindings_test bindings_test.c)
 add_test(NAME bindings COMMAND bindings_test)
 
-# The on-screen controller layout table for the Channel F: no overlapping
-# caps, every key reachable, labels unique and agreeing with the matrix. No
-# machine is started.
-chf_session_test(keyboard_test keyboard_test.c)
-add_test(NAME keyboard COMMAND keyboard_test)
+# The on-screen controllers' layout for the Channel F, its hit test and the
+# stick's gesture maths: no overlapping controls, every contact on exactly one
+# control, wedges that agree with chfsession_stick_from_vector. No machine is
+# started.
+chf_session_test(controls_test controls_test.c)
+add_test(NAME controls COMMAND controls_test)
 
-# Where a dropped file goes (a ROM to the ROM directory, a cartridge to the
-# cartridge directory, the rest to the SD folder), what makes a cartridge
-# image acceptable, and Import Cartridge to SD.
+# Where a dropped file goes (a BIOS ROM to the ROM directory, a cartridge to
+# the cartridge directory, the rest to the SD folder), what makes a cartridge
+# image acceptable, and Import Cartridge to SD with its refusals.
 chf_session_test(media_test media_test.c)
 add_test(NAME media COMMAND media_test)
+
+# Import BIOS: the three ROMs by size and CRC-32 from a file, a zip or a
+# folder, a 2K file split in two, an unknown dump never taken, which BIOS
+# each machine runs. MAME's channelf.zip is imported too when it is on this
+# machine.
+chf_session_test(roms_import_test roms_import_test.c)
+add_test(NAME roms_import COMMAND roms_import_test)
+
+# The built-in Help covers what the app has: settings, machines, ROMs, keys,
+# ports, the debugger's tabs and prompt commands, and every context a Help
+# button opens.
+chf_session_test(help_test help_test.c)
+add_test(NAME help COMMAND help_test)
 
 # The external-FujiNet address field's parser.
 chf_session_test(hostport_test hostport_test.c)
@@ -95,9 +111,10 @@ chf_session_test(gamepad_test gamepad_test.c)
 add_test(NAME gamepad COMMAND gamepad_test)
 
 # The gamepad layer end to end with an SDL3 virtual gamepad: hot-plug, the
-# default mapping onto the stick (D-pad, left analog stick, South), buttons
-# rebound to a key and to RESET, the sources kept apart, unplug releasing what
-# was held. SKIPs (77) where SDL has no virtual joysticks.
+# default mapping onto the hand controller (D-pad and left stick, shoulders,
+# East, South, the right stick), buttons rebound to a console button and to
+# RESET, the sources kept apart, unplug releasing what was held. SKIPs (77)
+# where SDL has no virtual joysticks.
 chf_session_test(gamepad_map_test gamepad_map_test.c)
 add_test(NAME gamepad_map COMMAND gamepad_map_test)
 set_tests_properties(gamepad_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)

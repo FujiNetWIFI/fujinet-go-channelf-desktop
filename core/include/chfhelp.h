@@ -4,8 +4,8 @@
  * frontend lays out with its own toolkit.
  *
  * A frontend shows the blocks whose platforms include its own bit. Ids are
- * GitHub's heading slugs ("drives-and-disks"); a Help button names a
- * context instead ("prefs/Storage", "debugger/cpu"), which stays put when a
+ * GitHub's heading slugs ("controllers-and-keys"); a Help button names a
+ * context instead ("prefs/Machine", "debugger/cpu"), which stays put when a
  * heading is renamed. Everything here is constant data and reentrant.
  *
  * Copyright (C) 2026 Thomas Cherryhomes

@@ -45,15 +45,12 @@ BLOCK_NAMES = ("H2", "H3", "PARA", "BULLET", "BULLET2", "NUMBERED", "NOTE", "PRE
 TEXT, BOLD, ITALIC, CODE, KBD, LINK, CELL = range(7)
 SPAN_NAMES = ("TEXT", "BOLD", "ITALIC", "CODE", "KBD", "LINK", "CELL")
 
-# The app's shortcuts as a Mac shows them (frontends/macos/AppDelegate.m).
+# The app's shortcuts as a Mac shows them (the Mac frontend's menus): Ctrl is
+# Command there, and Help is the Help menu's own key.
 KBD_MAC_FIXED = {
-    "Ctrl+Shift+P": "⌘,",
-    "Ctrl+Shift+Q": "⌘Q",
+    "Ctrl+,": "⌘,",
     "Ctrl+Shift+H": "⌘?",
-    "Ctrl+End": "⌃End",
-    "Ctrl+Alt+PgDn": "⌃⌥Page Down",
     "Shift+F8": "⇧F8",
-    "Ctrl+F": "⌘F",
 }
 
 # A non-last table column wider than this squeezes the last one.
@@ -72,6 +69,9 @@ def kbd_mac(text, line):
         return None
     if text in KBD_MAC_FIXED:
         return KBD_MAC_FIXED[text]
+    m = re.fullmatch(r"Ctrl\+([A-Z])", text)
+    if m:
+        return "⌘" + m.group(1)
     m = re.fullmatch(r"Ctrl\+Shift\+([A-Z])", text)
     if m:
         return "⌘⇧" + m.group(1)
@@ -363,7 +363,7 @@ def parse(src_text):
                     raise HelpError(f"line {ln}: end without only:")
                 platforms, in_only = ALL, None
             else:
-                if not re.fullmatch(r"[a-z]+(/[A-Za-z]+)?", arg):
+                if not re.fullmatch(r"[a-z]+(-[a-z]+)*(/[A-Za-z]+)?", arg):
                     raise HelpError(f"line {ln}: bad context {arg!r}")
                 context = (arg, ln)
             numbered = 0

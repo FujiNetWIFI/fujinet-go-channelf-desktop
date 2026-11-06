@@ -2,10 +2,10 @@
  * bindings -- the remappable key/gamepad table, the keyboard translator,
  * and every name the bindings editor and the settings store need.
  *
- * One flat target table (chfsession.h's CHF_TARGET_* indices): per disc (1,
- * then 2) its four directions and its fire button; the console's 27
- * keys (two keypads and START/OPTION/SELECT); the console's RESET; then the
- * session's own actions.
+ * One flat target table (chfsession.h's CHF_TARGET_* indices): per player (1,
+ * then 2) the hand controller's eight contacts (the action number is the
+ * hardware bit), the console's four numbered buttons, its RESET, then the
+ * session's own actions: 23 in all.
  * Each target holds at most one keysym and one gamepad button. Rebinding
  * STEALS -- a key drives exactly one target, because one keystroke doing
  * two things is worse than losing the old binding: the second effect is
@@ -17,8 +17,8 @@
  * differ from the defaults ("<target>.k:<keysym>" / "<target>.b:<button>").
  *
  * Keysyms are X11's, folded to lower case before lookup so a binding made
- * with 'w' still fires while Shift is held for something else. The numeric
- * keypad's keys are NOT folded onto the main block's (disc 2 lives there),
+ * with 'z' still fires while Shift is held for something else. The numeric
+ * keypad's keys are NOT folded onto the main block's (player 2 lives there),
  * except its Enter, which is Enter.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -56,70 +56,60 @@ static void seed_button(int target, int button)
     s_defaults[target].button = button;
 }
 
-/* The defaults: player 1's keypad on the top-row digits (1-9, 0), Backspace
- * is CLEAR and Enter is ENTER; player 2's keypad is the Q block (Q W E / A S
- * D / Z X C, then V B N for CLEAR 0 ENTER). Disc 1 is the arrow keys with
- * Right Ctrl for fire; disc 2 the numeric keypad's 8 4 6 2 with 0 for fire --
- * the keypad's other keys are left alone, and where a default would clash the
- * disc wins. START, OPTION and SELECT are F2, F3, F4; F1 is the console's
- * RESET (MAME's), Escape is Reset to CONFIG. F5/F7/F8/F9/F11/F12 are the
- * family's window and debugger keys and stay free of the machine. */
+/* The defaults. Player 1, the right controller: the arrow keys tilt the stick,
+ * Z and X twist it (counter-clockwise, clockwise), C pulls the knob up and
+ * Space pushes it down. Player 2, the left controller: the numeric keypad's
+ * 8 2 4 6 tilt it (forward, back, left, right), 7 and 9 twist, . pulls and 0
+ * pushes. The console's buttons 1-4 (TIME, MODE, HOLD, START) are the
+ * number keys 1 2 3 4, F1 is RESET (MAME's) and Escape is Reset to CONFIG.
+ * F5/F7/F8/F9/F11/F12 are the family's window and debugger keys and stay free
+ * of the machine.
+ *
+ * Gamepad, the same on both players: the D-pad tilts the stick (the left
+ * analog stick does too: gamepad_sdl.c), LB and RB twist, East pulls, South
+ * pushes. The console's buttons go on West (TIME), Back (MODE), North (HOLD)
+ * and Start (START). With "right_stick" on the right analog stick is the
+ * knob's other axes too. */
 static void compute_defaults_locked(void)
 {
-    static const uint32_t p1[12] = {
-        '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        CHF_KEYSYM_BACKSPACE, '0', CHF_KEYSYM_RETURN,
+    static const struct { int act; uint32_t key; int button; } p1[CHF_ACT_PER_PORT] = {
+        { CHF_ACT_RIGHT,     CHF_KEYSYM_RIGHT, CHF_PAD_BTN_DPAD_RIGHT },
+        { CHF_ACT_LEFT,      CHF_KEYSYM_LEFT,  CHF_PAD_BTN_DPAD_LEFT },
+        { CHF_ACT_BACK,      CHF_KEYSYM_DOWN,  CHF_PAD_BTN_DPAD_DOWN },
+        { CHF_ACT_FORWARD,   CHF_KEYSYM_UP,    CHF_PAD_BTN_DPAD_UP },
+        { CHF_ACT_TWIST_CCW, 'z',              CHF_PAD_BTN_LEFT_SHOULDER },
+        { CHF_ACT_TWIST_CW,  'x',              CHF_PAD_BTN_RIGHT_SHOULDER },
+        { CHF_ACT_PULL,      'c',              CHF_PAD_BTN_EAST },
+        { CHF_ACT_PUSH,      CHF_KEYSYM_SPACE, CHF_PAD_BTN_SOUTH },
     };
-    static const uint32_t p2[12] = {
-        'q', 'w', 'e', 'a', 's', 'd', 'z', 'x', 'c', 'v', 'b', 'n',
+    static const uint32_t p2_keys[CHF_ACT_PER_PORT] = {
+        CHF_KEYSYM_KP_6, CHF_KEYSYM_KP_4, CHF_KEYSYM_KP_2, CHF_KEYSYM_KP_8,
+        CHF_KEYSYM_KP_7, CHF_KEYSYM_KP_9, CHF_KEYSYM_KP_PERIOD, CHF_KEYSYM_KP_0,
     };
-    int t, k;
+    static const uint32_t key_keys[CHF_KEY_COUNT] = { '1', '2', '3', '4' };
+    static const int key_buttons[CHF_KEY_COUNT] = {
+        CHF_PAD_BTN_WEST, CHF_PAD_BTN_BACK, CHF_PAD_BTN_NORTH, CHF_PAD_BTN_START,
+    };
+    int t, a, k;
 
     for (t = 0; t < CHF_TARGET_COUNT; t++) {
         s_defaults[t].keysym = 0;
         s_defaults[t].button = CHF_PAD_BTN_NONE;
     }
 
-    for (k = 0; k < 12; k++) {
-        seed_key(CHF_TARGET_KEY(CHF_KEY_PAD_BASE(0) + k), p1[k]);
-        seed_key(CHF_TARGET_KEY(CHF_KEY_PAD_BASE(1) + k), p2[k]);
+    for (a = 0; a < CHF_ACT_PER_PORT; a++) {
+        seed_key(CHF_TARGET_PORT(0, p1[a].act), p1[a].key);
+        seed_key(CHF_TARGET_PORT(1, p1[a].act), p2_keys[p1[a].act]);
+        seed_button(CHF_TARGET_PORT(0, p1[a].act), p1[a].button);
+        seed_button(CHF_TARGET_PORT(1, p1[a].act), p1[a].button);
     }
-    seed_key(CHF_TARGET_KEY(CHF_KEY_START), CHF_KEYSYM_F2);
-    seed_key(CHF_TARGET_KEY(CHF_KEY_OPTION), CHF_KEYSYM_F3);
-    seed_key(CHF_TARGET_KEY(CHF_KEY_SELECT), CHF_KEYSYM_F4);
-
-    seed_key(CHF_TARGET_PORT(0, CHF_ACT_UP), CHF_KEYSYM_UP);
-    seed_key(CHF_TARGET_PORT(0, CHF_ACT_RIGHT), CHF_KEYSYM_RIGHT);
-    seed_key(CHF_TARGET_PORT(0, CHF_ACT_DOWN), CHF_KEYSYM_DOWN);
-    seed_key(CHF_TARGET_PORT(0, CHF_ACT_LEFT), CHF_KEYSYM_LEFT);
-    seed_key(CHF_TARGET_PORT(0, CHF_ACT_FIRE), CHF_KEYSYM_RCTRL);
-    seed_key(CHF_TARGET_PORT(1, CHF_ACT_UP), CHF_KEYSYM_KP_8);
-    seed_key(CHF_TARGET_PORT(1, CHF_ACT_RIGHT), CHF_KEYSYM_KP_6);
-    seed_key(CHF_TARGET_PORT(1, CHF_ACT_DOWN), CHF_KEYSYM_KP_2);
-    seed_key(CHF_TARGET_PORT(1, CHF_ACT_LEFT), CHF_KEYSYM_KP_4);
-    seed_key(CHF_TARGET_PORT(1, CHF_ACT_FIRE), CHF_KEYSYM_KP_0);
+    for (k = 0; k < CHF_KEY_COUNT; k++) {
+        seed_key(CHF_TARGET_KEY(k), key_keys[k]);
+        seed_button(CHF_TARGET_KEY(k), key_buttons[k]);
+    }
 
     seed_key(CHF_TARGET_SWITCH(CHF_SW_RESET), CHF_KEYSYM_F1);
     seed_key(CHF_TARGET_SYSACT(CHF_SYSACT_RESET_CONFIG), CHF_KEYSYM_ESCAPE);
-
-    /* gamepad defaults, the same on both discs: the D-pad is the disc's
-     * directions (the left analog stick drives the analog disc too, with
-     * "analog sticks" on: gamepad_sdl.c) and South is the side button. The
-     * console's buttons go on the pad's Start (START), X (OPTION) and Back
-     * (SELECT). */
-    seed_button(CHF_TARGET_KEY(CHF_KEY_START), CHF_PAD_BTN_START);
-    seed_button(CHF_TARGET_KEY(CHF_KEY_OPTION), CHF_PAD_BTN_WEST);
-    seed_button(CHF_TARGET_KEY(CHF_KEY_SELECT), CHF_PAD_BTN_BACK);
-    {
-        int port;
-        for (port = 0; port < 2; port++) {
-            seed_button(CHF_TARGET_PORT(port, CHF_ACT_UP), CHF_PAD_BTN_DPAD_UP);
-            seed_button(CHF_TARGET_PORT(port, CHF_ACT_RIGHT), CHF_PAD_BTN_DPAD_RIGHT);
-            seed_button(CHF_TARGET_PORT(port, CHF_ACT_DOWN), CHF_PAD_BTN_DPAD_DOWN);
-            seed_button(CHF_TARGET_PORT(port, CHF_ACT_LEFT), CHF_PAD_BTN_DPAD_LEFT);
-            seed_button(CHF_TARGET_PORT(port, CHF_ACT_FIRE), CHF_PAD_BTN_SOUTH);
-        }
-    }
 }
 
 static uint32_t fold(uint32_t keysym)
@@ -224,13 +214,14 @@ int chfsession_target_for_button(chfsession *s, int port, int button)
     if (button == CHF_PAD_BTN_NONE) return -1;
     pthread_mutex_lock(&s_lock);
     ensure_seeded_locked();
+    if (port < 0 || port >= CHF_PLAYERS) port = 0;
     for (t = 0; t < CHF_ACT_PER_PORT; t++)
         if (s_table[CHF_TARGET_PORT(port, t)].button == button) {
             found = CHF_TARGET_PORT(port, t);
             break;
         }
     if (found < 0)
-        for (t = 2 * CHF_ACT_PER_PORT; t < CHF_TARGET_COUNT; t++)
+        for (t = CHF_PLAYERS * CHF_ACT_PER_PORT; t < CHF_TARGET_COUNT; t++)
             if (s_table[t].button == button) { found = t; break; }
     pthread_mutex_unlock(&s_lock);
     return found;
@@ -290,7 +281,7 @@ void chfsession_binding_set_button(chfsession *s, int target, int button,
                                      char *stolen, int stolensz)
 {
     int victims[CHF_TARGET_COUNT], nvictims = 0, t;
-    int port = target / CHF_ACT_PER_PORT;   /* 2 = switches/sysactions */
+    int port = target / CHF_ACT_PER_PORT;   /* 2 and up: buttons, RESET, actions */
     (void)s;
     if (target < 0 || target >= CHF_TARGET_COUNT) return;
     pthread_mutex_lock(&s_lock);
@@ -301,7 +292,7 @@ void chfsession_binding_set_button(chfsession *s, int target, int button,
             /* steal only within the same scope: this port, or the
              * machine-wide targets, which every pad reaches */
             if (t != target && s_table[t].button == button
-                && (tport == port || tport >= 2 || port >= 2)) {
+                && (tport == port || tport >= CHF_PLAYERS || port >= CHF_PLAYERS)) {
                 s_table[t].button = CHF_PAD_BTN_NONE;
                 victims[nvictims++] = t;
             }
@@ -327,7 +318,7 @@ void chfsession_bindings_reset(chfsession *s)
 /* ---- names ---------------------------------------------------------------- */
 
 static const char *const act_names[CHF_ACT_PER_PORT] = {
-    "Up", "Right", "Down", "Left", "Fire",
+    "Right", "Left", "Back", "Forward", "Twist CCW", "Twist CW", "Pull", "Push",
 };
 static const char *const switch_names[CHF_SW_COUNT] = {
     "RESET",
@@ -336,19 +327,17 @@ static const char *const sysact_names[CHF_SYSACT_COUNT] = {
     "Reset to CONFIG", "Debugger Stop",
 };
 
-/* A console key's name: "Player 1 keypad 5", "START". */
+/* A console button's name: "1 TIME". */
 static const char *key_name(int key, char *buf, size_t bufsz)
 {
-    const char *label = chfsession_key_label(CHF_MACHINE_ARCADIA, key);
+    const char *label = chfsession_key_label(CHF_MACHINE_CHANNELF, key);
+    const char *legend = chfsession_key_legend(CHF_MACHINE_CHANNELF, key);
     if (!label) {
         snprintf(buf, bufsz, "%d", key);
         return buf;
     }
-    if (key < 24) {
-        snprintf(buf, bufsz, "P%d keypad %s", key / 12 + 1, label);
-        return buf;
-    }
-    return label;
+    snprintf(buf, bufsz, "%s %s", label, legend ? legend : "");
+    return buf;
 }
 
 const char *chf_target_name(int target)
@@ -356,14 +345,14 @@ const char *chf_target_name(int target)
     static char buf[64];
     char kbuf[32];
     if (target < 0 || target >= CHF_TARGET_COUNT) return "";
-    if (target < 2 * CHF_ACT_PER_PORT) {
-        snprintf(buf, sizeof buf, "Disc %d: %s", target / CHF_ACT_PER_PORT + 1,
+    if (target < CHF_PLAYERS * CHF_ACT_PER_PORT) {
+        snprintf(buf, sizeof buf, "Player %d: %s", target / CHF_ACT_PER_PORT + 1,
                  act_names[target % CHF_ACT_PER_PORT]);
         return buf;
     }
-    target -= 2 * CHF_ACT_PER_PORT;
+    target -= CHF_PLAYERS * CHF_ACT_PER_PORT;
     if (target < CHF_KEY_COUNT) {
-        snprintf(buf, sizeof buf, "Key: %s", key_name(target, kbuf, sizeof kbuf));
+        snprintf(buf, sizeof buf, "Console: %s", key_name(target, kbuf, sizeof kbuf));
         return buf;
     }
     target -= CHF_KEY_COUNT;
@@ -375,8 +364,8 @@ const char *chf_target_short_name(int target)
 {
     static char buf[32];
     if (target < 0 || target >= CHF_TARGET_COUNT) return "";
-    if (target < 2 * CHF_ACT_PER_PORT) return act_names[target % CHF_ACT_PER_PORT];
-    target -= 2 * CHF_ACT_PER_PORT;
+    if (target < CHF_PLAYERS * CHF_ACT_PER_PORT) return act_names[target % CHF_ACT_PER_PORT];
+    target -= CHF_PLAYERS * CHF_ACT_PER_PORT;
     if (target < CHF_KEY_COUNT) return key_name(target, buf, sizeof buf);
     target -= CHF_KEY_COUNT;
     if (target < CHF_SW_COUNT) return switch_names[target];

@@ -1,7 +1,7 @@
 /*
  * chfsession's private state. Not installed; only the core/src sources
  * include it. One struct shared by the session's C modules (settings,
- * paths, media, audio, gamepads, bindings).
+ * paths, media, roms, audio, gamepads, bindings).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -31,6 +31,7 @@ struct chfsession {
     char config_dir[CHF_PATH_MAX];
     char data_dir[CHF_PATH_MAX];
     char carts_dir[CHF_PATH_MAX];
+    char roms_dir[CHF_PATH_MAX];       /* <data>/roms: the imported BIOS */
     char settings_file[CHF_PATH_MAX];
 
     setting_kv *settings;
@@ -62,22 +63,31 @@ struct chfsession {
     char cart_path[CHF_PATH_MAX];
     int run_machine;                   /* chf_machine the host was started with */
     int run_game;                      /* the slot holds a game's own cartridge
-                                        * (a mapper), not the FujiNet cart */
+                                        * (a mapper), not the FujiNet cartridge */
+    int run_bios;                      /* CHF_ROM_SL31253 / _SL90025, -1: the stand-in */
+    int refused_bios;                  /* a game was refused for want of the BIOS
+                                        * (cleared by the next power cycle) */
+    char refused_why[256];
     /* keys the keyboard currently holds, by target, so a release clears
      * exactly what its press asserted even if the binding changed meanwhile */
     uint32_t held_keysym[CHF_TARGET_COUNT];
 
-    /* What drives each stick direction, matrix key and console button, one
-     * bit per source (SRC_*), so that letting go of one source never
-     * releases another's. input_mtx covers these arrays and the calls that
-     * hand the result to the host. */
+    /* What drives each controller contact, console button and RESET, one bit
+     * per source (SRC_*), so that letting go of one source never releases
+     * another's. input_mtx covers these arrays and the calls that hand the
+     * result to the host. */
     pthread_mutex_t input_mtx;
-    uint32_t pad_src[2][CHF_ACT_PER_PORT];
+    uint32_t pad_src[CHF_PLAYERS][CHF_ACT_PER_PORT];
     uint32_t key_src[CHF_KEY_COUNT];
     uint32_t sw_src[CHF_SW_COUNT];
-    /* each pad's analog disc deflection per port, -128..127 (0 = centre) */
-    int disc_x[9][2];     /* [CHF_MAX_PADS] = the pointer (chfsession_disc_set) */
-    int disc_y[9][2];
+
+    /* twist pulses (the wheel): each held until the machine has run this many
+     * frames (0: not pulsing); a small thread lets them go (input.c) */
+    uint64_t pulse_until[CHF_PLAYERS][2];
+    pthread_t pulse_thread;
+    pthread_cond_t pulse_cond;
+    int pulse_thread_up;
+    int pulse_quit;
 
     void *audio;              /* audio_sdl.c state, NULL until started */
     void *gamepad;            /* gamepad_sdl.c state, NULL until started */
@@ -121,17 +131,43 @@ void fujinet_stop(struct chfsession *s);
 int  fujinet_wait_for_boip(struct chfsession *s, int timeout_ms);
 
 /* Who is holding an input down (the bits of the *_src arrays): the keyboard
- * and the controllers window together, and for each gamepad (by the stable
+ * and the controllers window's buttons together, the pointer's own drag
+ * (chfsession_pointer_set), a wheel pulse, and for each gamepad (by the stable
  * owner number its slot was given, 0 to CHF_MAX_PADS - 1) its buttons and its
- * analog stick / hat separately. So letting go of one never releases another,
- * even two pads or two buttons bound to the one key. */
+ * analog sticks / hat separately. So letting go of one never releases
+ * another, even two pads or two buttons bound to the one key. */
 #define CHF_MAX_PADS  8
 #define SRC_KEYBOARD 1u
 #define SRC_PAD(owner)   (1u << (1 + (owner)))
 #define SRC_STICK(owner) (1u << (1 + CHF_MAX_PADS + (owner)))
+#define SRC_POINTER  (1u << (1 + 2 * CHF_MAX_PADS))
+#define SRC_PULSE    (1u << (2 + 2 * CHF_MAX_PADS))
 
 /* paths.c: mkdir -p. */
 int paths_mkdir_p(const char *path);
+
+/* roms.c */
+/* The BIOS bytes, malloc'd (caller frees), or NULL when the item is not in the
+ * ROM directory (or embedded). */
+uint8_t *roms_load(struct chfsession *s, int id, uint32_t *size);
+/* Copies a developer build's embedded images into the ROM directory on first
+ * run (WITH_CHF_ROMS=ON); nothing in a shipped build. */
+void roms_provision_embedded(struct chfsession *s);
+/* The first half that runs on `machine` under `choice` (a chf_bios_choice),
+ * or -1 for the stand-in; and whether sl31254 is there too. */
+int  roms_bios_for(struct chfsession *s, int machine, int choice);
+int  roms_import_ex(struct chfsession *s, const char *path, char *msg, int msgsz,
+                    char *first_dest, int destsz);
+
+/* input.c: the controllers, the console's buttons and RESET, from every
+ * source. */
+void input_init(struct chfsession *s);
+/* Let go of every source and tell the host (a start). */
+void input_clear(struct chfsession *s);
+/* A power cycle replaced the machine: hand it what is still held. */
+void input_after_power_cycle(struct chfsession *s);
+/* Stop the pulse thread, if it is up (stop / free). */
+void input_stop(struct chfsession *s);
 
 /* audio_sdl.c */
 int  audio_start(struct chfsession *s);
@@ -141,12 +177,10 @@ void audio_stop(struct chfsession *s);
 int  gamepad_start(struct chfsession *s);
 void gamepad_stop(struct chfsession *s);
 /* Called by the gamepad thread for the pad that owns `owner`. press: a pad
- * button drives a target (a disc direction or fire, a console key, RESET)
- * -- the pad's SRC_PAD source. stick: the analog stick or hat drives a stick
- * direction -- its SRC_STICK source. */
+ * button drives a target (a controller contact, a console button, RESET) --
+ * the pad's SRC_PAD source. stick: an analog stick or hat drives a controller
+ * contact -- its SRC_STICK source. */
 void session_gamepad_press(struct chfsession *s, int owner, int target, int down);
-/* The analog disc of a pad (left stick): x/y -128..127, 0 = centre. */
-void session_gamepad_disc(struct chfsession *s, int owner, int port, int x, int y);
 void session_gamepad_stick(struct chfsession *s, int owner, int port, int act, int down);
 /* Called by the gamepad thread on a connect/disconnect. */
 void session_gamepad_event(struct chfsession *s, const char *text);

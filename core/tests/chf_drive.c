@@ -4,22 +4,21 @@
  * For exploring CONFIG and checking a flow end to end; built, not
  * registered.
  *
- *   chf_drive [--cart image] [--rom file|zip|folder]... [--import-sd file]... SCRIPT
+ *   chf_drive [--cart image] [--bios file|zip|folder]... [--import-sd file]... SCRIPT
  *
  * SCRIPT is a sequence of words:
  *   wait:MS            let the machine run
  *   press:TARGET[:MS]  hold a control (default 100 ms), then release it;
- *                      TARGET is a key's label (q, 7, enter, clear, space, yes,
- *                      no, plus, minus, times, divide, equals, dot, ?), j1up,
- *                      j1down, j1left, j1right, j1fire (and j2...), reset, or
- *                      config (Reset to CONFIG)
+ *                      TARGET is a console button (1-4, time, mode, hold,
+ *                      start), a controller contact (p1 or p2, then right,
+ *                      left, back, forward, ccw, cw, pull or push: p1push),
+ *                      reset, or config (Reset to CONFIG)
  *   shot:NAME          write the current frame to NAME.ppm
  *   status             print the cartridge's status
  *   until:TEXT:MS      wait up to MS for the status to contain TEXT
- *   text               print the cart's text engine screen
  *
  * Settings and data go in a fresh tree under $TMPDIR; --bios imports a
- * ROM or zip or folder into it (never the user's own ROM directory). The FujiNet runtime
+ * BIOS ROM or zip or folder into it (never the user's own ROM directory). The FujiNet runtime
  * takes stdout and stderr for its Console Log and changes directory, so
  * this prints to its own copy of stdout and resolves NAME against the
  * directory it started in.
@@ -36,7 +35,6 @@
 #include <unistd.h>
 
 #include "chfsession.h"
-#include "chfdebug.h"
 #include "test_tmpdir.h"
 
 static FILE *out;               /* stdout, before the runtime took it */
@@ -48,42 +46,36 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
-/* a key's label, jNdir / jNfire, reset; config is a system action (-2) */
+/* a console button (1-4 or its legend), pNcontact, reset; config is a system
+ * action (-2) */
 static int target_of(const char *name)
 {
-    int n;
-    const chf_keycap *caps = chfsession_keyboard_layout(CHF_MACHINE_ARCADIA, &n, NULL, NULL);
-    static const char *const dirs[] = { "up", "right", "down", "left", "fire" };
+    static const char *const acts[CHF_ACT_PER_PORT] = {
+        "right", "left", "back", "forward", "ccw", "cw", "pull", "push",
+    };
 
-    if (name[0] == 'j' && (name[1] == '1' || name[1] == '2'))
+    if (name[0] == 'p' && (name[1] == '1' || name[1] == '2'))
     {
-        for (int d = 0; d < 5; d++)
-            if (!strcmp(name + 2, dirs[d]))
-                return CHF_TARGET_PORT(name[1] - '1', d);
+        for (int a = 0; a < CHF_ACT_PER_PORT; a++)
+            if (!strcmp(name + 2, acts[a]))
+                return CHF_TARGET_PORT(name[1] - '1', a);
         return -1;
     }
     if (!strcmp(name, "reset"))
         return CHF_TARGET_SWITCH(CHF_SW_RESET);
     if (!strcmp(name, "config"))
         return -2;
-    for (int i = 0; i < n; i++)
+    for (int k = 0; k < CHF_KEY_COUNT; k++)
     {
-        const char *l = caps[i].label;
+        const char *l = chfsession_key_legend(CHF_MACHINE_CHANNELF, k);
         char low[16];
-        int k = 0;
-        for (; l[k] && k < 15; k++)
-            low[k] = (char)((l[k] >= 'A' && l[k] <= 'Z') ? l[k] + 32 : l[k]);
-        low[k] = 0;
-        if (caps[i].target >= 0 && !strcmp(low, name))
-            return CHF_TARGET_KEY(caps[i].target);
+        int i = 0;
+        for (; l[i] && i < 15; i++)
+            low[i] = (char)((l[i] >= 'A' && l[i] <= 'Z') ? l[i] + 32 : l[i]);
+        low[i] = 0;
+        if (!strcmp(low, name) || !strcmp(chfsession_key_label(CHF_MACHINE_CHANNELF, k), name))
+            return CHF_TARGET_KEY(k);
     }
-    if (!strcmp(name, "plus"))   return CHF_TARGET_KEY(16);
-    if (!strcmp(name, "minus"))  return CHF_TARGET_KEY(40);
-    if (!strcmp(name, "times"))  return CHF_TARGET_KEY(41);
-    if (!strcmp(name, "divide")) return CHF_TARGET_KEY(42);
-    if (!strcmp(name, "equals")) return CHF_TARGET_KEY(43);
-    if (!strcmp(name, "dot"))    return CHF_TARGET_KEY(39);
-    if (!strcmp(name, "space"))  return CHF_TARGET_KEY(12);
     return -1;
 }
 
@@ -91,7 +83,7 @@ static void shot(chfsession *s, const char *name)
 {
     static uint32_t px[CHFSESSION_FB_WIDTH * CHFSESSION_FB_HEIGHT];
     uint64_t serial = 0;
-    char path[512];
+    char path[1100];
     FILE *f;
 
     chfsession_copy_frame(s, px, &serial);
@@ -123,7 +115,7 @@ int main(int argc, char **argv)
 
     if (argc < 2)
     {
-        fprintf(stderr, "usage: chf_drive [--cart image] [--bios file] [--import-sd file]... SCRIPT\n");
+        fprintf(stderr, "usage: chf_drive [--cart image] [--bios file|zip|folder]... [--import-sd file]... SCRIPT\n");
         return 2;
     }
     out = fdopen(dup(STDOUT_FILENO), "w");
@@ -143,6 +135,12 @@ int main(int argc, char **argv)
     {
         if (!strcmp(argv[i], "--cart"))
             cart = argv[++i];
+        else if (!strcmp(argv[i], "--bios"))
+        {
+            char msg[512];
+            chfsession_rom_import(s, argv[++i], msg, sizeof msg);
+            fprintf(out, "bios: %s\n", msg);
+        }
         else if (!strcmp(argv[i], "--import-sd"))
             i++;   /* after start: the SD tree exists once FujiNet is up */
         else
@@ -191,12 +189,6 @@ int main(int argc, char **argv)
             }
             else if (!strncmp(w, "shot:", 5))
                 shot(s, w + 5);
-            else if (!strcmp(w, "text"))
-            {
-                static char text[4096];
-                chfdebug_command(chfsession_debugger(s), "text", text, sizeof text);
-                fprintf(out, "%s", text);
-            }
             else if (!strcmp(w, "status"))
             {
                 chfsession_cart_status(s, st, sizeof st);

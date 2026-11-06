@@ -1,13 +1,14 @@
 /*
  * session.c -- the frontend contract (core/include/chfsession.h) over the
- * Fairchild Channel F host (core/chf/host.h): a Signetics 2650 console with
- * no BIOS, so the only images are game cartridges and FujiNet apps.
+ * Channel F host (core/chf/host.h): an F3850 console whose BIOS is either the
+ * user's own imported dump or the app's stand-in, with the FujiNet cartridge in
+ * its slot.
  *
- * The C modules beside it (settings, paths, media, roms, keyboard, audio,
- * gamepads, bindings) share the session struct through session_internal.h;
- * this file owns the lifecycle, the power cycles, the cartridges, the input
- * routing and the cartridge status. Ported from the O2 sibling's
- * session.c.
+ * The C modules beside it (settings, paths, media, roms, input, controls,
+ * audio, gamepads, bindings) share the session struct through
+ * session_internal.h; this file owns the lifecycle, the power cycles, the
+ * cartridges, the BIOS and the cartridge status. Ported from the Arcadia
+ * sibling's session.c, with the O2 sibling's BIOS handling.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -29,9 +30,9 @@
 #include "fuji_mailbox.h"
 #include "chfmap.h"
 
-/* The largest image the cartridge serves: an APPBANK image (8K and up to 31
- * pages of 2K), with room to say "too big" rather than truncate. */
-#define CART_MAX (CHFMAP_STORE + 1u)
+/* The largest image a game cartridge can be: the 256K multi-game cartridge.
+ * (The FujiNet cartridge serves 64K at most: chfmap.h.) */
+#define CART_MAX (0x40000u + 1u)
 
 /* ---- the machines ----------------------------------------------------------- */
 
@@ -39,7 +40,27 @@
 
 static int clamp_machine(int machine)
 {
-    return machine >= 0 && machine < CHF_MACHINE_COUNT ? machine : CHF_MACHINE_ARCADIA;
+    return machine >= 0 && machine < CHF_MACHINE_COUNT ? machine : CHF_MACHINE_CHANNELF;
+}
+
+static int clamp_bios(int choice)
+{
+    return choice >= 0 && choice < CHF_BIOS_CHOICE_COUNT ? choice : CHF_BIOS_AUTO;
+}
+
+/* The picture's shape on the TV: the NTSC console draws its 102 x 58 cells
+ * 2 x 4 pixels (204 x 232), the PAL ones 2 x 5 (204 x 290); a TV shows either
+ * at 4:3. */
+void chfsession_display_aspect(int machine, int square_pixels, int *num, int *den)
+{
+    int n = 4, d = 3;
+
+    if (square_pixels) {
+        n = CHFSESSION_FB_WIDTH;
+        d = chf_machine_is_pal(clamp_machine(machine)) ? 290 : CHFSESSION_FB_HEIGHT;
+    }
+    if (num) *num = n;
+    if (den) *den = d;
 }
 
 /* ---- helpers shared with the C modules ----------------------------------- */
@@ -99,12 +120,15 @@ chfsession *chfsession_new(const chfsession_paths *paths)
     pthread_mutex_init(&s->sysact_mtx, NULL);
     pthread_mutex_init(&s->pad_event_mtx, NULL);
     pthread_mutex_init(&s->input_mtx, NULL);
+    input_init(s);
+    s->run_bios = -1;
 
     if (paths_init(s, paths ? paths->config_dir : NULL,
                    paths ? paths->data_dir : NULL) != 0) {
         chfsession_free(s);
         return NULL;
     }
+    roms_provision_embedded(s);
     settings_init(s);
     bindings_init(s);
 
@@ -130,14 +154,16 @@ void chfsession_free(chfsession *s)
     pthread_mutex_destroy(&s->sysact_mtx);
     pthread_mutex_destroy(&s->pad_event_mtx);
     pthread_mutex_destroy(&s->input_mtx);
+    pthread_cond_destroy(&s->pulse_cond);
     free(s);
 }
 
 void chfsession_default_opts(chfsession *s, chfsession_start_opts *opts)
 {
     memset(opts, 0, sizeof *opts);
-    opts->machine = clamp_machine(chfsession_get_int(s, "machine", CHF_MACHINE_ARCADIA));
-    opts->analog_joystick = chfsession_get_int(s, "analog_joystick", 1);
+    opts->machine = clamp_machine(chfsession_get_int(s, "machine", CHF_MACHINE_CHANNELF));
+    opts->bios = clamp_bios(chfsession_get_int(s, "bios", CHF_BIOS_AUTO));
+    opts->right_stick = chfsession_get_int(s, "right_stick", 1);
     opts->enable_fujinet = chfsession_get_int(s, "enable_fujinet", 1);
     opts->external_fujinet = chfsession_get_int(s, "fujinet_external", 0);
     opts->boip_connect = chfsession_get_str(s, "fujinet_external_addr", NULL);
@@ -153,6 +179,8 @@ void chfsession_default_opts(chfsession *s, chfsession_start_opts *opts)
 typedef struct {
     int app;                  /* a FujiNet app: claims the mailbox */
     int type;                 /* chf_cart_type of a game (CHF_CART_FUJINET for an app) */
+    int known;                /* a Videocart MAME's software list names */
+    uint32_t size;
     chfmap_plan_t plan;        /* what the FujiNet cartridge makes of the image */
     chfmap_err_t plan_err;
 } cart_info;
@@ -166,11 +194,10 @@ static int path_is_zip(const char *path)
 static int name_has_cart_ext(const char *name)
 {
     const char *dot = strrchr(name, '.');
-    return dot && (!strcasecmp(dot, ".bin") || !strcasecmp(dot, ".rom") ||
-                   !strcasecmp(dot, ".chf"));
+    return dot && (!strcasecmp(dot, ".bin") || !strcasecmp(dot, ".chf"));
 }
 
-/* A zip holding one cartridge image (MAME's romset zips): the one entry
+/* A zip holding one cartridge image (MAME's softlist zips): the one entry
  * with a cartridge extension, or the only entry there is. */
 static uint8_t *read_cart_zip(const char *path, uint32_t *len, char *why, int whysz)
 {
@@ -249,10 +276,10 @@ uint8_t *session_read_cart(const char *path, uint32_t *len, char *why, int whysz
 }
 
 /* Identify an image. A FujiNet app is one the cartridge firmware's own
- * planner says claims the mailbox (an APPBANK image, or a bank layout with
- * "FUJI" at $F2C); anything else is a game, which is MAME's cartridge for its
- * size and contents (the mapper the host puts in the slot: standard or Golf).
- * 1 if the image can run, else 0 and why. */
+ * planner says claims the mailbox (a 16K image, or 16K plus 8K pages, with
+ * "FUJI" at $47FC); anything else is a game, which is the Videocart for its
+ * contents (chf_cart_identify: by CRC against MAME's software list, else
+ * MAME's by-path rule). 1 if the image can run, else 0 and why. */
 static int analyse_image(const uint8_t *img, uint32_t len, cart_info *ci,
                          char *why, int whysz)
 {
@@ -260,6 +287,7 @@ static int analyse_image(const uint8_t *img, uint32_t len, cart_info *ci,
     chf_cart_t tmp;
 
     memset(ci, 0, sizeof *ci);
+    ci->size = len;
     if (why && whysz > 0)
         why[0] = '\0';
     ci->plan_err = chfmap_plan(img, len, &ci->plan);
@@ -269,6 +297,7 @@ static int analyse_image(const uint8_t *img, uint32_t len, cart_info *ci,
         return 1;
     }
     ci->type = chf_cart_identify(img, len);
+    ci->known = chf_cart_softlist_name(img, len) != NULL;
     if (chf_cart_init(&tmp, ci->type, img, len, &err) != 0) {
         if (why && whysz > 0)
             snprintf(why, (size_t)whysz, "%s", err ? err : "the cartridge cannot be mapped");
@@ -282,9 +311,9 @@ static const char *chfmap_strerror(chfmap_err_t e)
     switch (e) {
     case CHFMAP_OK:       return "ok";
     case CHFMAP_EEMPTY:   return "the image is empty";
-    case CHFMAP_ETOOBIG:  return "the image is larger than the biggest FujiNet app";
-    case CHFMAP_ENOMAP:   return "over 8 KB, but not 8 KB plus whole 2 KB pages";
-    case CHFMAP_ENOCLAIM: return "an image over 8 KB must claim the mailbox (\"FUJI\")";
+    case CHFMAP_ETOOBIG:  return "over 16 KB, and not a FujiNet app (16 KB plus whole 8 KB pages)";
+    case CHFMAP_ENOSIG:   return "it has no $55 at $0800, so the BIOS would ignore it";
+    case CHFMAP_ENOCLAIM: return "it has banked pages but does not claim the mailbox (\"FUJI\")";
     }
     return "the image cannot be mapped";
 }
@@ -330,24 +359,64 @@ int chfsession_cart_is_app(const char *path)
     return check_image(path, &ci, NULL, 0) && ci.app;
 }
 
-/* Whether the FujiNet cartridge itself can serve the image (a network boot of
- * it from the SD folder): chfmap's plan accepts it (up to 8 KB flat, or an
- * APPBANK image of 8 KB plus 2 KB pages that claims the mailbox). A game the
- * slot's own mapper takes but chfmap does not still runs from the slot, so
- * check_cart allows it; the SD folder is for what CONFIG can boot. */
+/* Whether the FujiNet cartridge can serve the image (a network boot of it
+ * from the SD folder, Import Cartridge to SD): a flat image of up to 16K with
+ * the $55 signature, or a FujiNet app. A Videocart that carries RAM or
+ * banking of its own (Maze and Hangman's 2102, Chess's 2K, the multi-game
+ * cartridges) cannot run there, and says why. A game that runs from the slot
+ * as its own cartridge but is not one of those still goes in. */
 int session_cart_plan_check(const char *path, char *why, int whysz)
 {
     cart_info ci;
+    const char *reason = NULL;
 
     if (!check_image(path, &ci, why, whysz))
         return 0;
-    if (ci.plan_err != CHFMAP_OK) {
+    if (ci.known && !ci.app) {
+        switch (ci.type) {
+        case CHF_CART_MAZE:
+        case CHF_CART_HANGMAN:
+            reason = "it has a 2102 RAM on the cartridge, which the FujiNet cartridge does not";
+            break;
+        case CHF_CART_CHESS:
+            reason = "it has 2 KB of RAM at $2800, which the FujiNet cartridge does not serve";
+            break;
+        case CHF_CART_MULTI_OLD:
+        case CHF_CART_MULTI:
+            reason = "it is a banked multi-game cartridge, which the FujiNet cartridge cannot serve";
+            break;
+        default:
+            break;
+        }
+    }
+    if (!reason && ci.plan_err != CHFMAP_OK)
+        reason = chfmap_strerror(ci.plan_err);
+    if (reason) {
         if (why && whysz > 0)
-            snprintf(why, (size_t)whysz, "the FujiNet cartridge cannot serve it: %s",
-                     chfmap_strerror(ci.plan_err));
+            snprintf(why, (size_t)whysz, "the FujiNet cartridge cannot serve it: %s", reason);
         return 0;
     }
     return 1;
+}
+
+/* What the console would be missing to run this image (NULL: just power on)
+ * with the BIOS imported now: 1 if it can, else 0 and why. A game calls the
+ * console's BIOS routines, which the stand-in does not have; CONFIG and the
+ * FujiNet apps run on either. */
+static int requirements(struct chfsession *s, int machine, int bios,
+                        const cart_info *ci, char *why, int whysz)
+{
+    if (!ci || ci->app || roms_bios_for(s, machine, bios) >= 0)
+        return 1;
+    if (bios == CHF_BIOS_STANDIN && roms_bios_for(s, machine, CHF_BIOS_AUTO) >= 0)
+        snprintf(why, (size_t)whysz,
+                 "This cartridge needs the console's BIOS, which is switched off in "
+                 "Preferences (Machine > BIOS).");
+    else
+        snprintf(why, (size_t)whysz,
+                 "This cartridge needs the console's BIOS. Use Import BIOS... to add "
+                 "your own copy (CONFIG and the FujiNet apps run without it).");
+    return 0;
 }
 
 /* ---- powering the machine -------------------------------------------------------- */
@@ -357,10 +426,10 @@ static int host_up(struct chfsession *s, const char *cart_path)
 {
     chf_host_opts_t ho;
     cart_info ci;
-    uint8_t *cart = NULL;
-    uint32_t cart_len = 0;
+    uint8_t *cart = NULL, *lo = NULL, *hi = NULL;
+    uint32_t cart_len = 0, lo_len = 0, hi_len = 0;
     char why[256];
-    int rc;
+    int rc, bios_id;
 
     memset(&ho, 0, sizeof ho);
     memset(&ci, 0, sizeof ci);
@@ -376,6 +445,26 @@ static int host_up(struct chfsession *s, const char *cart_path)
             free(cart);
             return -1;
         }
+        if (!requirements(s, s->opts.machine, s->opts.bios, &ci, why, sizeof why)) {
+            session_set_error(s, "%s", why);
+            s->refused_bios = 1;
+            snprintf(s->refused_why, sizeof s->refused_why, "%s", why);
+            free(cart);
+            return -1;
+        }
+    }
+
+    /* the console's BIOS: the user's own two ROMs, or the stand-in */
+    bios_id = roms_bios_for(s, s->opts.machine, s->opts.bios);
+    if (bios_id >= 0) {
+        lo = roms_load(s, bios_id, &lo_len);
+        hi = roms_load(s, CHF_ROM_SL31254, &hi_len);
+        if (!lo || !hi) {
+            free(lo);
+            free(hi);
+            lo = hi = NULL;
+            bios_id = -1;
+        }
     }
 
     /* The cartridge dials FujiNet's BoIP port -- the in-process runtime's,
@@ -387,6 +476,9 @@ static int host_up(struct chfsession *s, const char *cart_path)
     if (s->fujinet_disabled)
         s->boip_endpoint[0] = '\0';
     ho.machine = s->opts.machine;
+    ho.bios_lo = lo;
+    ho.bios_hi = hi;
+    ho.bios_id = bios_id;
     ho.cart = cart;
     ho.cart_size = cart_len;
     ho.cart_type = cart ? ci.type : CHF_CART_FUJINET;
@@ -400,16 +492,23 @@ static int host_up(struct chfsession *s, const char *cart_path)
     } else {
         s->run_machine = s->opts.machine;
         s->run_game = cart && !ci.app;
+        s->run_bios = bios_id;
+        s->refused_bios = 0;
+        input_after_power_cycle(s);
     }
     free(cart);
+    free(lo);
+    free(hi);
     return rc;
 }
 
-/* The machine option the settings name now: a Preferences change takes
- * effect at the next power cycle, which reads it here. */
+/* The machine options the settings name now: an Import BIOS or a Preferences
+ * change takes effect at the next power cycle, which reads them here. */
 static void reload_machine_opts(struct chfsession *s)
 {
     s->opts.machine = clamp_machine(chfsession_get_int(s, "machine", s->opts.machine));
+    s->opts.bios = clamp_bios(chfsession_get_int(s, "bios", s->opts.bios));
+    s->opts.right_stick = chfsession_get_int(s, "right_stick", s->opts.right_stick);
 }
 
 /* A power cycle: the machine and the cartridge come up fresh; FujiNet stays
@@ -448,6 +547,7 @@ static void adopt_opts(struct chfsession *s, const chfsession_start_opts *opts)
 {
     s->opts = *opts;
     s->opts.machine = clamp_machine(opts->machine);
+    s->opts.bios = clamp_bios(opts->bios);
     if (opts->cart_path) {
         char abs[CHF_PATH_MAX];
         snprintf(s->cart_path, sizeof s->cart_path, "%s",
@@ -474,12 +574,8 @@ int chfsession_start(chfsession *s, const chfsession_start_opts *opts)
     }
     adopt_opts(s, opts);
 
-    memset(s->pad_src, 0, sizeof s->pad_src);
-    memset(s->key_src, 0, sizeof s->key_src);
-    memset(s->sw_src, 0, sizeof s->sw_src);
-    memset(s->disc_x, 0, sizeof s->disc_x);
-    memset(s->disc_y, 0, sizeof s->disc_y);
-    chf_host_release_all();
+    s->refused_bios = 0;
+    input_clear(s);
     chfdebug_trace_fujinet(s);
 
     /* An external FujiNet is dialed at the address the settings name; a bad
@@ -515,8 +611,8 @@ int chfsession_start(chfsession *s, const chfsession_start_opts *opts)
     }
 
     /* A remembered cartridge that no longer loads (moved, an image the
-     * console cannot take) must not leave the app unbootable: fall back to
-     * CONFIG and say why. */
+     * console cannot take, a game whose BIOS has gone) must not leave the app
+     * unbootable: fall back to CONFIG and say why. */
     if (host_up(s, s->opts.cart_path) != 0) {
         if (s->opts.cart_path) {
             fprintf(stderr, "chf: %s: %s; booting CONFIG\n", s->cart_path, s->last_error);
@@ -551,10 +647,12 @@ void chfsession_stop(chfsession *s)
         return;
     audio_stop(s);
     gamepad_stop(s);
+    input_stop(s);
     chfdebug_before_power_cycle(s);
     chf_host_stop();
     fujinet_stop(s);
     s->fujinet_external = 0;
+    s->run_bios = -1;
     s->running = 0;
 }
 
@@ -607,6 +705,16 @@ int chfsession_load_cart(chfsession *s, const char *path)
         session_set_error(s, "%s", why);
         return -1;
     }
+    /* A game calls BIOS routines the stand-in does not have: judge by the
+     * machine and BIOS settings the power cycle will read. */
+    if (!requirements(s, clamp_machine(chfsession_get_int(s, "machine", s->opts.machine)),
+                      clamp_bios(chfsession_get_int(s, "bios", s->opts.bios)), &ci,
+                      why, sizeof why)) {
+        session_set_error(s, "%s", why);
+        s->refused_bios = 1;
+        snprintf(s->refused_why, sizeof s->refused_why, "%s", why);
+        return -1;
+    }
     if (power_cycle(s, path) != 0) {
         set_cart(s, NULL);
         return -1;
@@ -639,6 +747,44 @@ int chfsession_reset_to_config(chfsession *s)
 int chfsession_eject(chfsession *s)
 {
     return chfsession_reset_to_config(s);
+}
+
+/* What the running configuration lacks: the stand-in met a game or a BIOS
+ * routine it does not have (the host saw it), or a game was refused for want
+ * of the BIOS. The refusal clears when the BIOS has since been imported, and
+ * everything at the next power cycle that has it. */
+unsigned chfsession_missing(chfsession *s)
+{
+    char why[160];
+    unsigned missing = 0;
+
+    if (s->running)
+        missing = chf_host_missing(why, sizeof why);
+    if (s->refused_bios && chfsession_have_bios(s, clamp_machine(
+            chfsession_get_int(s, "machine", s->opts.machine))))
+        s->refused_bios = 0;
+    if (s->refused_bios)
+        missing |= CHF_MISSING_BIOS;
+    return missing;
+}
+
+int chfsession_needs_bios(chfsession *s)
+{
+    return (chfsession_missing(s) & CHF_MISSING_BIOS) != 0;
+}
+
+int chfsession_missing_reason(chfsession *s, char *dst, int dstsz)
+{
+    char why[256] = "";
+
+    if (!dst || dstsz <= 0)
+        return 0;
+    dst[0] = '\0';
+    if (s->running && (chf_host_missing(why, sizeof why) & CHF_MISSING_BIOS) && why[0])
+        return snprintf(dst, (size_t)dstsz, "%s", why);
+    if (chfsession_needs_bios(s))
+        return snprintf(dst, (size_t)dstsz, "%s", s->refused_why);
+    return 0;
 }
 
 void chfsession_set_paused(chfsession *s, int paused)
@@ -675,7 +821,7 @@ uint64_t chfsession_frame_count(chfsession *s)
 int chfsession_refresh_rate(chfsession *s)
 {
     const int machine = s->running ? s->run_machine
-        : clamp_machine(chfsession_get_int(s, "machine", CHF_MACHINE_ARCADIA));
+        : clamp_machine(chfsession_get_int(s, "machine", CHF_MACHINE_CHANNELF));
     return chf_machine_is_pal(machine) ? 50 : 60;
 }
 
@@ -709,276 +855,6 @@ void chfsession_set_volume(chfsession *s, int percent)
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     chfsession_set_int(s, "volume", percent);
-}
-
-/* ---- input ----------------------------------------------------------------- */
-
-/* The console's view of a disc's digital side: opposite directions cancel
- * (MAME's inputs are 8-way for the same reason). input_mtx held. */
-static unsigned stick_mask_locked(const struct chfsession *s, int port)
-{
-    unsigned mask = 0;
-
-    for (int a = 0; a < CHF_ACT_PER_PORT; a++)
-        if (s->pad_src[port][a])
-            mask |= 1u << a;
-    if ((mask & (1u << CHF_ACT_UP)) && (mask & (1u << CHF_ACT_DOWN)))
-        mask &= ~((1u << CHF_ACT_UP) | (1u << CHF_ACT_DOWN));
-    if ((mask & (1u << CHF_ACT_LEFT)) && (mask & (1u << CHF_ACT_RIGHT)))
-        mask &= ~((1u << CHF_ACT_LEFT) | (1u << CHF_ACT_RIGHT));
-    return mask;
-}
-
-static void push_stick_locked(struct chfsession *s, int port)
-{
-    /* chf_action's order is the host's bit order: UP RIGHT DOWN LEFT FIRE */
-    chf_host_stick_set(port, (uint8_t)stick_mask_locked(s, port));
-}
-
-/* The analog disc: the strongest deflection any pad on the port holds
- * (a non-zero analog value overrides the digital bits in the core). */
-static void push_disc_locked(struct chfsession *s, int port)
-{
-    int bx = 0, by = 0, best = 0;
-
-    for (int o = 0; o <= CHF_MAX_PADS; o++) {
-        int mag = abs(s->disc_x[o][port]) + abs(s->disc_y[o][port]);
-        if (mag > best) {
-            best = mag;
-            bx = s->disc_x[o][port];
-            by = s->disc_y[o][port];
-        }
-    }
-    chf_host_disc_set(port, bx, by);
-}
-
-static void push_matrix_locked(struct chfsession *s)
-{
-    uint64_t matrix = 0;
-
-    for (int k = 0; k < CHF_KEY_COUNT; k++)
-        if (s->key_src[k])
-            matrix |= 1ull << k;
-    chf_host_keys_set(matrix);
-}
-
-static void push_reset_locked(struct chfsession *s)
-{
-    chf_host_reset_set(s->sw_src[CHF_SW_RESET] != 0);
-}
-
-static void set_src(uint32_t *word, uint32_t src, int down)
-{
-    if (down)
-        *word |= src;
-    else
-        *word &= ~src;
-}
-
-/* One source of one target; sysactions are not held inputs and are left to
- * the caller. */
-static void source_press(struct chfsession *s, int target, uint32_t src, int down)
-{
-    pthread_mutex_lock(&s->input_mtx);
-    if (target < 2 * CHF_ACT_PER_PORT) {
-        const int port = target / CHF_ACT_PER_PORT;
-        set_src(&s->pad_src[port][target % CHF_ACT_PER_PORT], src, down);
-        push_stick_locked(s, port);
-    } else if (target < CHF_TARGET_SWITCH(0)) {
-        set_src(&s->key_src[target - CHF_TARGET_KEY(0)], src, down);
-        push_matrix_locked(s);
-    } else if (target < CHF_TARGET_SYSACT(0)) {
-        set_src(&s->sw_src[target - CHF_TARGET_SWITCH(0)], src, down);
-        push_reset_locked(s);
-    }
-    pthread_mutex_unlock(&s->input_mtx);
-}
-
-void chfsession_press(chfsession *s, int target, int down)
-{
-    if (!s->running || target < 0 || target >= CHF_TARGET_COUNT)
-        return;
-    if (target >= CHF_TARGET_SYSACT(0)) {
-        if (down)
-            chfsession_sysaction(s, target - CHF_TARGET_SYSACT(0));
-        return;
-    }
-    source_press(s, target, SRC_KEYBOARD, down);
-}
-
-void chfsession_sysaction(chfsession *s, int sysact)
-{
-    switch (sysact) {
-    case CHF_SYSACT_RESET_CONFIG:
-        chfsession_reset_to_config(s);
-        break;
-    case CHF_SYSACT_DEBUG_STOP:
-        if (s->running) {
-            chfdebug *d = chfdebug_get(s);
-            chfdebug_attach(d);
-            chfdebug_stop(d);
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-void chfsession_sysaction_post(chfsession *s, int sysact)
-{
-    if (sysact < 0 || sysact >= CHF_SYSACT_COUNT)
-        return;
-    pthread_mutex_lock(&s->sysact_mtx);
-    s->sysact_pending |= 1u << sysact;
-    pthread_mutex_unlock(&s->sysact_mtx);
-}
-
-int chfsession_sysaction_take(chfsession *s, int *out)
-{
-    int found = 0;
-    pthread_mutex_lock(&s->sysact_mtx);
-    for (int i = 0; i < CHF_SYSACT_COUNT; i++) {
-        if (s->sysact_pending & (1u << i)) {
-            s->sysact_pending &= ~(1u << i);
-            if (out)
-                *out = i;
-            found = 1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&s->sysact_mtx);
-    return found;
-}
-
-unsigned chfsession_buttons_held(chfsession *s, int port)
-{
-    unsigned held;
-    if (port < 0 || port > 1)
-        return 0;
-    pthread_mutex_lock(&s->input_mtx);
-    held = stick_mask_locked(s, port);
-    pthread_mutex_unlock(&s->input_mtx);
-    return held;
-}
-
-void chfsession_disc_get(chfsession *s, int port, int *x, int *y)
-{
-    int bx = 0, by = 0, best = 0;
-
-    if (port >= 0 && port <= 1) {
-        pthread_mutex_lock(&s->input_mtx);
-        for (int o = 0; o <= CHF_MAX_PADS; o++) {
-            int mag = abs(s->disc_x[o][port]) + abs(s->disc_y[o][port]);
-            if (mag > best) {
-                best = mag;
-                bx = s->disc_x[o][port];
-                by = s->disc_y[o][port];
-            }
-        }
-        pthread_mutex_unlock(&s->input_mtx);
-    }
-    if (x) *x = bx;
-    if (y) *y = by;
-}
-
-int chfsession_key_held(chfsession *s, int key)
-{
-    int held;
-    if (key < 0 || key >= CHF_KEY_COUNT)
-        return 0;
-    pthread_mutex_lock(&s->input_mtx);
-    held = s->key_src[key] != 0;
-    pthread_mutex_unlock(&s->input_mtx);
-    return held;
-}
-
-int chfsession_switch_held(chfsession *s, int sw)
-{
-    int held;
-    if (sw < 0 || sw >= CHF_SW_COUNT)
-        return 0;
-    pthread_mutex_lock(&s->input_mtx);
-    held = s->sw_src[sw] != 0;
-    pthread_mutex_unlock(&s->input_mtx);
-    return held;
-}
-
-/* Everything the keyboard and the controllers window hold, let go (focus
- * loss): what a key's press asserted, whichever way it was asserted. A
- * gamepad's own holds are left to the gamepad. */
-static void release_keyboard_sources(struct chfsession *s)
-{
-    pthread_mutex_lock(&s->input_mtx);
-    for (int port = 0; port < 2; port++) {
-        for (int a = 0; a < CHF_ACT_PER_PORT; a++)
-            s->pad_src[port][a] &= ~SRC_KEYBOARD;
-        push_stick_locked(s, port);
-    }
-    for (int k = 0; k < CHF_KEY_COUNT; k++)
-        s->key_src[k] &= ~SRC_KEYBOARD;
-    push_matrix_locked(s);
-    for (int w = 0; w < CHF_SW_COUNT; w++)
-        s->sw_src[w] &= ~SRC_KEYBOARD;
-    push_reset_locked(s);
-    pthread_mutex_unlock(&s->input_mtx);
-}
-
-void chfsession_release_all(chfsession *s)
-{
-    if (!s)
-        return;
-    memset(s->held_keysym, 0, sizeof s->held_keysym);
-    release_keyboard_sources(s);
-}
-
-/* The gamepad thread's entry points: the same routing, from the pad's own
- * source bits, never touching the settings or the debugger. */
-void session_gamepad_press(struct chfsession *s, int owner, int target, int down)
-{
-    if (!s->running || owner < 0 || owner >= CHF_MAX_PADS || target < 0
-        || target >= CHF_TARGET_SYSACT(0))
-        return;
-    source_press(s, target, SRC_PAD(owner), down);
-}
-
-void session_gamepad_disc(struct chfsession *s, int owner, int port, int x, int y)
-{
-    if (!s->running || owner < 0 || owner >= CHF_MAX_PADS || port < 0 || port > 1)
-        return;
-    pthread_mutex_lock(&s->input_mtx);
-    s->disc_x[owner][port] = x;
-    s->disc_y[owner][port] = y;
-    push_disc_locked(s, port);
-    pthread_mutex_unlock(&s->input_mtx);
-}
-
-void chfsession_disc_set(chfsession *s, int port, int x, int y)
-{
-    if (!s->running || port < 0 || port > 1)
-        return;
-    if (x < -128) x = -128;
-    if (x > 127) x = 127;
-    if (y < -128) y = -128;
-    if (y > 127) y = 127;
-    pthread_mutex_lock(&s->input_mtx);
-    s->disc_x[CHF_MAX_PADS][port] = x;
-    s->disc_y[CHF_MAX_PADS][port] = y;
-    push_disc_locked(s, port);
-    pthread_mutex_unlock(&s->input_mtx);
-}
-
-void session_gamepad_stick(struct chfsession *s, int owner, int port, int act, int down)
-{
-    if (!s->running || owner < 0 || owner >= CHF_MAX_PADS || port < 0 || port > 1
-        || act < 0 || act >= CHF_ACT_PER_PORT)
-        return;
-    source_press(s, CHF_TARGET_PORT(port, act), SRC_STICK(owner), down);
-}
-
-void chfsession_set_analog(chfsession *s, int joystick)
-{
-    s->opts.analog_joystick = joystick ? 1 : 0;
-    chfsession_set_int(s, "analog_joystick", s->opts.analog_joystick);
 }
 
 /* ---- FujiNet --------------------------------------------------------------- */
@@ -1106,11 +982,14 @@ int chfsession_cart_booted_game(chfsession *s)
     return st.booted_game ? 1 : 0;
 }
 
+/* "Videocart, 4 KB" for a plain game (and for an image MAME's software list
+ * does not name: the by-path rule's RAM is harmless to it), "Maze (2102 RAM)"
+ * and the like for the cartridges with hardware of their own. */
 int chfsession_cart_type_name(chfsession *s, char *dst, int dstsz)
 {
     chf_cart_status_t st;
     chf_cart_t *c;
-    int type = CHF_CART_NONE;
+    int type = CHF_CART_NONE, known = 0;
     uint32_t size = 0;
     char what[96];
 
@@ -1120,21 +999,25 @@ int chfsession_cart_type_name(chfsession *s, char *dst, int dstsz)
     if (!s->running)
         return 0;
 
-    chf_host_cart_status(&st);
+    memset(&st, 0, sizeof st);
+    if (!s->run_game)
+        chf_host_cart_status(&st);
     chf_host_lock();
     c = chf_host_cart();
     if (c) {
         type = c->type;
         size = c->rom_size;
+        known = c->rom && chf_cart_softlist_name(c->rom, c->rom_size) != NULL;
     }
     chf_host_unlock();
 
     if (s->run_game || (type != CHF_CART_FUJINET && type != CHF_CART_NONE)) {
+        const char *name = known && type != CHF_CART_STD ? chf_cart_type_name(type) : "Videocart";
+
         if (size >= 1024)
-            snprintf(what, sizeof what, "%s, %u KB", chf_cart_type_name(type),
-                     (unsigned)((size + 1023) / 1024));
+            snprintf(what, sizeof what, "%s, %u KB", name, (unsigned)((size + 1023) / 1024));
         else
-            snprintf(what, sizeof what, "%s", chf_cart_type_name(type));
+            snprintf(what, sizeof what, "%s", name);
     } else if (!st.booted_game) {
         snprintf(what, sizeof what, "FujiNet CONFIG");
     } else if (st.mailbox) {

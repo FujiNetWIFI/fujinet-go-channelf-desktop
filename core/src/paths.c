@@ -1,8 +1,7 @@
 /*
  * chfsession path layout: XDG config/data directories, the cartridge
- * directory, the ROM directory (the imported BIOS, character sets and
- * speech ROMs) and the FujiNet runtime tree. Transposed from the NES port's paths.c (same
- * author, same license).
+ * directory, the ROM directory (the imported BIOS) and the FujiNet runtime
+ * tree. Transposed from the NES port's paths.c (same author, same license).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -180,6 +179,18 @@ int paths_init(struct chfsession *s, const char *config_dir,
     snprintf(s->carts_dir, sizeof s->carts_dir, "%s/carts", s->data_dir);
     if (mkdir_p(s->carts_dir) != 0) {
         session_set_error(s, "cannot create cartridge dir %s", s->carts_dir);
+        return -1;
+    }
+    /* The imported BIOS (roms.c); CHF_ROM_DIR overrides it (the tests). */
+    {
+        const char *env = getenv("CHF_ROM_DIR");
+        if (env && *env)
+            snprintf(s->roms_dir, sizeof s->roms_dir, "%s", env);
+        else
+            snprintf(s->roms_dir, sizeof s->roms_dir, "%s/roms", s->data_dir);
+    }
+    if (mkdir_p(s->roms_dir) != 0) {
+        session_set_error(s, "cannot create ROM dir %s", s->roms_dir);
         return -1;
     }
     return 0;

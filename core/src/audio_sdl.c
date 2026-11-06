@@ -5,7 +5,7 @@
  * which would fight the GTK/Qt display stack.
  *
  * The device runs at CHFSESSION_AUDIO_RATE, interleaved stereo float: the
- * core streams the beeper at this rate (core/chf/machine.c) and the
+ * core streams the console's tones at this rate (core/chf/sound.c) and the
  * host's ring hands it over as is, so the callback does no conversion of its
  * own. Modelled on the NES port's audio_sdl.c by way of the SMS sibling.
  *

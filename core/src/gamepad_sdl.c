@@ -1,6 +1,6 @@
 /*
- * gamepad_sdl -- SDL3 gamepads (and unmapped joysticks) as Channel F
- * joysticks, on their own polling thread.
+ * gamepad_sdl -- SDL3 gamepads (and unmapped joysticks) as Channel F hand
+ * controllers, on their own polling thread.
  *
  * A polling thread rather than SDL's event queue on the UI thread: this
  * app's video belongs to GTK/Qt/AppKit/Win32, not SDL, and only the gamepad
@@ -11,17 +11,18 @@
  * mapping for (a plain HID adapter) is opened as a raw joystick instead:
  * its buttons and hats are bindable in the raw bands, just unnamed.
  *
- * What a pad drives is a stick (1 for the first pad, 2 for the second).
- * Every button goes through the bindings table: by default the D-pad is the
- * stick's four directions and South its button, and a button may be bound to
- * a keyboard key or RESET instead. With "analog sticks" on, the left analog
- * stick drives the console's analog disc (two pots, -128..127, radial
- * dead zone), the way the real controller's disc does; with it off it is an
- * eight-way switch with hysteresis instead. Hat 0 of a raw joystick is always
- * digital. The three ways of holding an input
- * -- a pad button, the analog stick, the keyboard -- are separate sources in
- * the session, so letting go of one never releases another. Ported from the
- * O2 sibling's gamepad_sdl.c.
+ * What a pad drives is one hand controller (the first pad is player 1, the
+ * right controller; the second is player 2, the left). Every button goes
+ * through the bindings table: by default the D-pad tilts the stick, LB/RB
+ * twist the knob, East pulls it and South pushes it, and a button may be
+ * bound to a console button, RESET, or a keyboard key instead. The left
+ * analog stick is always the controller's stick: an eight-way switch with
+ * hysteresis (in at half deflection, out at 0.35). With "right_stick" on the
+ * right analog stick is the knob's other axes: x twists, y pulls (up) and
+ * pushes (down), with the same thresholds. Hat 0 of a raw joystick is the
+ * stick too. The ways of holding an input -- a pad button, the analog sticks,
+ * the keyboard -- are separate sources in the session, so letting go of one
+ * never releases another. Ported from the O2 sibling's gamepad_sdl.c.
  *
  * Pads are assigned to ports in connection order unless assigned explicitly.
  * A pad that is unplugged and plugged back in (matched by its SDL GUID and
@@ -32,7 +33,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -47,13 +47,7 @@
 #define MAX_PADS CHF_MAX_PADS
 #define MAX_HATS 4
 
-/* A third of full deflection engages, a sixth releases: low enough that a
- * worn stick still registers, high enough that resting drift does not, and
- * a gap wide enough that jitter across one threshold cannot flutter. */
-#define STICK_ENTER 0.35f
-#define STICK_EXIT  0.15f
 #define TRIGGER_ON  0.5f
-#define DISC_DEADZONE 0.12f
 
 typedef struct {
     SDL_JoystickID id;
@@ -64,8 +58,8 @@ typedef struct {
     int assign;               /* explicit port, -1 = automatic */
     int port;                 /* the port it drove on the last poll, or -1 */
     int stick_dir;            /* left stick's four-way state (hysteresis) */
-    uint8_t sent[CHF_ACT_PER_PORT]; /* directions the analog stick / hat holds */
-    int disc_x, disc_y;       /* the analog disc last sent for this pad */
+    int knob_dir;             /* right stick's */
+    uint8_t sent[CHF_ACT_PER_PORT]; /* contacts the analog sticks / hat hold */
     /* What each button's press asserted (target + 1, 0 = nothing), so its
      * release lets go of exactly that even if the binding changed meanwhile,
      * and a pad that goes away drops what it held. */
@@ -96,35 +90,25 @@ static gamepad_state *g_state;   /* one per process: SDL's subsystem is */
 
 /* ---- pure helpers ----------------------------------------------------------- */
 
-void chf_disc_from_stick(float x, float y, int *dx, int *dy)
-{
-    const float dead = DISC_DEADZONE;
-    float mag = sqrtf(x * x + y * y);
-    float scale;
-    int ix, iy;
-
-    if (mag < dead) {
-        *dx = *dy = 0;
-        return;
-    }
-    if (mag > 1.0f)
-        mag = 1.0f;
-    /* radial dead zone: the deflection past it, rescaled to 0..1 */
-    scale = ((mag - dead) / (1.0f - dead)) / sqrtf(x * x + y * y);
-    ix = (int)lroundf(x * scale * 127.0f);
-    iy = (int)lroundf(y * scale * 127.0f);
-    *dx = ix < -128 ? -128 : ix > 127 ? 127 : ix;
-    *dy = iy < -128 ? -128 : iy > 127 ? 127 : iy;
-}
-
 unsigned chf_acts_from_dir(int dir)
 {
     unsigned acts = 0;
 
-    if ((dir & CHF_DIR_UP) && !(dir & CHF_DIR_DOWN)) acts |= 1u << CHF_ACT_UP;
-    if ((dir & CHF_DIR_DOWN) && !(dir & CHF_DIR_UP)) acts |= 1u << CHF_ACT_DOWN;
+    if ((dir & CHF_DIR_UP) && !(dir & CHF_DIR_DOWN)) acts |= 1u << CHF_ACT_FORWARD;
+    if ((dir & CHF_DIR_DOWN) && !(dir & CHF_DIR_UP)) acts |= 1u << CHF_ACT_BACK;
     if ((dir & CHF_DIR_LEFT) && !(dir & CHF_DIR_RIGHT)) acts |= 1u << CHF_ACT_LEFT;
     if ((dir & CHF_DIR_RIGHT) && !(dir & CHF_DIR_LEFT)) acts |= 1u << CHF_ACT_RIGHT;
+    return acts;
+}
+
+unsigned chf_knob_acts_from_dir(int dir)
+{
+    unsigned acts = 0;
+
+    if ((dir & CHF_DIR_UP) && !(dir & CHF_DIR_DOWN)) acts |= 1u << CHF_ACT_PULL;
+    if ((dir & CHF_DIR_DOWN) && !(dir & CHF_DIR_UP)) acts |= 1u << CHF_ACT_PUSH;
+    if ((dir & CHF_DIR_LEFT) && !(dir & CHF_DIR_RIGHT)) acts |= 1u << CHF_ACT_TWIST_CCW;
+    if ((dir & CHF_DIR_RIGHT) && !(dir & CHF_DIR_LEFT)) acts |= 1u << CHF_ACT_TWIST_CW;
     return acts;
 }
 
@@ -217,10 +201,6 @@ static const char *slot_name(const pad_slot *slot)
 static void slot_release_all(gamepad_state *g, pad_slot *slot)
 {
     int a, b;
-    if (slot->port >= 0 && (slot->disc_x || slot->disc_y)) {
-        slot->disc_x = slot->disc_y = 0;
-        session_gamepad_disc(g->session, slot->owner, slot->port, 0, 0);
-    }
     if (slot->port >= 0)
         for (a = 0; a < CHF_ACT_PER_PORT; a++)
             if (slot->sent[a]) {
@@ -411,7 +391,7 @@ static void handle_hat_motion(gamepad_state *g, SDL_JoystickID which, int hat, U
         dispatch_button(g, which, CHF_PAD_HAT_BASE + hat * CHF_PAD_HAT_DIRS + dir, 1);
 }
 
-/* ---- the directional role and the analog controllers ------------------------ */
+/* ---- the sticks -------------------------------------------------------------- */
 
 static float axis_norm(Sint16 v)
 {
@@ -450,7 +430,7 @@ static void poll_one(gamepad_state *g, pad_slot *slot, int port)
     const struct chfsession *s = g->session;
     uint8_t want[CHF_ACT_PER_PORT];
     unsigned acts;
-    int dir, a, dx = 0, dy = 0;
+    int dir, a;
     float lx, ly;
 
     memset(want, 0, sizeof want);
@@ -458,31 +438,31 @@ static void poll_one(gamepad_state *g, pad_slot *slot, int port)
         /* moved to another port (or none): release what it held there */
         slot_release_all(g, slot);
         slot->port = port;
-        slot->stick_dir = 0;
+        slot->stick_dir = slot->knob_dir = 0;
         if (port < 0) return;
     }
 
+    /* the left stick (and a raw joystick's hat 0) is the controller's stick */
     dir = slot_hat_dir(slot);
-    if (s->opts.analog_joystick) {
-        /* the analog disc: the left stick's deflection, as is */
-        slot->stick_dir = 0;
+    if (slot->handle || slot->joy) {
         slot_stick(slot, 0, &lx, &ly);
-        chf_disc_from_stick(lx, ly, &dx, &dy);
-    } else if (slot->handle || slot->joy) {
-        slot_stick(slot, 0, &lx, &ly);
-        slot->stick_dir = chf_dir_from_stick(lx, ly, slot->stick_dir, STICK_ENTER, STICK_EXIT);
+        slot->stick_dir = chf_dir_from_stick(lx, ly, slot->stick_dir, CHF_STICK_ENTER, CHF_STICK_EXIT);
         dir |= slot->stick_dir;
     }
-    if (dx != slot->disc_x || dy != slot->disc_y) {
-        slot->disc_x = dx;
-        slot->disc_y = dy;
-        session_gamepad_disc(g->session, slot->owner, port, dx, dy);
-    }
-    /* opposite directions together cancel: nothing */
     acts = chf_acts_from_dir(dir);
+
+    /* the right stick of a mapped gamepad is the knob's other two axes */
+    if (s->opts.right_stick && slot->handle) {
+        float rx, ry;
+        slot_stick(slot, 1, &rx, &ry);
+        slot->knob_dir = chf_dir_from_stick(rx, ry, slot->knob_dir, CHF_STICK_ENTER, CHF_STICK_EXIT);
+        acts |= chf_knob_acts_from_dir(slot->knob_dir);
+    } else {
+        slot->knob_dir = 0;
+    }
+
     for (a = 0; a < CHF_ACT_PER_PORT; a++)
         want[a] = (uint8_t)((acts >> a) & 1u);
-
     for (a = 0; a < CHF_ACT_PER_PORT; a++) {
         if (want[a] != slot->sent[a]) {
             slot->sent[a] = want[a];

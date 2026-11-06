@@ -1,12 +1,13 @@
 /*
- * The Preferences window: a tab per page -- Machine, Display, Audio, Input,
- * FujiNet -- over the same settings keys as the other frontends'
+ * The Preferences window: a tab per page -- Machine, Display & Audio, Input,
+ * FujiNet, ROMs -- over the same settings keys as the other frontends'
  * Preferences, so a machine configured in one comes up the same in another.
+ * A Help button (and F1) opens the Help topic of the page showing.
  *
- * The picture, the volume, the analog sticks and the gamepad assignments
- * apply at once. The machine (which console) and the host
- * options (audio, gamepads, FujiNet) wait for the window to close, which
- * hands the main window one "dirty" flag so it power-cycles once for the lot.
+ * The picture, the volume, the right stick, the gamepad assignments and the
+ * controls apply at once. The machine, the BIOS and the host options (audio,
+ * gamepads, FujiNet) wait for the window to close, which hands the main
+ * window one "dirty" flag so it power-cycles once for the lot.
  *
  * Laid out in 96-dpi units through chf_scale() and rebuilt on WM_DPICHANGED;
  * each page is a set of children of the window shown or hidden under a tab
@@ -21,31 +22,44 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
+#include "help/help_window.h"
+#include "import.h"
+#include "key_forward.h"
 #include "resource.h"
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
 #endif
 
-#define PREFS_CLASS "FujiNetGoArcPrefs"
+#define PREFS_CLASS "FujiNetGoChfPrefs"
 #define PREFS_STYLE (WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
 #define MAX_ITEMS 160
+#define MAX_ROMS 16
 
 /* Layout, in 96-dpi units. */
-#define CW 540              /* client width */
+#define CW 560              /* client width */
 #define M 14                /* margin */
-#define PAGE_H 250          /* the tallest page: Input */
+#define PAGE_H 412          /* the tallest page: Input */
 #define ROW 22
+#define HINT_IDLE "A key does one thing: giving it to a control takes it from the old one."
 
-enum { PG_MACHINE, PG_DISPLAY, PG_AUDIO, PG_INPUT, PG_FUJINET, PG_COUNT };
+enum { PG_MACHINE, PG_DISPLAY, PG_INPUT, PG_FUJINET, PG_ROMS, PG_COUNT };
 
 enum {
-    IDC_TABS = 100, IDC_MACHINE,
-    IDC_ASPECT, IDC_SMOOTH, IDC_AUDIO, IDC_VOLUME, IDC_GAMEPAD, IDC_ANALOG, IDC_PAD_LIST,
-    IDC_PAD_PORT, IDC_FUJINET, IDC_EXTERNAL, IDC_EXT_ADDR, IDC_WEBUI, IDC_CLOSE
+    IDC_TABS = 100, IDC_MACHINE, IDC_BIOS,
+    IDC_ASPECT, IDC_SMOOTH, IDC_AUDIO, IDC_VOLUME, IDC_GAMEPAD, IDC_RSTICK, IDC_PAD_LIST,
+    IDC_PAD_PORT, IDC_CONTROLS, IDC_CLEAR, IDC_RESET_CONTROLS,
+    IDC_FUJINET, IDC_EXTERNAL, IDC_EXT_ADDR, IDC_WEBUI,
+    IDC_IMPORT, IDC_IMPORT_FOLDER, IDC_PREFS_HELP, IDC_PREFS_CLOSE
 };
 
 #define IDT_PADS 1
+#define IDT_CAPTURE 2
+
+/* The Help contexts, by page. */
+static const char *const k_contexts[PG_COUNT] = {
+    "prefs/Machine", "prefs/Display", "prefs/Input", "prefs/FujiNet", "prefs/ROMs"
+};
 
 typedef struct {
     HWND h;
@@ -54,11 +68,12 @@ typedef struct {
     int bold;               /* a heading */
 } item;
 
-static HWND g_win, g_tabs, g_close;
+static HWND g_win, g_tabs, g_close, g_help;
 static HWND g_machine_note, g_pad_list, g_pad_port, g_ext_addr;
-static HWND g_machine_combo;
+static HWND g_machine_combo, g_bios_combo, g_controls, g_hint, g_rom_path;
+static HWND g_rom_state[MAX_ROMS];
 static item g_items[MAX_ITEMS];
-static int g_nitems;
+static int g_nitems, g_nroms;
 static HFONT g_font, g_bold;
 static int g_dpi = 96;
 static chfsession *g_session;
@@ -66,6 +81,8 @@ static chf_prefs_hooks g_hooks;
 static int g_dirty;
 static int g_page;
 static unsigned g_pad_seen;
+static int g_armed = -1;        /* the control waiting for a key or a pad button */
+static int g_filling;
 
 static int S(int v) { return chf_scale(v, g_dpi); }
 
@@ -128,11 +145,17 @@ static void combo_add(HWND c, const char *text)
 
 static void set_text(HWND h, const char *utf8)
 {
-    wchar_t cur[512], *w = chf_wide_dup(utf8);
+    wchar_t cur[1024], *w = chf_wide_dup(utf8);
     if (!w) return;
-    GetWindowTextW(h, cur, 512);
+    GetWindowTextW(h, cur, 1024);
     if (wcscmp(cur, w) != 0) SetWindowTextW(h, w);
     free(w);
+}
+
+static void to_backslashes(char *p)
+{
+    for (; *p; p++)
+        if (*p == '/') *p = '\\';
 }
 
 /* ---- the machine page ---------------------------------------------------------- */
@@ -140,65 +163,79 @@ static void set_text(HWND h, const char *utf8)
 static int machine_selected(void)
 {
     const int sel = (int)SendMessageA(g_machine_combo, CB_GETCURSEL, 0, 0);
-    return sel >= 0 && sel < CHF_MACHINE_COUNT ? sel : CHF_MACHINE_ARCADIA;
+    return sel >= 0 && sel < CHF_MACHINE_COUNT ? sel : CHF_MACHINE_CHANNELF;
 }
 
-/* The PAL clone is not verified against MAME (which runs every clone at
- * NTSC): say so under the combo. */
+/* What the chosen machine is, and whether a real BIOS would run on it. */
 static void refresh_machine(void)
 {
-    set_text(g_machine_note,
-             machine_selected() == CHF_MACHINE_ARCADIA_PAL
-             ? "PAL clone (4.433 MHz / 5, 50 Hz, 312 lines): not verified against MAME, which runs every clone at NTSC."
-             : "NTSC: Signetics 2650 at 0.895 MHz, 60 Hz. There is no BIOS and no ROM to import: "
-               "games are cartridge files (Machine > Open Cartridge).");
+    const int m = machine_selected();
+    char text[900];
+    int n;
+    n = snprintf(text, sizeof text, "%s", chf_machine_is_pal(m)
+                 ? "PAL: the F3850 at 2 MHz, 312 lines at 50 Hz."
+                 : "NTSC: the F3850 at 1.79 MHz, 264 lines at 60.5 Hz.");
+    if (m == CHF_MACHINE_VIDEOPLAY2)
+        n += snprintf(text + n, sizeof text - (size_t)n, " Its sound is half the level of the others, as in MAME.");
+    n += snprintf(text + n, sizeof text - (size_t)n, "\n\n");
+    if (chfsession_have_bios(g_session, m))
+        snprintf(text + n, sizeof text - (size_t)n,
+                 "A real BIOS runs on this machine (Videocarts need one).");
+    else
+        snprintf(text + n, sizeof text - (size_t)n,
+                 "No real BIOS runs on this machine: CONFIG and the FujiNet apps use the app's own stand-in, "
+                 "and Videocarts need the BIOS (the ROMs tab imports it).");
+    set_text(g_machine_note, text);
 }
 
 static void build_machine(void)
 {
-    int y = 6, m;
+    int y = 6, m, b;
     heading(PG_MACHINE, "Machine", y); y += 22;
     label(PG_MACHINE, "Applied by a power cycle when this window closes.", M, y, CW - 2 * M, 18); y += 28;
-    label(PG_MACHINE, "Console:", M, y + 3, 70, 18);
-    g_machine_combo = combo(PG_MACHINE, IDC_MACHINE, M + 76, y, 380);
+    label(PG_MACHINE, "Machine:", M, y + 3, 70, 18);
+    g_machine_combo = combo(PG_MACHINE, IDC_MACHINE, M + 76, y, 400);
     for (m = 0; m < CHF_MACHINE_COUNT; m++)
         combo_add(g_machine_combo, chf_machine_name(m));
     {
-        const int cur = chfsession_get_int(g_session, "machine", CHF_MACHINE_ARCADIA);
+        const int cur = chfsession_get_int(g_session, "machine", CHF_MACHINE_CHANNELF);
         SendMessageA(g_machine_combo, CB_SETCURSEL, (WPARAM)(cur >= 0 && cur < CHF_MACHINE_COUNT ? cur : 0), 0);
     }
-    y += 40;
-    g_machine_note = label(PG_MACHINE, "", M, y, CW - 2 * M, 54);
+    y += 34;
+    label(PG_MACHINE, "BIOS:", M, y + 3, 70, 18);
+    g_bios_combo = combo(PG_MACHINE, IDC_BIOS, M + 76, y, 400);
+    for (b = 0; b < CHF_BIOS_CHOICE_COUNT; b++)
+        combo_add(g_bios_combo, chf_bios_choice_name(b));
+    {
+        const int cur = chfsession_get_int(g_session, "bios", CHF_BIOS_AUTO);
+        SendMessageA(g_bios_combo, CB_SETCURSEL, (WPARAM)(cur >= 0 && cur < CHF_BIOS_CHOICE_COUNT ? cur : 0), 0);
+    }
+    y += 44;
+    g_machine_note = label(PG_MACHINE, "", M, y, CW - 2 * M, 96);
     refresh_machine();
 }
 
-/* ---- display, audio -------------------------------------------------------------- */
+/* ---- display and audio ----------------------------------------------------------- */
 
 static void build_display(void)
 {
-    HWND c;
+    HWND c, t;
     int y = 6;
-    heading(PG_DISPLAY, "Display", y); y += 28;
-    label(PG_DISPLAY, "Picture:", M, y + 3, 70, 18);
+    heading(PG_DISPLAY, "Display and audio", y); y += 28;
+    label(PG_DISPLAY, "Aspect:", M, y + 3, 70, 18);
     c = combo(PG_DISPLAY, IDC_ASPECT, M + 76, y, 240);
-    combo_add(c, "TV (4:3)");
+    combo_add(c, "Television (4:3)");
     combo_add(c, "Square pixels");
     SendMessageA(c, CB_SETCURSEL, chfsession_get_int(g_session, "aspect", 0) == 0 ? 0 : 1, 0);
     y += 38;
     checkbox(PG_DISPLAY, IDC_SMOOTH, "Smooth scaling (off: sharp pixels)", M, y, 320,
              chfsession_get_int(g_session, "smooth", 0));
-}
-
-static void build_audio(void)
-{
-    HWND t;
-    int y = 6;
-    heading(PG_AUDIO, "Audio", y); y += 26;
-    checkbox(PG_AUDIO, IDC_AUDIO, "Enable audio (applied when this window closes)", M, y, CW - 2 * M,
+    y += 40;
+    checkbox(PG_DISPLAY, IDC_AUDIO, "Enable audio (applied when this window closes)", M, y, CW - 2 * M,
              chfsession_get_int(g_session, "enable_audio", 1));
     y += 34;
-    label(PG_AUDIO, "Volume:", M, y + 4, 70, 18);
-    t = add(L"msctls_trackbar32", NULL, TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, PG_AUDIO, IDC_VOLUME,
+    label(PG_DISPLAY, "Volume:", M, y + 4, 70, 18);
+    t = add(L"msctls_trackbar32", NULL, TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, PG_DISPLAY, IDC_VOLUME,
             M + 76, y, 320, 30);
     if (t) {
         SendMessageA(t, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
@@ -220,14 +257,16 @@ static void refresh_pad_list(void)
         SendMessageA(g_pad_list, LB_ADDSTRING, 0, (LPARAM)"(no gamepads connected)");
     for (i = 0; i < n; i++) {
         char name[128], line[220];
+        wchar_t w[220];
         const int eff = chfsession_gamepad_effective_port(g_session, i);
         chfsession_gamepad_name(g_session, i, name, sizeof name);
         if (eff >= 0)
-            snprintf(line, sizeof line, "%s  [stick %d%s]", name, eff + 1,
+            snprintf(line, sizeof line, "%s  [player %d%s]", name, eff + 1,
                      chfsession_gamepad_assignment(g_session, i) < 0 ? ", automatic" : "");
         else
             snprintf(line, sizeof line, "%s  [unused]", name);
-        SendMessageA(g_pad_list, LB_ADDSTRING, 0, (LPARAM)line);
+        MultiByteToWideChar(CP_UTF8, 0, line, -1, w, 220);
+        SendMessageW(g_pad_list, LB_ADDSTRING, 0, (LPARAM)w);
     }
     if (sel >= 0 && sel < n) {
         SendMessageA(g_pad_list, LB_SETCURSEL, (WPARAM)sel, 0);
@@ -236,24 +275,119 @@ static void refresh_pad_list(void)
     g_pad_seen = chfsession_gamepad_generation(g_session);
 }
 
+/* Every control with its key and gamepad button. */
+static void fill_controls(void)
+{
+    int t;
+    LVITEMW it;
+    if (!g_controls) return;
+    g_filling = 1;
+    SendMessageW(g_controls, WM_SETREDRAW, FALSE, 0);
+    if ((int)SendMessageW(g_controls, LVM_GETITEMCOUNT, 0, 0) == 0) {
+        memset(&it, 0, sizeof it);
+        it.mask = LVIF_TEXT;
+        for (t = 0; t < CHF_TARGET_COUNT; t++) {
+            it.iItem = t;
+            it.pszText = L"";
+            SendMessageW(g_controls, LVM_INSERTITEMW, 0, (LPARAM)&it);
+        }
+    }
+    for (t = 0; t < CHF_TARGET_COUNT; t++) {
+        const chf_binding b = chfsession_binding_get(g_session, t);
+        char key[48] = "";
+        const char *texts[3];
+        int c;
+        if (b.keysym) chfsession_keysym_name(b.keysym, key, sizeof key);
+        texts[0] = chf_target_name(t);
+        texts[1] = key[0] ? key : "\xe2\x80\x94";
+        texts[2] = b.button != CHF_PAD_BTN_NONE ? chf_pad_button_name(b.button) : "\xe2\x80\x94";
+        for (c = 0; c < 3; c++) {
+            wchar_t w[96];
+            MultiByteToWideChar(CP_UTF8, 0, texts[c], -1, w, 96);
+            memset(&it, 0, sizeof it);
+            it.iSubItem = c;
+            it.pszText = w;
+            SendMessageW(g_controls, LVM_SETITEMTEXTW, (WPARAM)t, (LPARAM)&it);
+        }
+    }
+    SendMessageW(g_controls, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_controls, NULL, TRUE);
+    g_filling = 0;
+}
+
+static void set_hint(const char *text)
+{
+    set_text(g_hint, text);
+}
+
+static void disarm(const char *hint)
+{
+    g_armed = -1;
+    KillTimer(g_win, IDT_CAPTURE);
+    chfsession_gamepad_capture_cancel(g_session);
+    set_hint(hint);
+}
+
+static void arm(int target)
+{
+    char msg[200];
+    if (target < 0 || target >= CHF_TARGET_COUNT) return;
+    g_armed = target;
+    chfsession_gamepad_capture_begin(g_session);
+    SetTimer(g_win, IDT_CAPTURE, 50, NULL);
+    snprintf(msg, sizeof msg, "Press a key or a gamepad button for %s (Escape cancels).", chf_target_name(target));
+    set_hint(msg);
+    SetFocus(g_controls);
+}
+
+static void bound(const char *what, const char *stolen)
+{
+    char msg[300];
+    if (stolen[0]) snprintf(msg, sizeof msg, "Bound %s (it was %s's).", what, stolen);
+    else snprintf(msg, sizeof msg, "Bound %s.", what);
+    disarm(msg);
+    fill_controls();
+}
+
 static void build_input(void)
 {
-    int y = 6;
-    heading(PG_INPUT, "Input", y); y += 26;
-    checkbox(PG_INPUT, IDC_GAMEPAD, "Enable gamepads (applied when this window closes)", M, y, CW - 2 * M,
+    LVCOLUMNW col;
+    int y = 6, i;
+    static const wchar_t *const heads[3] = { L"Control", L"Key", L"Gamepad" };
+    static const int widths[3] = { 220, 150, 130 };
+    heading(PG_INPUT, "Input", y); y += 24;
+    checkbox(PG_INPUT, IDC_GAMEPAD, "Enable gamepads (applied when this window closes)", M, y, 330,
              chfsession_get_int(g_session, "enable_gamepad", 1));
-    y += 28;
-    checkbox(PG_INPUT, IDC_ANALOG, "Analog sticks steer too", M, y, 320,
-             chfsession_get_int(g_session, "analog_joystick", 1));
-    y += 36;
-    label(PG_INPUT, "Gamepads (select one, then choose its stick):", M, y, CW - 2 * M, 18); y += 24;
+    checkbox(PG_INPUT, IDC_RSTICK, "Right stick works the knob", M + 340, y, 190,
+             chfsession_get_int(g_session, "right_stick", 1));
+    y += 30;
+    label(PG_INPUT, "Gamepads (select one, then choose its player):", M, y, CW - 2 * M, 18); y += 20;
     g_pad_list = add(L"LISTBOX", NULL, WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP | WS_BORDER, PG_INPUT,
-                     IDC_PAD_LIST, M, y, 340, 96);
-    g_pad_port = combo(PG_INPUT, IDC_PAD_PORT, M + 350, y, 130);
+                     IDC_PAD_LIST, M, y, 400, 64);
+    g_pad_port = combo(PG_INPUT, IDC_PAD_PORT, M + 410, y, 122);
     combo_add(g_pad_port, "Automatic");
-    combo_add(g_pad_port, "Stick 1");
-    combo_add(g_pad_port, "Stick 2");
+    combo_add(g_pad_port, "Player 1");
+    combo_add(g_pad_port, "Player 2");
     SendMessageA(g_pad_port, CB_SETCURSEL, 0, 0);
+    y += 72;
+    label(PG_INPUT, "Controls (choose one, then press its key or button):", M, y + 5, 340, 18);
+    button(PG_INPUT, IDC_CLEAR, "Clear", CW - M - 176, y - 2, 60);
+    button(PG_INPUT, IDC_RESET_CONTROLS, "Reset Controls", CW - M - 110, y - 2, 110);
+    y += 30;
+    g_controls = add(WC_LISTVIEWW, NULL, LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP | WS_BORDER |
+                                          WS_VSCROLL, PG_INPUT, IDC_CONTROLS, M, y, CW - 2 * M, 176);
+    if (g_controls) {
+        SendMessageW(g_controls, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        memset(&col, 0, sizeof col);
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        for (i = 0; i < 3; i++) {
+            col.pszText = (wchar_t *)heads[i];
+            col.cx = widths[i];
+            SendMessageW(g_controls, LVM_INSERTCOLUMNW, (WPARAM)i, (LPARAM)&col);
+        }
+    }
+    y += 182;
+    g_hint = add(L"STATIC", HINT_IDLE, SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, PG_INPUT, 0, M, y, CW - 2 * M, 18);
 }
 
 /* ---- FujiNet ---------------------------------------------------------------------- */
@@ -270,14 +404,15 @@ static void build_fujinet(void)
     checkbox(PG_FUJINET, IDC_EXTERNAL, "Use external FujiNet (applied when this window closes)", M, y, CW - 2 * M,
              chfsession_get_int(g_session, "fujinet_external", 0));
     y += 32;
-    label(PG_FUJINET, "Address:port:", M, y + 3, 90, 18);
+    label(PG_FUJINET, "Address:", M, y + 3, 70, 18);
     e = add(L"EDIT", chfsession_get_str(g_session, "fujinet_external_addr", ""),
-            ES_AUTOHSCROLL | WS_TABSTOP | WS_BORDER, PG_FUJINET, IDC_EXT_ADDR, M + 96, y, 240, 24);
+            ES_AUTOHSCROLL | WS_TABSTOP | WS_BORDER, PG_FUJINET, IDC_EXT_ADDR, M + 76, y, 240, 24);
     g_ext_addr = e;
     if (e) {
         SendMessageW(e, EM_SETCUEBANNER, FALSE, (LPARAM)L"127.0.0.1:11526");
         EnableWindow(e, chfsession_get_int(g_session, "fujinet_external", 0) != 0);
     }
+    label(PG_FUJINET, "host:port, or just a port", M + 326, y + 3, 200, 18);
     y += 40;
     if (chfsession_fujinet_external(g_session))
         snprintf(line, sizeof line, "Web UI: FujiNet is external");
@@ -285,6 +420,51 @@ static void build_fujinet(void)
         snprintf(line, sizeof line, "Web UI: %s", chfsession_fujinet_webui_url(g_session));
     label(PG_FUJINET, line, M, y + 5, 360, 18);
     button(PG_FUJINET, IDC_WEBUI, "Open", CW - M - 100, y, 100);
+}
+
+/* ---- the ROMs page -------------------------------------------------------------- */
+
+static void refresh_roms(void)
+{
+    int i;
+    for (i = 0; i < g_nroms; i++)
+        if (g_rom_state[i])
+            set_text(g_rom_state[i], chfsession_rom_item_available(g_session, i) ? "Imported" : "Not imported");
+}
+
+static void build_roms(void)
+{
+    int y = 6, i;
+    const char *last = NULL;
+    char path[1100];
+
+    label(PG_ROMS, "The Channel F BIOS is not part of the app. CONFIG and the FujiNet apps run on the app's own "
+                   "stand-in; Videocarts need the real BIOS: two 1 KB ROMs. Import your own dumps from files, "
+                   "a zip (MAME's channelf.zip works) or a folder; they are recognised by size and checksum, "
+                   "whatever they are named. Kept in:",
+          M, y, CW - 2 * M, 70);
+    y += 74;
+    snprintf(path, sizeof path, "%s", chfsession_roms_path(g_session));
+    to_backslashes(path);
+    g_rom_path = add(L"STATIC", path, SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, PG_ROMS, 0, M, y, CW - 2 * M, 18);
+    y += 28;
+    button(PG_ROMS, IDC_IMPORT, "Import...", M, y, 130);
+    button(PG_ROMS, IDC_IMPORT_FOLDER, "Import a Folder...", M + 138, y, 170);
+    y += 42;
+    g_nroms = chfsession_rom_item_count();
+    if (g_nroms > MAX_ROMS) g_nroms = MAX_ROMS;
+    for (i = 0; i < g_nroms; i++) {
+        const chf_rom_item *it = chfsession_rom_item(i);
+        if (!last || strcmp(last, it->group) != 0) {
+            if (last) y += 6;
+            heading(PG_ROMS, it->group, y);
+            y += 20;
+            last = it->group;
+        }
+        label(PG_ROMS, it->name, M + 14, y, CW - 2 * M - 14 - 110, 18);
+        g_rom_state[i] = add(L"STATIC", "", SS_RIGHT | SS_NOPREFIX, PG_ROMS, 0, CW - M - 110, y, 110, 18);
+        y += 20;
+    }
 }
 
 /* ---- layout ------------------------------------------------------------------------ */
@@ -296,6 +476,8 @@ static void show_page(int page)
     for (i = 0; i < g_nitems; i++)
         if (g_items[i].page >= 0)
             ShowWindow(g_items[i].h, g_items[i].page == page ? SW_SHOW : SW_HIDE);
+    /* Help, F1 and Ctrl+Shift+H open the page's own */
+    chf_help_set_context(g_win, k_contexts[page], 1);
 }
 
 /* Places everything at the current DPI and sizes the window to its
@@ -307,11 +489,16 @@ static void layout(void)
     top = chf_place_tab_strip(g_tabs, 0, 0, S(CW)) + S(8);
     for (i = 0; i < g_nitems; i++) {
         const item *it = &g_items[i];
-        int h = S(it->ht);
         if (!it->h) continue;
-        /* a drop-down's height is its list: keep the closed box one line */
-        MoveWindow(it->h, S(it->x), top + S(it->y), S(it->w), h, TRUE);
+        MoveWindow(it->h, S(it->x), top + S(it->y), S(it->w), S(it->ht), TRUE);
     }
+    if (g_controls) {
+        static const int widths[3] = { 220, 150, 130 };
+        int c;
+        for (c = 0; c < 3; c++)
+            SendMessageW(g_controls, LVM_SETCOLUMNWIDTH, (WPARAM)c, S(widths[c]));
+    }
+    MoveWindow(g_help, S(M), top + S(PAGE_H) + S(6), S(100), S(28), TRUE);
     MoveWindow(g_close, S(CW) - S(M) - S(100), top + S(PAGE_H) + S(6), S(100), S(28), TRUE);
     SetRect(&want, 0, 0, S(CW), top + S(PAGE_H) + S(6) + S(28) + S(M));
     {
@@ -359,6 +546,20 @@ static void open_web_ui(void)
     ShellExecuteA(g_win, "open", chfsession_fujinet_webui_url(g_session), NULL, NULL, SW_SHOWNORMAL);
 }
 
+static void do_import(int folder)
+{
+    const int n = chf_import_bios(g_win, g_session, folder);
+    if (n < 0) return;
+    refresh_roms();
+    refresh_machine();
+    if (n > 0) {
+        /* a console that can run its BIOS now boots it at the power cycle
+         * this window ends with */
+        g_dirty = 1;
+        if (g_hooks.roms_changed) g_hooks.roms_changed();
+    }
+}
+
 /* The external address is saved, and only if it is one; an invalid one with
  * the option on keeps the window open and says so when interactive. */
 static int commit_address(int interactive)
@@ -398,8 +599,18 @@ static void on_command(int id, int code)
     case IDC_MACHINE:
         if (code == CBN_SELCHANGE) {
             const int m = machine_selected();
-            if (chfsession_get_int(g_session, "machine", CHF_MACHINE_ARCADIA) != m) {
+            if (chfsession_get_int(g_session, "machine", CHF_MACHINE_CHANNELF) != m) {
                 chfsession_set_int(g_session, "machine", m);
+                g_dirty = 1;
+            }
+            refresh_machine();
+        }
+        break;
+    case IDC_BIOS:
+        if (code == CBN_SELCHANGE) {
+            const int b = (int)SendMessageA(g_bios_combo, CB_GETCURSEL, 0, 0);
+            if (b >= 0 && chfsession_get_int(g_session, "bios", CHF_BIOS_AUTO) != b) {
+                chfsession_set_int(g_session, "bios", b);
                 g_dirty = 1;
             }
             refresh_machine();
@@ -419,9 +630,12 @@ static void on_command(int id, int code)
         break;
     case IDC_AUDIO: setting_from_checkbox(id, "enable_audio", 1); break;
     case IDC_GAMEPAD: setting_from_checkbox(id, "enable_gamepad", 1); break;
-    case IDC_ANALOG:
-        chfsession_set_analog(g_session, SendDlgItemMessageA(g_win, IDC_ANALOG, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    case IDC_RSTICK: {
+        const int on = SendDlgItemMessageA(g_win, IDC_RSTICK, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        chfsession_set_int(g_session, "right_stick", on);
+        chfsession_set_right_stick(g_session, on);
         break;
+    }
     case IDC_PAD_LIST:
         if (code == LBN_SELCHANGE) {
             const int sel = (int)SendMessageA(g_pad_list, LB_GETCURSEL, 0, 0);
@@ -438,12 +652,32 @@ static void on_command(int id, int code)
             refresh_pad_list();
         }
         break;
+    case IDC_CLEAR: {
+        const int t = (int)SendMessageW(g_controls, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+        if (t >= 0 && t < CHF_TARGET_COUNT) {
+            char msg[200];
+            chfsession_binding_set_key(g_session, t, 0, NULL, 0);
+            chfsession_binding_set_button(g_session, t, CHF_PAD_BTN_NONE, NULL, 0);
+            snprintf(msg, sizeof msg, "%s has no key or button now.", chf_target_name(t));
+            disarm(msg);
+            fill_controls();
+        }
+        break;
+    }
+    case IDC_RESET_CONTROLS:
+        chfsession_bindings_reset(g_session);
+        disarm("Every control is back to its default.");
+        fill_controls();
+        break;
     case IDC_FUJINET: setting_from_checkbox(id, "enable_fujinet", 1); break;
     case IDC_EXTERNAL:
         setting_from_checkbox(id, "fujinet_external", 0);
         EnableWindow(g_ext_addr, SendDlgItemMessageA(g_win, IDC_EXTERNAL, BM_GETCHECK, 0, 0) == BST_CHECKED);
         break;
     case IDC_WEBUI: open_web_ui(); break;
+    case IDC_IMPORT: do_import(0); break;
+    case IDC_IMPORT_FOLDER: do_import(1); break;
+    case IDC_PREFS_HELP: chf_help_for(g_win); break;
     default: break;
     }
 }
@@ -454,18 +688,32 @@ static LRESULT CALLBACK prefs_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_COMMAND:
-        if (LOWORD(wp) == IDC_CLOSE || LOWORD(wp) == IDCANCEL) {
+        if (LOWORD(wp) == IDC_PREFS_CLOSE || LOWORD(wp) == IDCANCEL) {
             PostMessageA(hwnd, WM_CLOSE, 0, 0);
             return 0;
         }
         if (LOWORD(wp) != IDOK) on_command(LOWORD(wp), HIWORD(wp));
         return 0;
-    case WM_NOTIFY:
-        if (((LPNMHDR)lp)->hwndFrom == g_tabs && ((LPNMHDR)lp)->code == (UINT)TCN_SELCHANGE) {
+    case WM_NOTIFY: {
+        const NMHDR *h = (const NMHDR *)lp;
+        if (h->hwndFrom == g_tabs && h->code == (UINT)TCN_SELCHANGE) {
             show_page(TabCtrl_GetCurSel(g_tabs));
             return 0;
         }
+        if (h->hwndFrom == g_controls && !g_filling) {
+            if (h->code == (UINT)NM_CLICK || h->code == (UINT)NM_DBLCLK) {
+                const NMITEMACTIVATE *ia = (const NMITEMACTIVATE *)lp;
+                arm(ia->iItem);
+                return 0;
+            }
+            if (h->code == (UINT)NM_RETURN ||
+                (h->code == (UINT)LVN_KEYDOWN && ((const NMLVKEYDOWN *)lp)->wVKey == VK_RETURN)) {
+                arm((int)SendMessageW(g_controls, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED));
+                return 0;
+            }
+        }
         break;
+    }
     case WM_HSCROLL:
         if ((HWND)lp == GetDlgItem(hwnd, IDC_VOLUME))
             chfsession_set_volume(g_session, (int)SendMessageA((HWND)lp, TBM_GETPOS, 0, 0));
@@ -473,6 +721,23 @@ static LRESULT CALLBACK prefs_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_PADS && chfsession_gamepad_generation(g_session) != g_pad_seen)
             refresh_pad_list();
+        else if (wp == IDT_CAPTURE) {
+            int button;
+            if (g_armed < 0) {
+                KillTimer(hwnd, IDT_CAPTURE);
+            } else if (chfsession_gamepad_capture_poll(g_session, &button)) {
+                char stolen[128];
+                const int target = g_armed;
+                stolen[0] = '\0';
+                chfsession_binding_set_button(g_session, target, button, stolen, sizeof stolen);
+                bound(chf_pad_button_name(button), stolen);
+            }
+        }
+        return 0;
+    case WM_ACTIVATE:
+        /* the keyboard went elsewhere: nothing is waiting for a key */
+        if (LOWORD(wp) == WA_INACTIVE && g_armed >= 0)
+            disarm(HINT_IDLE);
         return 0;
     case WM_DPICHANGED:
         g_dpi = HIWORD(wp);
@@ -486,9 +751,14 @@ static LRESULT CALLBACK prefs_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY: {
         const int dirty = g_dirty;
         KillTimer(hwnd, IDT_PADS);
+        KillTimer(hwnd, IDT_CAPTURE);
+        if (g_armed >= 0) chfsession_gamepad_capture_cancel(g_session);
+        g_armed = -1;
         g_win = NULL;
-        g_tabs = g_close = g_pad_list = g_pad_port = g_ext_addr = g_machine_combo = g_machine_note = NULL;
-        g_nitems = 0;
+        g_tabs = g_close = g_help = g_pad_list = g_pad_port = g_ext_addr = g_machine_combo = g_machine_note = NULL;
+        g_bios_combo = g_controls = g_hint = g_rom_path = NULL;
+        memset(g_rom_state, 0, sizeof g_rom_state);
+        g_nitems = g_nroms = 0;
         g_dirty = 0;
         if (g_font) DeleteObject(g_font);
         if (g_bold) DeleteObject(g_bold);
@@ -505,9 +775,9 @@ static LRESULT CALLBACK prefs_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 void chf_prefs_show(HWND parent, chfsession *session, const chf_prefs_hooks *hooks)
 {
     static int registered;
-    static const char *const names[PG_COUNT] = { "Machine", "Display", "Audio", "Input", "FujiNet" };
+    static const char *const names[PG_COUNT] = { "Machine", "Display && Audio", "Input", "FujiNet", "ROMs" };
     HINSTANCE inst = GetModuleHandleA(NULL);
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_TAB_CLASSES | ICC_BAR_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_TAB_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES };
     int i;
 
     if (g_win) {
@@ -530,8 +800,9 @@ void chf_prefs_show(HWND parent, chfsession *session, const chf_prefs_hooks *hoo
         registered = RegisterClassExW(&wc) != 0;
     }
     g_dpi = chf_window_dpi(parent);
-    g_nitems = 0;
+    g_nitems = g_nroms = 0;
     g_dirty = 0;
+    g_armed = -1;
     g_win = CreateWindowExW(WS_EX_CONTROLPARENT, L"" PREFS_CLASS, L"Preferences", PREFS_STYLE,
                             CW_USEDEFAULT, CW_USEDEFAULT, 100, 100, parent, NULL, inst, NULL);
     if (!g_win) return;
@@ -549,17 +820,21 @@ void chf_prefs_show(HWND parent, chfsession *session, const chf_prefs_hooks *hoo
     }
     build_machine();
     build_display();
-    build_audio();
     build_input();
     build_fujinet();
+    build_roms();
+    g_help = CreateWindowExW(0, L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                             0, 0, 10, 10, g_win, (HMENU)(INT_PTR)IDC_PREFS_HELP, inst, NULL);
     g_close = CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                              0, 0, 10, 10, g_win, (HMENU)(INT_PTR)IDC_CLOSE, inst, NULL);
+                              0, 0, 10, 10, g_win, (HMENU)(INT_PTR)IDC_PREFS_CLOSE, inst, NULL);
     /* the tab strip first in creation order, last in z-order: with
      * WS_CLIPSIBLINGS it never paints over a page */
     SetWindowPos(g_tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     make_fonts();
     refresh_pad_list();
+    fill_controls();
+    refresh_roms();
     TabCtrl_SetCurSel(g_tabs, PG_MACHINE);
     show_page(PG_MACHINE);
     layout();
@@ -580,8 +855,50 @@ void chf_prefs_gamepads_changed(void)
     if (g_win) refresh_pad_list();
 }
 
+void chf_prefs_roms_changed(void)
+{
+    if (!g_win) return;
+    refresh_roms();
+    refresh_machine();
+}
+
+/* Keys while a control waits for one: the next key is the binding (Escape
+ * cancels), not a dialog key. */
+static int capture_key(MSG *msg)
+{
+    const int down = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
+    if (g_armed < 0) return 0;
+    switch (msg->message) {
+    case WM_CHAR: case WM_SYSCHAR: case WM_KEYUP: case WM_SYSKEYUP:
+        return 1;
+    default:
+        break;
+    }
+    if (!down) return 0;
+    if (msg->lParam & (1 << 30)) return 1;
+    if (msg->wParam == VK_ESCAPE) {
+        disarm(HINT_IDLE);
+        return 1;
+    }
+    {
+        const uint32_t ks = chf_keysym_from_msg(msg->wParam, msg->lParam);
+        char stolen[128], name[32];
+        if (!ks) return 1;                  /* nothing to call it: keep waiting */
+        stolen[0] = '\0';
+        chfsession_binding_set_key(g_session, g_armed, ks, stolen, sizeof stolen);
+        chfsession_keysym_name(ks, name, sizeof name);
+        bound(name, stolen);
+    }
+    return 1;
+}
+
 int chf_prefs_pretranslate(MSG *msg)
 {
     if (!g_win || !msg->hwnd || (msg->hwnd != g_win && !IsChild(g_win, msg->hwnd))) return 0;
+    if (capture_key(msg)) return 1;
+    /* F1 and the Ctrl shortcuts (Ctrl+Shift+H, Help) are the app's, not a dialog's */
+    if ((msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN) &&
+        (msg->wParam == VK_F1 || GetKeyState(VK_CONTROL) < 0))
+        return 0;
     return IsDialogMessageW(g_win, msg) ? 1 : 0;
 }

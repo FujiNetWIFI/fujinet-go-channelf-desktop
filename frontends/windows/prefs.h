@@ -13,6 +13,8 @@
 typedef struct {
     /* the picture options changed (applied at once) */
     void (*display_changed)(void);
+    /* a BIOS import from the window succeeded: the main window follows it */
+    void (*roms_changed)(void);
     /* the window closed; dirty = a setting that needs a power cycle changed */
     void (*closed)(int dirty);
 } chf_prefs_hooks;
@@ -21,6 +23,8 @@ typedef struct {
 void chf_prefs_show(HWND parent, chfsession *session, const chf_prefs_hooks *hooks);
 /* Closing without applying anything (quitting): the settings are saved. */
 void chf_prefs_abandon(void);
+/* An import made elsewhere: refresh what the window shows about the ROMs. */
+void chf_prefs_roms_changed(void);
 /* The gamepad set changed. */
 void chf_prefs_gamepads_changed(void);
 /* Tab and the arrow keys move between its controls; 1 if the message was used. */

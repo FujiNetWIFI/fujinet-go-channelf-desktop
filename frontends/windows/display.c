@@ -86,7 +86,8 @@ static HANDLE g_thread;
 static HANDLE g_active;     /* manual-reset: set while the picture is on screen */
 static volatile LONG g_running;
 static volatile LONG g_width, g_height;       /* the client, from WM_SIZE */
-static volatile LONG g_aspect = 1, g_smooth;
+static volatile LONG g_smooth;
+static volatile LONG g_asp_num = 4, g_asp_den = 3;   /* the picture's shape on screen */
 static display_mode g_mode;
 static int g_warp;
 
@@ -110,17 +111,16 @@ static uint32_t g_gdi_fb[FB_W * FB_H];
 static int g_gdi_have;
 static CRITICAL_SECTION g_gdi_lock;
 
-/* The picture inside a client of w x h, centred: the television's 4:3 or the
- * framebuffer's own square pixels. The whole 192 x 262 frame (128 pixels of
- * playfield between 32-pixel borders) fills the tube: MAME's channelf driver
- * declares no aspect, so it shows the visible area at the default 4:3, which
- * is what "TV" does here. */
+/* The picture inside a client of w x h, centred, in the shape the session
+ * gives for the machine: the television's 4:3, or square pixels (NTSC
+ * 204:232, PAL 204:290). The frame is the console's visible area, VRAM
+ * columns 4-105 and rows 4-61 at 2 x 4 pixels a cell. */
 static RECT picture_rect(int w, int h)
 {
     RECT r;
     double want, dw, dh;
     if (w <= 0 || h <= 0) { SetRect(&r, 0, 0, 0, 0); return r; }
-    want = g_aspect ? 4.0 / 3.0 : (double)FB_W / (double)FB_H;
+    want = (double)g_asp_num / (double)(g_asp_den ? g_asp_den : 1);
     if ((double)w / h > want) { dh = h; dw = dh * want; }
     else                      { dw = w; dh = dw / want; }
     r.left = (int)((w - dw) / 2);
@@ -617,7 +617,10 @@ void chf_display_set_active(int active)
 
 void chf_display_set_options(int tv, int smooth)
 {
-    InterlockedExchange(&g_aspect, tv != 0);
+    int num = 4, den = 3;
+    chfsession_display_aspect(chfsession_get_int(g_session, "machine", 0), tv == 0, &num, &den);
+    InterlockedExchange(&g_asp_num, num);
+    InterlockedExchange(&g_asp_den, den);
     InterlockedExchange(&g_smooth, smooth != 0);
     if (g_hwnd && g_mode != MODE_D3D)
         InvalidateRect(g_hwnd, NULL, FALSE);

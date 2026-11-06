@@ -1,5 +1,5 @@
 /*
- * The Win32 debugger window over the 2650 / UVI debugger engine
+ * The Win32 debugger window over the F8 / Channel F video debugger engine
  * (chfdebug.h): eight tabs -- Prompt, CPU & RAM, Disassembly, Video,
  * Sound & I/O, Breakpoints, Cart, FujiNet.
  *

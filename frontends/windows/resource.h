@@ -9,11 +9,14 @@
 #define IDM_OPEN           1001
 #define IDM_EJECT          1002
 #define IDM_IMPORT_SD      1003
+#define IDM_OPEN_SD        1004
+#define IDM_IMPORT_BIOS    1005
 #define IDM_PAUSE          1006
 #define IDM_RESET          1007
 #define IDM_RESET_CONFIG   1008
 #define IDM_SETTINGS       1009
 #define IDM_EXIT           1010
+#define IDM_IMPORT_FOLDER  1011
 /* View menu */
 #define IDM_CONTROLLERS    1020
 #define IDM_DEBUGGER       1021
@@ -23,11 +26,13 @@
 /* FujiNet and Help menus */
 #define IDM_FUJINET_CONFIG 1030
 #define IDM_FUJINET_LOG    1031
+#define IDM_HELP           1039
 #define IDM_ABOUT          1040
 
 /* The main window's status bar */
 #define IDC_STATUSBAR      2003
 #define IDC_LOG_EDIT       2004
+#define IDC_LOG_HELP       2005
 
 /* Timers */
 #define IDT_LOG_REFRESH    1

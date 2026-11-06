@@ -24,6 +24,7 @@ add_executable(fujinet-go-channelf-windows WIN32
   import.c
   fujilog.c
   prefs.c
+  help/help_window.c
   controllers/controllers_window.c
   debugger/dbg_window.c
   debugger/dbg_views.c

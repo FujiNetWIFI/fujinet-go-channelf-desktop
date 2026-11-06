@@ -12,12 +12,14 @@
 
 #include <string.h>
 
+#include "help/help_window.h"
 #include "resource.h"
 
-#define LOG_CLASS "FujiNetGoArcLog"
+#define LOG_CLASS "FujiNetGoChfLog"
 #define MONO_PX 13
+#define HELP_BAR 32          /* the strip with the Help button, 96-dpi units */
 
-static HWND g_win, g_edit;
+static HWND g_win, g_edit, g_help;
 static HFONT g_font;
 static chfsession *g_session;
 static unsigned long g_last_hash;
@@ -102,6 +104,13 @@ static void make_font(HWND hwnd)
     if (g_font) DeleteObject(g_font);
     g_font = chf_make_font(chf_window_dpi(hwnd), MONO_PX, FW_NORMAL, CHF_MONO_FACE);
     if (g_edit) SendMessageA(g_edit, WM_SETFONT, (WPARAM)g_font, TRUE);
+    if (g_help) {
+        static HFONT ui;
+        HFONT old = ui;
+        ui = chf_make_font(chf_window_dpi(hwnd), 0, FW_NORMAL, NULL);
+        SendMessageA(g_help, WM_SETFONT, (WPARAM)ui, TRUE);
+        if (old) DeleteObject(old);
+    }
 }
 
 static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -109,10 +118,16 @@ static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_SIZE: {
         RECT rc;
+        const int dpi = chf_window_dpi(hwnd), bar = chf_scale(HELP_BAR, dpi);
         GetClientRect(hwnd, &rc);
-        if (g_edit) MoveWindow(g_edit, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+        if (g_edit) MoveWindow(g_edit, 0, bar, rc.right - rc.left, rc.bottom - rc.top - bar, TRUE);
+        if (g_help) MoveWindow(g_help, rc.right - chf_scale(84, dpi), chf_scale(4, dpi), chf_scale(76, dpi),
+                               bar - chf_scale(8, dpi), TRUE);
         return 0;
     }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_LOG_HELP) { chf_help_for(hwnd); return 0; }
+        break;
     case WM_DPICHANGED: {
         const RECT *r = (const RECT *)lp;
         make_font(hwnd);
@@ -135,6 +150,7 @@ static LRESULT CALLBACK log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(hwnd, IDT_LOG_REFRESH);
         g_win = NULL;
         g_edit = NULL;
+        g_help = NULL;
         if (g_font) DeleteObject(g_font);
         g_font = NULL;
         return 0;
@@ -179,6 +195,10 @@ void chf_fujilog_show(HWND parent, chfsession *session)
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
         0, 0, rc.right - rc.left, rc.bottom - rc.top, g_win, (HMENU)(INT_PTR)IDC_LOG_EDIT, inst, NULL);
     SendMessageA(g_edit, EM_SETLIMITTEXT, 0, 0);
+    g_help = CreateWindowExA(0, "BUTTON", "Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 10, 10,
+                             g_win, (HMENU)(INT_PTR)IDC_LOG_HELP, inst, NULL);
+    chf_help_set_context(g_win, "fujilog", 1);
+    SendMessageA(g_win, WM_SIZE, 0, 0);
     make_font(g_win);
     g_last_len = -1;
     SetTimer(g_win, IDT_LOG_REFRESH, 1000, NULL);

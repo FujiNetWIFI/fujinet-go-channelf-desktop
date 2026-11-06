@@ -43,12 +43,13 @@ static inline uint32_t chf_keysym_from_msg(WPARAM vk, LPARAM lp)
 }
 
 /* The app's own keys, never the console's: F9, F11, F12, and Ctrl+O (open),
- * Ctrl+R (reset to CONFIG) and Ctrl+, (Preferences). Ctrl itself is the
- * console's: Right Ctrl is stick 1's fire button. */
+ * Ctrl+R (reset to CONFIG), Ctrl+, (Preferences), Ctrl+Q (quit) and
+ * Ctrl+Shift+H (Help). */
 static inline int chf_app_key(WPARAM vk)
 {
     if (vk == VK_F9 || vk == VK_F11 || vk == VK_F12) return 1;
-    return (GetKeyState(VK_CONTROL) & 0x8000) && (vk == 'O' || vk == 'R' || vk == VK_OEM_COMMA);
+    return (GetKeyState(VK_CONTROL) & 0x8000) &&
+           (vk == 'O' || vk == 'R' || vk == 'Q' || vk == 'H' || vk == VK_OEM_COMMA);
 }
 
 /* A key press or release for the console from any of the app's windows: 1
@@ -65,6 +66,9 @@ static inline int chf_forward_key(chfsession *s, UINT msg, WPARAM vk, LPARAM lp)
     if (!down)
         return chfsession_key(s, ks, 0) != 0;     /* always: a key let go after a shortcut must not stick */
     if (chf_app_key(vk) || (msg == WM_SYSKEYDOWN && vk == VK_F4)) return 0;
+    /* Ctrl is the app's: a key pressed with it is a shortcut, never the console's */
+    if ((GetKeyState(VK_CONTROL) & 0x8000) && vk != VK_CONTROL && vk != VK_LCONTROL && vk != VK_RCONTROL)
+        return 0;
     if (lp & (1 << 30)) return chfsession_target_for_key(s, ks) >= 0;
     return chfsession_key(s, ks, 1) != 0;
 }

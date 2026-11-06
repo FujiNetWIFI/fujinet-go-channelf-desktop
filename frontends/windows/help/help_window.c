@@ -23,7 +23,7 @@
 #include "chfhelp.h"
 
 #define ME CHFHELP_WINDOWS
-#define HELP_CLASS "FujiNetGoMSDOSHelp"
+#define HELP_CLASS "FujiNetGoChfHelp"
 #define IDC_SEARCH 100
 #define IDC_LIST 101
 #define IDC_VIEW 102
@@ -57,7 +57,14 @@ static struct {
 
 static int S(int v)
 {
-    return msdos_scale(v, g_dpi);
+    return chf_scale(v, g_dpi);
+}
+
+/* UTF-8 into a wide buffer of n, always terminated. */
+static void help_wide(const char *utf8, wchar_t *w, int n)
+{
+    w[0] = 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8 ? utf8 : "", -1, w, n) <= 0) w[n - 1] = 0;
 }
 
 static COLORREF mix(COLORREF a, COLORREF b, int pct)
@@ -69,7 +76,7 @@ static COLORREF mix(COLORREF a, COLORREF b, int pct)
 
 /* ---- contexts ----------------------------------------------------------------------- */
 
-void msdos_help_set_context(HWND window, const char *context, int f1)
+void chf_help_set_context(HWND window, const char *context, int f1)
 {
     int i, slot = -1;
     for (i = 0; i < MAX_CONTEXTS; i++) {
@@ -89,7 +96,7 @@ static int find_context(HWND window)
     return -1;
 }
 
-void msdos_help_for(HWND window)
+void chf_help_for(HWND window)
 {
     const int c = find_context(window);
     if (g_win && window == g_win) {
@@ -97,7 +104,7 @@ void msdos_help_for(HWND window)
         SendMessageW(g_search, EM_SETSEL, 0, -1);
         return;
     }
-    msdos_help_show(window, c >= 0 ? g_contexts[c].context : "main");
+    chf_help_show(window, c >= 0 ? g_contexts[c].context : "main");
 }
 
 /* ---- the page ------------------------------------------------------------------------- */
@@ -210,7 +217,7 @@ static void highlight(void)
         for (end = w; *end && *end != ' '; end++) {}
         if (*end) *end++ = '\0';
         if (!*w) continue;
-        msdos_wide(w, ww, 128);
+        help_wide(w, ww, 128);
         ft.chrg.cpMin = 0;
         ft.chrg.cpMax = -1;
         ft.lpstrText = ww;
@@ -337,7 +344,7 @@ static void follow_link(LONG cp)
 {
     for (int i = 0; i < g_nlinks; i++) {
         if (cp < g_links[i].min || cp >= g_links[i].max) continue;
-        if (g_links[i].target[0] == '#') msdos_help_show(g_win, g_links[i].target);
+        if (g_links[i].target[0] == '#') chf_help_show(g_win, g_links[i].target);
         else ShellExecuteA(g_win, "open", g_links[i].target, NULL, NULL, SW_SHOWNORMAL);
         return;
     }
@@ -359,7 +366,7 @@ static void search_text(char *dst, int dstsz)
 static void add_row(const char *utf8)
 {
     wchar_t w[512];
-    msdos_wide(utf8, w, 512);
+    help_wide(utf8, w, 512);
     SendMessageW(g_list, LB_ADDSTRING, 0, (LPARAM)w);
 }
 
@@ -424,9 +431,9 @@ static void layout(void)
 static void make_fonts(void)
 {
     NONCLIENTMETRICSW ncm;
-    const int sys = msdos_system_dpi();
+    const int sys = chf_system_dpi();
     if (g_font) DeleteObject(g_font);
-    g_font = msdos_make_font(g_dpi, 0, FW_NORMAL, 0, NULL);
+    g_font = chf_make_font(g_dpi, 0, FW_NORMAL, NULL);
     SendMessageW(g_search, WM_SETFONT, (WPARAM)g_font, TRUE);
     SendMessageW(g_list, WM_SETFONT, (WPARAM)g_font, TRUE);
     /* the page in the message font, a point larger; RichEdit sizes it at
@@ -500,7 +507,7 @@ static int create_window(HWND owner)
 
     if (!richedit) richedit = LoadLibraryW(L"Msftedit.dll");
     if (!richedit) {
-        msdos_message(owner, "The Help needs Msftedit.dll, which is part of Windows.", "Help",
+        chf_message(owner, "The Help needs Msftedit.dll, which is part of Windows.", "Help",
                       MB_ICONERROR | MB_OK);
         return 0;
     }
@@ -517,15 +524,15 @@ static int create_window(HWND owner)
     /* owned by the main window (not a popup: its keys are its own) */
     while (owner && GetWindow(owner, GW_OWNER)) owner = GetWindow(owner, GW_OWNER);
     g_owner = owner;
-    g_dpi = owner ? msdos_window_dpi(owner) : msdos_system_dpi();
+    g_dpi = owner ? chf_window_dpi(owner) : chf_system_dpi();
     if (owner) GetWindowRect(owner, &pr);
     else SetRect(&pr, 0, 0, 0, 0);
     g_win = CreateWindowExA(WS_EX_CONTROLPARENT, HELP_CLASS, "FujiNet Go Channel F Help",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, pr.left + S(80), pr.top + S(60), S(980),
                             S(720), owner, NULL, inst, NULL);
     if (!g_win) return 0;
-    if (msdos_window_dpi(g_win) != g_dpi) {
-        g_dpi = msdos_window_dpi(g_win);
+    if (chf_window_dpi(g_win) != g_dpi) {
+        g_dpi = chf_window_dpi(g_win);
         SetWindowPos(g_win, NULL, 0, 0, S(980), S(720), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     g_search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -546,13 +553,13 @@ static int create_window(HWND owner)
     return 1;
 }
 
-void msdos_help_show(HWND owner, const char *id)
+void chf_help_show(HWND owner, const char *id)
 {
     int t = 0, b = -1;
     if (!g_win && !create_window(owner)) return;
     if (id && id[0] == '?') {
         wchar_t w[256];
-        msdos_wide(id + 1, w, 256);
+        help_wide(id + 1, w, 256);
         SetWindowTextW(g_search, w);        /* EN_CHANGE fills the list */
         if (g_nhits) select_row(0);
     } else if (id || g_topic < 0) {
@@ -573,7 +580,7 @@ void msdos_help_show(HWND owner, const char *id)
     scroll_to_block();
 }
 
-int msdos_help_pretranslate(MSG *msg)
+int chf_help_pretranslate(MSG *msg)
 {
     HWND root;
     int ctrl, shift, alt, c;
@@ -584,19 +591,19 @@ int msdos_help_pretranslate(MSG *msg)
     shift = GetKeyState(VK_SHIFT) < 0;
     alt = GetKeyState(VK_MENU) < 0;
     if (ctrl && shift && !alt && msg->wParam == 'H') {
-        if (!(msg->lParam & (1L << 30))) msdos_help_for(root);
+        if (!(msg->lParam & (1L << 30))) chf_help_for(root);
         return 1;
     }
     c = find_context(root);
     if (msg->wParam == VK_F1 && !ctrl && !shift && !alt && c >= 0 && g_contexts[c].f1) {
-        if (!(msg->lParam & (1L << 30))) msdos_help_for(root);
+        if (!(msg->lParam & (1L << 30))) chf_help_for(root);
         return 1;
     }
     if (!g_win || root != g_win || msg->message != WM_KEYDOWN) return 0;
 
     /* the Help's own keys */
     if (ctrl && !shift && msg->wParam == 'F') {
-        msdos_help_for(g_win);
+        chf_help_for(g_win);
         return 1;
     }
     if (msg->wParam == VK_TAB && !ctrl && !alt) {

@@ -1,6 +1,6 @@
 /*
- * The AppKit debugger window over the Signetics 2650 / 2637 UVI debugger engine
- * (chfdebug.h).
+ * The AppKit debugger window over the Fairchild F8 (F3850) / Channel F video
+ * debugger engine (chfdebug.h).
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #pragma once

@@ -1,8 +1,8 @@
 /*
- * The Controllers panel (F9 / Cmd+J): the Channel F's membrane keyboard and its
- * two joysticks drawn like the console's, the gamepads with their
- * assignments, and Map mode for rebinding. Hidden at start; a fixed-size
- * floating NSPanel.
+ * The Controllers panel (F9 / Cmd+J): the Channel F's console buttons and its
+ * two hand controllers drawn from the session's layout (chfsession_controls_*),
+ * the gamepads with their assignments, and Map mode for rebinding. Hidden at
+ * start; a fixed-size floating NSPanel.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -23,6 +23,6 @@ typedef BOOL (^ChfAppKeyHandler)(uint32_t keysym);
 - (void)toggle;
 - (void)hide;
 - (BOOL)isVisible;
-/* The machine changed (Preferences): the keyboard is rebuilt for it. */
+/* The machine changed (Settings): the panel is rebuilt for it. */
 - (void)refresh;
 @end

@@ -19,10 +19,10 @@ uint32_t ChfKeysymFromEvent(NSEvent *event);
 /* The keysym for a modifier flag change (flagsChanged), or 0. Sets *down. */
 uint32_t ChfKeysymFromFlagsChange(NSEvent *event, int *down);
 
-/* This app's accent colour (CHFSESSION_ACCENT_RGB): the console keypad's gold
+/* This app's accent colour (CHFSESSION_ACCENT_RGB): the Videocarts' yellow
  * (#F2C300). For fills and highlights; dark text sits on it. */
 NSColor *ChfAccentColor(void);
 
-/* The accent for TEXT and thin strokes: on a light appearance the gold is
+/* The accent for TEXT and thin strokes: on a light appearance the yellow is
  * CHFSESSION_ACCENT_DARK_RGB (#8A6D00) instead. */
 NSColor *ChfAccentTextColor(void);

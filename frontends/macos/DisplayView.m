@@ -48,10 +48,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The picture is 192 x 262 (MAME's visible area for the UVI: 128 playfield
- * pixels plus the borders, 262 lines), and MAME shows that whole area at the
- * television's 4:3, so its pixels are tall. Square pixels show the 192 x 262
- * as it is. */
+/* The picture is 204 x 232 (MAME's visible area: 102 x 58 cells, 2 pixels wide
+ * and 4 lines tall), shown at the television's 4:3 or with square pixels;
+ * chfsession_display_aspect says which shape for the machine. */
 #define TV_ASPECT (4.0 / 3.0)
 
 /* Buffers in flight: one being filled, one waiting for the main thread, one
@@ -103,7 +102,7 @@ static void releaseFrame(void *info, const void *data, size_t size)
     uint64_t _serial;                /* the link thread's: the last frame copied */
     CGColorSpaceRef _cs;
     CALayer *_picture;
-    BOOL _tv;
+    double _aspect;                  /* width / height of the picture's box */
     BOOL _smooth;
     NSLock *_lock;                   /* guards _pending and _posted */
     CGImageRef _pending;             /* the newest image the main thread has not shown */
@@ -122,11 +121,12 @@ static CVReturn displayCallback(CVDisplayLinkRef link, const CVTimeStamp *now,
 
 - (instancetype)initWithSession:(chfsession *)session
 {
-    /* 2x the 262 lines at the TV's 4:3 */
+    /* 2x the 232 lines at the TV's 4:3 is 619 wide: a comfortable first
+     * window on any Mac is a little more */
     self = [super initWithFrame:NSMakeRect(0, 0, 699, 524)];
     if (!self) return nil;
     _session = session;
-    _tv = YES;
+    _aspect = TV_ASPECT;
     _smooth = NO;
     _lock = [[NSLock alloc] init];
     _cs = CGColorSpaceCreateDeviceRGB();
@@ -164,13 +164,12 @@ static CVReturn displayCallback(CVDisplayLinkRef link, const CVTimeStamp *now,
 
 /* ---- the picture's place ---------------------------------------------------- */
 
-/* Letterboxed at the TV's 4:3, or at the picture's own 192:262. */
+/* Letterboxed at the chosen shape. */
 - (void)positionPicture
 {
     if (!_picture) return;
     const NSRect b = [self bounds];
-    const double want = _tv ? TV_ASPECT
-                            : (double)CHFSESSION_FB_WIDTH / (double)CHFSESSION_FB_HEIGHT;
+    const double want = _aspect;
     const double w = b.size.width, h = b.size.height;
     if (w <= 0 || h <= 0) return;
     double sw, sh;
@@ -195,9 +194,11 @@ static CVReturn displayCallback(CVDisplayLinkRef link, const CVTimeStamp *now,
     [self positionPicture];
 }
 
-- (void)setTvAspect:(BOOL)tv
+- (void)setMachine:(int)machine squarePixels:(BOOL)square
 {
-    _tv = tv;
+    int num = 4, den = 3;
+    chfsession_display_aspect(machine, square ? 1 : 0, &num, &den);
+    _aspect = den > 0 && num > 0 ? (double)num / (double)den : TV_ASPECT;
     [self positionPicture];
 }
 

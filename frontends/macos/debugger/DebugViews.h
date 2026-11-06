@@ -55,10 +55,15 @@ NSButton *ChfButton(NSString *title, id target, SEL action);
 @property (nonatomic) NSRect highlight;
 /* The picture pixel under the pointer, or -1, -1 when it is outside. */
 @property (nonatomic, copy) void (^onHover)(int x, int y);
+/* A press on a picture pixel (clicks: 1, 2 for a double click); not called
+ * for a press outside the picture. */
+@property (nonatomic, copy) void (^onClick)(int x, int y, int clicks);
 @end
 
-/* A text view whose lines can be clicked, and whose wheel can be taken over. */
+/* A text view whose lines can be clicked (once, or twice), and whose wheel can
+ * be taken over. */
 @interface ChfLineTextView : NSTextView
 @property (nonatomic, copy) void (^onClickLine)(int line);
+@property (nonatomic, copy) void (^onDoubleClickLine)(int line);
 @property (nonatomic, copy) void (^onScroll)(int lines);
 @end

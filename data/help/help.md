@@ -232,12 +232,29 @@ jobs in the same way.
 
 ## Changing the controls
 
+<!-- only: gnome kde windows -->
+
 Preferences ▸ Input has every control the console has (23 in all: both
 controllers' eight contacts, the four buttons, RESET and the app's own
 actions) with its key and its gamepad button. Choose one, then press the
 key or the gamepad button to give it. **Clear** takes the job off a key or
 button, and **Reset Controls** puts the defaults back. The map is kept in
 the settings, and only what differs from the defaults is written.
+
+<!-- end -->
+
+<!-- only: macos -->
+
+On a Mac the controls are changed in the Controllers window
+(<kbd>F9</kbd>) rather than in Settings: click **Map**, then click a
+control on the picture or choose one (all 23 are in the list: both
+controllers' eight contacts, the four buttons, RESET and the app's own
+actions), then press the key or the gamepad button to give it. **Show
+bindings** writes each control's key on it. **Reset Controls** (there and in
+Settings ▸ Input) puts the defaults back. The map is kept in the settings,
+and only what differs from the defaults is written.
+
+<!-- end -->
 
 <!-- context: controllers -->
 # Controllers window
@@ -477,6 +494,13 @@ Preferences (<kbd>Ctrl+,</kbd>) set up the console. The machine, BIOS and
 FujiNet settings apply with a power cycle: the app does it when
 Preferences closes. The picture, the volume and the controls apply at once.
 The settings are one file, shared by every Channel F app on the computer.
+
+<!-- only: macos -->
+
+On a Mac this window is called **Settings** (in the app menu), and its
+pages are tabs.
+
+<!-- end -->
 
 <!-- context: prefs/Machine -->
 ## Machine settings

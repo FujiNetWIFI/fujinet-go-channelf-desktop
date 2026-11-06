@@ -264,17 +264,12 @@ NSButton *ChfButton(NSString *title, id target, SEL action)
     if (self.onHover) self.onHover(x, y);
 }
 
-- (void)mouseMoved:(NSEvent *)e
+/* The picture pixel under an event, or NO when it is outside the picture. */
+- (BOOL)pixelAt:(NSEvent *)e x:(int *)px y:(int *)py
 {
-    if (!_image || _dest.size.width <= 0) {
-        [self report:-1 y:-1];
-        return;
-    }
+    if (!_image || _dest.size.width <= 0) return NO;
     const NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
-    if (!NSPointInRect(p, _dest)) {
-        [self report:-1 y:-1];
-        return;
-    }
+    if (!NSPointInRect(p, _dest)) return NO;
     const double iw = (double)CGImageGetWidth(_image), ih = (double)CGImageGetHeight(_image);
     int x = (int)floor((p.x - _dest.origin.x) * iw / _dest.size.width);
     int y = (int)floor((NSMaxY(_dest) - p.y) * ih / _dest.size.height);
@@ -283,7 +278,22 @@ NSButton *ChfButton(NSString *title, id target, SEL action)
     if (y > (int)ih - 1) y = (int)ih - 1;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-    [self report:x y:y];
+    *px = x;
+    *py = y;
+    return YES;
+}
+
+- (void)mouseMoved:(NSEvent *)e
+{
+    int x, y;
+    if ([self pixelAt:e x:&x y:&y]) [self report:x y:y];
+    else [self report:-1 y:-1];
+}
+
+- (void)mouseDown:(NSEvent *)e
+{
+    int x, y;
+    if (self.onClick && [self pixelAt:e x:&x y:&y]) self.onClick(x, y, (int)[e clickCount]);
 }
 
 - (void)mouseExited:(NSEvent *)e
@@ -300,7 +310,7 @@ NSButton *ChfButton(NSString *title, id target, SEL action)
 }
 - (void)mouseDown:(NSEvent *)event
 {
-    if (!self.onClickLine) {
+    if (!self.onClickLine && !self.onDoubleClickLine) {
         [super mouseDown:event];
         return;
     }
@@ -311,7 +321,8 @@ NSButton *ChfButton(NSString *title, id target, SEL action)
     int line = 0;
     for (NSUInteger i = 0; i < idx && i < text.length; i++)
         if ([text characterAtIndex:i] == '\n') line++;
-    self.onClickLine(line);
+    if ([event clickCount] >= 2 && self.onDoubleClickLine) self.onDoubleClickLine(line);
+    else if (self.onClickLine) self.onClickLine(line);
 }
 
 - (void)scrollWheel:(NSEvent *)event

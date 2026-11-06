@@ -1,14 +1,13 @@
 /*
- * The debugger's Video tab: everything the 2637 UVI knows.
+ * The debugger's Video tab: everything the Channel F's video knows.
  *
- * Left, the picture the chip draws -- the last frame, the registers
- * re-rendered with the layers and overlays you choose, or the frame as far as
- * the beam has got -- with the object or character cell under the pointer
- * named and outlined. Right, the chip in sections: the four objects with their
- * positions and bitmaps, the 16 x 13 (or 26) character screen with its colour
- * bits, every register $1800-$1AFF decoded (editable while the machine is
- * stopped), the control, collision, sound and colour registers, and the glyph
- * (UDC), object and palette sheets.
+ * Left, the picture at a chosen scale in one of six views -- the last frame,
+ * the VRAM drawn now, the frame as far as the beam has got, the whole 128 x 64
+ * VRAM, its raw values, the four palettes -- with the overlay checkboxes and
+ * the cell under the pointer read out (click pins it, double-click breaks on
+ * writes to it). Right, in sections: the 64-row palette strip and the 4 x 4
+ * palette table, the four ports (raw, complement, decoded, and as the CPU
+ * would read them now), and the VRAM write log with its filters and counts.
  *
  * Refreshed by the debugger window: live while the machine runs (at most ten
  * times a second) and on every stop, only while this tab shows.
@@ -29,6 +28,6 @@
 - (instancetype)initWithDebugger:(chfdebug *)dbg;
 /* The tab's content, to put in the debugger's tab view. */
 @property (nonatomic, readonly) NSView *view;
-/* Pulls the chip's state and redraws what shows. */
+/* Pulls the video's state and redraws what shows. */
 - (void)refresh;
 @end

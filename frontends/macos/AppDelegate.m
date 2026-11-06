@@ -18,6 +18,7 @@
 #import "SettingsWindow.h"
 #import "controllers/ControllersWindow.h"
 #import "debugger/DebuggerWindow.h"
+#import "help/HelpWindow.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -62,10 +63,11 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 @property (nonatomic, weak) ChfAppDelegate *owner;
 @end
 
-@interface ChfAppDelegate () <ChfSettingsDelegate>
+@interface ChfAppDelegate () <ChfSettingsDelegate, NSAlertDelegate>
 - (void)runSysaction:(int)sa;
 - (void)loadMediaPaths:(NSArray<NSString *> *)paths;
 - (BOOL)handleAppKey:(uint32_t)keysym;
+- (void)importRomsFromPanel:(BOOL)folder;
 @end
 
 @implementation ChfContentView
@@ -137,6 +139,10 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 
     NSMenuItem *_aspectItem;
     NSMenuItem *_smoothItem;
+    int _machine;                /* the machine the console was started as */
+
+    BOOL _needsBiosShown;        /* the "Needs BIOS" alert, once per occurrence */
+    NSString *_refusedCart;      /* a game refused for want of the BIOS: opened again after the import */
 
     /* an open panel with an "All files" choice, while it runs */
     NSOpenPanel *_panel;
@@ -169,8 +175,8 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 {
     (void)note;
 
-    /* The 192x262 picture at the TV's 4:3, twice its 262 lines high:
-     * 699x524, a comfortable first window on any Mac. */
+    /* The 204x232 picture at the TV's 4:3: 699x524 is a comfortable first
+     * window on any Mac. */
     _window = [[NSWindow alloc]
         initWithContentRect:NSMakeRect(0, 0, 699, 524)
                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -178,7 +184,7 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     [_window setTitle:APP_TITLE];
-    /* NSWindow's default is to release itself on close, which CHF then does
+    /* NSWindow's default is to release itself on close, which ARC then does
      * a second time: the window is kept, and closing it quits (below) */
     [_window setReleasedWhenClosed:NO];
     [_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
@@ -196,7 +202,8 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     _display = [[ChfDisplayView alloc] initWithSession:_session];
     [_display setFrame:[_content bounds]];
     [_display setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-    [_display setTvAspect:chfsession_get_int(_session, "aspect", 0) == 0];
+    _machine = [self machineSetting];
+    [_display setMachine:_machine squarePixels:chfsession_get_int(_session, "aspect", 0) != 0];
     [_display setSmooth:chfsession_get_int(_session, "smooth", 0) != 0];
     [_content addSubview:_display];
 
@@ -213,6 +220,7 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [_content addSubview:_toast];
 
     [_window setContentView:_content];
+    ChfSetHelpContext(_window, @"main");
     [self buildMenu];
     [_window makeKeyAndOrderFront:nil];
     [_window makeFirstResponder:_content];
@@ -236,6 +244,8 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     chfsession_start_opts opts;
     chfsession_default_opts(_session, &opts);
     const BOOL started = chfsession_start(_session, &opts) == 0;
+    _machine = opts.machine;
+    [self applyDisplayShape];
     _launched = YES;
     _toastGeneration = chfsession_gamepad_generation(_session);
     if (!started) [self reportRefusal:[self lastError] title:@"Could not start"];
@@ -258,12 +268,27 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [self updateTimers];
 }
 
+/* The machine the settings name (what the next power cycle starts). */
+- (int)machineSetting
+{
+    const int m = chfsession_get_int(_session, "machine", CHF_MACHINE_CHANNELF);
+    return m >= 0 && m < CHF_MACHINE_COUNT ? m : CHF_MACHINE_CHANNELF;
+}
+
+/* The picture's shape: the running machine's, at the chosen aspect. */
+- (void)applyDisplayShape
+{
+    [_display setMachine:_machine squarePixels:chfsession_get_int(_session, "aspect", 0) != 0];
+}
+
 /* What the 10 Hz timer does: system actions the gamepad thread resolved (it
- * cannot touch AppKit), and gamepads coming and going. */
+ * cannot touch AppKit), the machine asking for the BIOS, and gamepads coming
+ * and going. */
 - (void)sysactTick
 {
     int sa;
     while (chfsession_sysaction_take(_session, &sa)) [self runSysaction:sa];
+    [self checkMissing];
     const unsigned gen = chfsession_gamepad_generation(_session);
     if (gen != _toastGeneration) {
         _toastGeneration = gen;
@@ -332,10 +357,68 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [self alert:title text:why];
 }
 
+/* ---- what the machine is missing ----------------------------------------------------- */
+
+/* The BIOS: a game was refused, or a FujiNet app called a routine the
+ * stand-in lacks and the console is parked. Said once, as a sheet on the
+ * machine's window, until a power cycle (or the import) clears it and
+ * something trips it again. */
+- (void)checkMissing
+{
+    if (!chfsession_needs_bios(_session)) {
+        if (_needsBiosShown) {
+            _needsBiosShown = NO;
+            ChfSetHelpContext(_window, @"main");
+        }
+        return;
+    }
+    ChfSetHelpContext(_window, @"nobios");
+    if (_needsBiosShown) return;
+    _needsBiosShown = YES;
+    char why[256];
+    why[0] = '\0';
+    chfsession_missing_reason(_session, why, (int)sizeof why);
+    [self askForBios:nsstr(why)];
+}
+
+/* The alert: Import BIOS… picks the files (and opens the refused cartridge
+ * again, or power-cycles), Not Now leaves it. Its Help button opens the
+ * nobios topic. */
+- (void)askForBios:(NSString *)reason
+{
+    /* the BIOS switched off in Settings: importing would not change that */
+    const BOOL canImport = ![reason containsString:@"switched off"];
+    NSAlert *a = [[NSAlert alloc] init];
+    a.messageText = @"Needs BIOS";
+    a.informativeText = reason.length ? reason
+        : @"This needs the console's own BIOS, which the app does not include. CONFIG and the "
+           @"FujiNet apps run without it.";
+    if (canImport) {
+        [a addButtonWithTitle:@"Import BIOS…"];
+        [a addButtonWithTitle:@"Not Now"];
+    } else {
+        [a addButtonWithTitle:@"OK"];
+    }
+    a.showsHelp = YES;
+    a.delegate = self;
+    [a beginSheetModalForWindow:_window completionHandler:^(NSModalResponse r) {
+        if (!canImport || r != NSAlertFirstButtonReturn) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ [self importRomsFromPanel:NO]; });
+    }];
+}
+
+- (BOOL)alertShowHelp:(NSAlert *)alert
+{
+    (void)alert;
+    [[ChfHelpWindow shared] showAt:@"nobios"];
+    return YES;
+}
+
 - (void)runSysaction:(int)sa
 {
     switch (sa) {
     case CHF_SYSACT_RESET_CONFIG:
+        _refusedCart = nil;
         chfsession_sysaction(_session, sa);
         break;
     case CHF_SYSACT_DEBUG_STOP:
@@ -455,6 +538,10 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [self item:machine title:@"Open Cartridge…" action:@selector(openCart:) key:@"o"];
     [self item:machine title:@"Eject Cartridge" action:@selector(ejectCart:) key:@""];
     [self item:machine title:@"Import Cartridge to SD…" action:@selector(importToSd:) key:@""];
+    [self item:machine title:@"Open SD Folder" action:@selector(openSdFolder:) key:@""];
+    [machine addItem:[NSMenuItem separatorItem]];
+    [self item:machine title:@"Import BIOS…" action:@selector(importBios:) key:@""];
+    [self item:machine title:@"Import BIOS from a Folder…" action:@selector(importBiosFolder:) key:@""];
     [machine addItem:[NSMenuItem separatorItem]];
     [self item:machine title:@"Pause" action:@selector(togglePause:) key:@""];
     /* F1 and Escape are bindings (the console's RESET key, Reset to CONFIG),
@@ -483,7 +570,7 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 
     NSMenuItem *fujiItem = [[NSMenuItem alloc] init];
     NSMenu *fuji = [[NSMenu alloc] initWithTitle:@"FujiNet"];
-    [self item:fuji title:@"Web UI" action:@selector(openWebUI:) key:@""];
+    [self item:fuji title:@"FujiNet Web UI" action:@selector(openWebUI:) key:@""];
     [self item:fuji title:@"Console Log" action:@selector(showFujiNetLog:) key:@""];
     [fujiItem setSubmenu:fuji];
     [bar addItem:fujiItem];
@@ -499,8 +586,11 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [windowItem setSubmenu:windows];
     [bar addItem:windowItem];
 
+    /* openHelp:, not showHelp: (AppKit's: "Help isn't available") */
     NSMenuItem *helpItem = [[NSMenuItem alloc] init];
     NSMenu *help = [[NSMenu alloc] initWithTitle:@"Help"];
+    [self item:help title:APP_TITLE @" Help" action:@selector(openHelp:) key:@"?"];
+    [help addItem:[NSMenuItem separatorItem]];
     [self item:help title:@"About " APP_TITLE action:@selector(showAbout:) key:@""];
     [helpItem setSubmenu:help];
     [bar addItem:helpItem];
@@ -508,6 +598,8 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [NSApp setMainMenu:bar];
     [NSApp setWindowsMenu:windows];
     [NSApp setHelpMenu:help];
+    /* the Help menu's search field finds the Help's sections too */
+    [NSApp registerUserInterfaceItemSearchHandler:[ChfHelpWindow shared]];
 }
 
 /* ---- actions ------------------------------------------------------------------------ */
@@ -530,11 +622,11 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
                       "Report issues: " ISSUES_URL "\n\n"
                       "Licensed under the GNU General Public License, version 3 or later "
                       "(GPL-3.0-or-later).\n\n"
-                      "The emulator is MAME's Channel F code -- the Signetics 2650 and the "
-                      "2637 UVI video chip (BSD-3-Clause CPU, GPL-2.0+ driver; Peter Trauner, "
-                      "Juergen Buchmueller, Martin Buchholz and others) -- "
-                      "transposed to C. The FujiNet firmware and the cartridge: Thomas Cherryhomes "
-                      "and the FujiNet contributors.";
+                      "The emulator is MAME's Channel F code -- the Fairchild F3850 (F8) "
+                      "processor (BSD-3-Clause) and the console driver (GPL-2.0+); Juergen "
+                      "Buchmueller, Frank Palazzolo, Sean Riddle and others -- transposed to C. "
+                      "The FujiNet firmware and the cartridge: Thomas Cherryhomes and the "
+                      "FujiNet contributors. No BIOS ships with the app.";
     NSMutableAttributedString *credits = [[NSMutableAttributedString alloc]
         initWithString:text
             attributes:@{ NSFontAttributeName: [NSFont systemFontOfSize:NSFont.smallSystemFontSize],
@@ -554,21 +646,38 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     }];
 }
 
+/* A game while no BIOS is imported is refused with the reason: the session
+ * says so and flags it, and the Needs BIOS alert offers the import; the
+ * cartridge is opened again after it. */
 - (void)openCartAtPath:(NSString *)path
 {
-    if (chfsession_load_cart(_session, [path fileSystemRepresentation]) != 0)
-        [self reportRefusal:[self lastError] title:@"Could not open"];
+    if (chfsession_load_cart(_session, [path fileSystemRepresentation]) != 0) {
+        if (chfsession_needs_bios(_session)) {
+            _refusedCart = path;
+            _needsBiosShown = NO;
+            [self checkMissing];
+        } else {
+            _refusedCart = nil;
+            [self reportRefusal:[self lastError] title:@"Could not open"];
+        }
+    } else {
+        _refusedCart = nil;
+    }
     [self updateTitle];
 }
 
-/* Open, a drop, Finder, the command line: the first cartridge is opened,
- * anything else goes on FujiNet's SD card. */
+/* Open, a drop, Finder, the command line: BIOS ROMs and zips of them are
+ * imported (together, one report), the first cartridge is opened, anything
+ * else goes on FujiNet's SD card. */
 - (void)loadMediaPaths:(NSArray<NSString *> *)paths
 {
+    NSMutableArray<NSString *> *roms = [NSMutableArray array];
     NSString *cart = nil;
     for (NSString *p in paths) {
         const char *fs = [p fileSystemRepresentation];
-        if (!cart && chfsession_media_is_cartridge(fs)) {
+        if (chfsession_media_is_rom(fs)) {
+            [roms addObject:p];
+        } else if (!cart && chfsession_media_is_cartridge(fs)) {
             cart = p;
         } else {
             char dest[1024];
@@ -580,35 +689,60 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
                              [nsstr(dest) lastPathComponent]]];
         }
     }
+    if ([roms count]) [self importRomPaths:roms];
     if (cart) [self openCartAtPath:cart];
+}
+
+/* Runs an open panel as a sheet on the key window (the machine's window if
+ * none; a window nobody can see gets the panel alone) and calls done with
+ * the chosen path, after the sheet has gone. */
+- (void)runPanel:(NSOpenPanel *)p then:(void (^)(NSString *path))done
+{
+    void (^finish)(NSModalResponse) = ^(NSModalResponse r) {
+        self->_panel = nil;
+        if (r != NSModalResponseOK) return;
+        NSString *path = [[p URL] path];
+        dispatch_async(dispatch_get_main_queue(), ^{ done(path); });
+    };
+    NSWindow *host = [NSApp keyWindow];
+    if (!host) host = _window;
+    if (host && [host isVisible] && ![host isMiniaturized])
+        [p beginSheetModalForWindow:host completionHandler:finish];
+    else
+        finish([p runModal]);
 }
 
 /* allName: offer an "All files" choice beside the filter, named so (an
  * accessory: AppKit's panels have no filter menu of their own); nil: the
- * filter alone. */
-- (NSString *)pickFile:(NSString *)title types:(NSArray<NSString *> *)types allFilesBeside:(NSString *)allName
+ * filter alone. helpContext: a Help button in the accessory. */
+- (void)pickFile:(NSString *)title types:(NSArray<NSString *> *)types allFilesBeside:(NSString *)allName
+            help:(NSString *)helpContext then:(void (^)(NSString *path))done
 {
     NSOpenPanel *p = [NSOpenPanel openPanel];
     [p setTitle:title];
+    [p setMessage:title];
     _panelTypes = typesForExtensions(types);
     p.allowedContentTypes = _panelTypes;
+    NSMutableArray<NSView *> *acc = [NSMutableArray array];
     if (allName) {
         NSPopUpButton *kind = [[NSPopUpButton alloc] init];
         [kind addItemsWithTitles:@[allName, @"All files"]];
         kind.target = self;
         kind.action = @selector(panelKindChanged:);
-        NSStackView *acc = [NSStackView stackViewWithViews:@[[NSTextField labelWithString:@"Show"], kind]];
-        acc.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-        acc.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 12);
-        [acc setFrameSize:acc.fittingSize];
-        p.accessoryView = acc;
-        p.accessoryViewDisclosed = YES;
-        _panel = p;
+        [acc addObject:[NSTextField labelWithString:@"Show"]];
+        [acc addObject:kind];
     }
-    const NSModalResponse r = [p runModal];
-    _panel = nil;
-    if (r != NSModalResponseOK) return nil;
-    return [[p URL] path];
+    if (helpContext) [acc addObject:ChfHelpButton(helpContext)];
+    if ([acc count]) {
+        NSStackView *view = [NSStackView stackViewWithViews:acc];
+        view.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        view.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 12);
+        [view setFrameSize:view.fittingSize];
+        p.accessoryView = view;
+        p.accessoryViewDisclosed = YES;
+    }
+    _panel = allName ? p : nil;
+    [self runPanel:p then:done];
 }
 
 - (void)panelKindChanged:(NSPopUpButton *)sender
@@ -617,23 +751,23 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     _panel.allowedContentTypes = sender.indexOfSelectedItem == 0 ? _panelTypes : @[];
 }
 
-/* .bin, .rom, .chf or a zip of one: the cartridge. */
-- (NSString *)pickCartridge:(NSString *)title
+/* .bin or .chf, or a zip of one: the cartridge. */
+- (void)pickCartridge:(NSString *)title help:(NSString *)helpContext then:(void (^)(NSString *path))done
 {
-    return [self pickFile:title types:@[@"bin", @"rom", @"chf", @"zip"]
-           allFilesBeside:@"Cartridge images (.bin .rom .chf .zip)"];
+    [self pickFile:title types:@[@"bin", @"chf", @"zip"]
+         allFilesBeside:@"Cartridge images (.bin .chf .zip)" help:helpContext then:done];
 }
 
 - (void)openCart:(id)sender
 {
     (void)sender;
-    NSString *path = [self pickCartridge:@"Open Cartridge"];
-    if (path) [self openCartAtPath:path];
+    [self pickCartridge:@"Open Cartridge" help:nil then:^(NSString *path) { [self openCartAtPath:path]; }];
 }
 
 - (void)ejectCart:(id)sender
 {
     (void)sender;
+    _refusedCart = nil;
     if (chfsession_eject(_session) != 0)
         [self alert:@"Could not eject" text:[self lastError]];
     [self updateTitle];
@@ -642,16 +776,95 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 - (void)importToSd:(id)sender
 {
     (void)sender;
-    NSString *path = [self pickCartridge:@"Import Cartridge to SD"];
-    if (!path) return;
-    char dest[1024];
-    if (chfsession_import_cart_to_sd(_session, [path fileSystemRepresentation], dest, sizeof dest) != 0) {
-        [self alert:@"Import failed" text:[self lastError]];
-        return;
-    }
-    [self showToast:[NSString stringWithFormat:@"%@ is on the SD host. Boot it from CONFIG.",
-                     [nsstr(dest) lastPathComponent]]];
+    [self pickCartridge:@"Import Cartridge to SD" help:@"import-sd" then:^(NSString *path) {
+        char dest[1024];
+        if (chfsession_import_cart_to_sd(self->_session, [path fileSystemRepresentation], dest, sizeof dest) != 0) {
+            [self alert:@"Import failed" text:[self lastError]];
+            return;
+        }
+        [self showToast:[NSString stringWithFormat:@"%@ is on the SD host. Boot it from CONFIG.",
+                         [nsstr(dest) lastPathComponent]]];
+    }];
 }
+
+/* FujiNet's SD folder in Finder. */
+- (void)openSdFolder:(id)sender
+{
+    (void)sender;
+    const char *p = chfsession_sd_path(_session);
+    if (!p || !p[0]) return;
+    NSString *dir = nsstr(p);
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir isDirectory:YES]];
+}
+
+/* ---- the BIOS ----------------------------------------------------------------------------- */
+
+/* Whatever was imported, the session's messages say what happened -- which ROM
+ * it was, an unrecognised dump of the right size, the next power cycle. A
+ * successful import takes effect at once when something was missing: the
+ * cartridge that was refused is opened again, or the console power-cycles
+ * (back onto the cartridge in the slot, or CONFIG). */
+- (void)importRomPaths:(NSArray<NSString *> *)paths
+{
+    NSMutableArray<NSString *> *log = [NSMutableArray array];
+    int imported = 0;
+    for (NSString *p in paths) {
+        char msg[2048];
+        msg[0] = '\0';
+        const int n = chfsession_rom_import(_session, [p fileSystemRepresentation], msg, (int)sizeof msg);
+        if (n > 0) imported += n;
+        if (msg[0]) [log addObject:nsstr(msg)];
+    }
+    [_settings refresh];
+    NSString *text = [log count] ? [log componentsJoinedByString:@"\n"]
+                                 : (imported > 0 ? @"Imported." : @"None of these files is a ROM this app uses.");
+    [self alert:(imported > 0 ? @"BIOS Imported" : @"Nothing Imported") text:text];
+    if (imported <= 0) return;
+
+    if (_refusedCart) {
+        NSString *cart = _refusedCart;
+        _refusedCart = nil;
+        [self openCartAtPath:cart];
+    } else if (!chfsession_is_running(_session) || chfsession_missing(_session)) {
+        if (chfsession_restart(_session) != 0)
+            [self reportRefusal:[self lastError] title:@"Could not start"];
+        else
+            [self showToast:@"The console was power-cycled with the new BIOS."];
+    }
+    [self updateTitle];
+    [self checkMissing];
+}
+
+/* Machine > Import BIOS… (files and zips, any number) and Import BIOS from a
+ * Folder…: the ROMs are recognised by checksum, so the files may be called
+ * anything. */
+- (void)importRomsFromPanel:(BOOL)folder
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    [panel setMessage:folder ? @"Import BIOS from a Folder (MAME's ROM folder works)"
+                             : @"Import BIOS: ROM images or zips (MAME's channelf.zip works)"];
+    [panel setCanChooseDirectories:folder];
+    [panel setCanChooseFiles:!folder];
+    [panel setAllowsMultipleSelection:!folder];
+    NSWindow *host = [NSApp keyWindow];
+    if (!host) host = _window;
+    void (^finish)(NSModalResponse) = ^(NSModalResponse r) {
+        if (r != NSModalResponseOK) return;
+        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        for (NSURL *u in [panel URLs]) [paths addObject:[u path]];
+        /* after the sheet: what came in is an alert of its own */
+        dispatch_async(dispatch_get_main_queue(), ^{ [self importRomPaths:paths]; });
+    };
+    if (host && [host isVisible] && ![host isMiniaturized])
+        [panel beginSheetModalForWindow:host completionHandler:finish];
+    else
+        finish([panel runModal]);
+}
+
+- (void)importBios:(id)sender { (void)sender; [self importRomsFromPanel:NO]; }
+- (void)importBiosFolder:(id)sender { (void)sender; [self importRomsFromPanel:YES]; }
 
 /* ---- the console ---------------------------------------------------------------------------- */
 
@@ -710,7 +923,7 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 - (void)setAspect:(int)aspect
 {
     chfsession_set_int(_session, "aspect", aspect);
-    [_display setTvAspect:aspect == 0];
+    [_display setMachine:_machine squarePixels:aspect != 0];
     [_aspectItem setState:(aspect == 0 ? NSControlStateValueOn : NSControlStateValueOff)];
     [_settings syncDisplay];
 }
@@ -747,16 +960,21 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 - (void)settingsSetAspect:(int)aspect { [self setAspect:aspect]; }
 - (void)settingsSetSmooth:(BOOL)smooth { [self setSmooth:smooth]; }
 - (void)settingsOpenWebUI { [self openWebUI:nil]; }
+- (void)settingsImportRoms:(BOOL)folder { [self importRomsFromPanel:folder]; }
 
 /* A power cycle for the machine options, a full restart if a host option
  * changed: the session knows which. */
 - (void)settingsClosed:(BOOL)needsRestart
 {
     if (needsRestart) {
+        _refusedCart = nil;
         if (chfsession_restart(_session) != 0)
             [self reportRefusal:[self lastError] title:@"Could not start"];
         else
             [self showToast:@"Settings applied: the console was power-cycled."];
+        /* the new machine's picture shape */
+        _machine = [self machineSetting];
+        [self applyDisplayShape];
     }
     [_controllers refresh];
     [self updateTitle];
@@ -826,9 +1044,10 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
         return;
     }
 
-    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 860, 600)];
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 36, 860, 564)];
     scroll.hasVerticalScroller = YES;
     scroll.autohidesScrollers = NO;
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
     _logView = [[NSTextView alloc] initWithFrame:scroll.bounds];
     _logView.editable = NO;
@@ -846,12 +1065,29 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     _logWindow.title = @"FujiNet Console Log";
     _logWindow.releasedWhenClosed = NO;
     _logWindow.delegate = self;
-    _logWindow.contentView = scroll;
+    {
+        /* the log over a strip with the Help button */
+        NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 860, 600)];
+        NSButton *help = ChfHelpButton(@"fujilog");
+        [help setFrameOrigin:NSMakePoint(10, 6)];
+        help.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+        [box addSubview:scroll];
+        [box addSubview:help];
+        _logWindow.contentView = box;
+    }
+    ChfSetHelpContext(_logWindow, @"fujilog");
     [_logWindow center];
 
     [self refreshLog:nil];
     [_logWindow makeKeyAndOrderFront:nil];
     [self updateLogTimer];
+}
+
+/* For the window in front: Settings' page, the debugger's tab ... */
+- (void)openHelp:(id)sender
+{
+    (void)sender;
+    [[ChfHelpWindow shared] showFor:[NSApp keyWindow]];
 }
 
 - (void)openWebUI:(id)sender

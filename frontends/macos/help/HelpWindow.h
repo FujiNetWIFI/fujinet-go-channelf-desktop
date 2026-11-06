@@ -9,20 +9,20 @@
 
 #import <Cocoa/Cocoa.h>
 
-@interface MSDOSHelpWindow : NSObject <NSUserInterfaceItemSearching>
-+ (MSDOSHelpWindow *)shared;
+@interface ChfHelpWindow : NSObject <NSUserInterfaceItemSearching>
++ (ChfHelpWindow *)shared;
 /* Shows the Help at ident: a heading's slug or a context ("debugger/cpu",
- * "prefs/Storage"), or "?words" to search; nil stays where it was. */
+ * "prefs/Machine"), or "?words" to search; nil stays where it was. */
 - (void)showAt:(NSString *)ident;
 /* The Help for what window shows (in the Help, its search). */
 - (void)showFor:(NSWindow *)window;
-/* MSDOS_HELP_SCREENSHOT: the window as it looks, as a PNG. */
+/* CHF_HELP_SCREENSHOT: the window as it looks, as a PNG. */
 - (BOOL)savePng:(NSString *)path;
 @end
 
 /* What Command+? and a Help button with no context of its own open for a
  * window. */
-void MSDOSSetHelpContext(NSWindow *window, NSString *context);
+void ChfSetHelpContext(NSWindow *window, NSString *context);
 
 /* The round Help button: opens context, or with nil its window's. */
-NSButton *MSDOSHelpButton(NSString *context);
+NSButton *ChfHelpButton(NSString *context);

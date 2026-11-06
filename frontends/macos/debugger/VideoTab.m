@@ -11,35 +11,36 @@
 #import "VideoTab.h"
 
 #import "DebugViews.h"
-#import "../KeyForward.h"
 
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* The views want at most one frame (192 x 262) at 1x, and the sheets up to 4x
- * of their own size: chfdebug.h says to size by MAX_PIXELS * scale * scale. */
-#define PX_CAP ((size_t)CHFDEBUG_UVI_VIEW_MAX_PIXELS * 16)
-#define OBJ_CAP (64 * 64)
+/* chfdebug.h: size the view buffer by CHFDEBUG_VIEW_MAX_PIXELS * scale * scale. */
+#define SCALE_MAX 4
+#define PX_CAP ((size_t)CHFDEBUG_VIEW_MAX_PIXELS * SCALE_MAX * SCALE_MAX)
 
-#define OBJ_ROW_H     46.0
-#define OBJ_HEAD_H    24.0
-#define OBJ_THUMB     40.0
+/* A VRAM cell in a view's pixels at scale 1: 2 wide, 4 tall. */
+#define CELL_W 2
+#define CELL_H 4
 
-#define SECTION_OBJECTS  0
-#define SECTION_SCREEN   1
-#define SECTION_REGS     2
-#define SECTION_CONTROL  3
-#define SECTION_SHEETS   4
+#define WRITES_MAX 400          /* the VRAM write log's lines */
+#define STRIP_ROW_H 8.0
+#define STRIP_W 150.0
+#define TABLE_W 400.0
+#define TABLE_ROW_H 58.0
 
-/* The layer and overlay checkboxes, with the bits they set. */
-static const struct { NSString *__unsafe_unretained title; unsigned bit; } kLayers[2] = {
-    { @"Characters", CHFDEBUG_UVI_L_CHARS }, { @"Objects", CHFDEBUG_UVI_L_OBJECTS },
-};
-static const struct { NSString *__unsafe_unretained title; unsigned bit; } kOverlays[4] = {
-    { @"Object boxes + indices", CHFDEBUG_UVI_F_BOXES }, { @"Character grid", CHFDEBUG_UVI_F_GRID },
-    { @"Collisions", CHFDEBUG_UVI_F_COLLIDE }, { @"Beam cross-hair", CHFDEBUG_UVI_F_BEAM },
+#define SECTION_PALETTES 0
+#define SECTION_PORTS    1
+#define SECTION_WRITES   2
+
+/* The overlay checkboxes, with the bits they set. */
+static const struct { NSString *__unsafe_unretained title; unsigned bit; } kOverlays[8] = {
+    { @"Visible", CHFDEBUG_F_VISIBLE },       { @"Grid", CHFDEBUG_F_GRID },
+    { @"Palette columns", CHFDEBUG_F_PALCOLS }, { @"Beam", CHFDEBUG_F_BEAM },
+    { @"Cursor", CHFDEBUG_F_CURSOR },         { @"Heat", CHFDEBUG_F_HEAT },
+    { @"Dirty", CHFDEBUG_F_DIRTY },           { @"Palette rows", CHFDEBUG_F_PALROWS },
 };
 
 static NSColor *colorFromXrgb(uint32_t rgb)
@@ -50,83 +51,119 @@ static NSColor *colorFromXrgb(uint32_t rgb)
                                alpha:1.0];
 }
 
-/* $hex, 0xhex or bare hex. */
-static BOOL parseHex(NSString *text, long *out)
+static NSString *nsstr(const char *s)
 {
-    NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    if ([t hasPrefix:@"$"]) t = [t substringFromIndex:1];
-    else if ([t.lowercaseString hasPrefix:@"0x"]) t = [t substringFromIndex:2];
-    if (t.length == 0) return NO;
-    char *end;
-    const long v = strtol(t.UTF8String, &end, 16);
-    if (*end) return NO;
-    *out = v;
-    return YES;
+    NSString *r = s ? [NSString stringWithUTF8String:s] : nil;
+    return r ? r : @"";
 }
 
-/* ---- the objects list ------------------------------------------------------------- */
-
-/* One line of the objects list: a heading, or an object with its bitmap. */
-@interface ChfObjectRow : NSObject
-@property (nonatomic, copy) NSString *heading;     /* set: a section heading */
-@property (nonatomic, copy) NSString *line1;
-@property (nonatomic, copy) NSString *line2;
-@property (nonatomic, strong) NSImage *thumb;
-@end
-
-@implementation ChfObjectRow
-@end
-
-/* The rows, drawn from the top; the view's height follows its rows, so the
- * scroll view around it scrolls them. */
-@interface ChfObjectsView : NSView
-@property (nonatomic, copy) NSArray<ChfObjectRow *> *rows;
-@end
-
-@implementation ChfObjectsView
-- (BOOL)isFlipped { return YES; }
-
-- (void)setRows:(NSArray<ChfObjectRow *> *)rows
+/* A whole decimal number, or `def` when the text is empty or not one. */
+static int parseInt(NSString *text, int def)
 {
-    _rows = [rows copy];
-    CGFloat h = 4;
-    for (ChfObjectRow *r in _rows) h += r.heading ? OBJ_HEAD_H : OBJ_ROW_H;
-    [self setFrameSize:NSMakeSize(self.frame.size.width, h)];
+    NSString *t = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (t.length == 0) return def;
+    char *end;
+    const long v = strtol(t.UTF8String, &end, 10);
+    return *end ? def : (int)v;
+}
+
+/* ---- the 64-row palette strip ------------------------------------------------------- */
+
+/* Every VRAM row: its number, the palette its columns 125 and 126 pick, and
+ * that palette's background. The rows the TV shows (4-61) are bright; the
+ * others are dimmed. */
+@interface ChfRowStripView : NSView
+- (void)setVideo:(const chfdebug_video *)v;
+@end
+
+@implementation ChfRowStripView {
+    uint8_t _palette[CHFDEBUG_VRAM_ROWS];
+    uint32_t _background[CHFDEBUG_VRAM_ROWS];
+}
+- (BOOL)isFlipped { return YES; }
+- (NSSize)intrinsicContentSize
+{
+    return NSMakeSize(STRIP_W, STRIP_ROW_H * CHFDEBUG_VRAM_ROWS + 4);
+}
+
+- (void)setVideo:(const chfdebug_video *)v
+{
+    if (!memcmp(_palette, v->row_palette, sizeof _palette) &&
+        !memcmp(_background, v->row_background, sizeof _background))
+        return;
+    memcpy(_palette, v->row_palette, sizeof _palette);
+    memcpy(_background, v->row_background, sizeof _background);
     [self setNeedsDisplay:YES];
 }
 
 - (void)drawRect:(NSRect)dirty
 {
     (void)dirty;
-    NSDictionary *head = @{ NSFontAttributeName: [NSFont boldSystemFontOfSize:12],
-                            NSForegroundColorAttributeName: NSColor.labelColor };
-    NSDictionary *one = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
-                           NSForegroundColorAttributeName: NSColor.labelColor };
-    NSDictionary *two = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular],
+    NSDictionary *num = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:7 weight:NSFontWeightRegular],
                            NSForegroundColorAttributeName: NSColor.secondaryLabelColor };
-    CGFloat y = 4;
-    for (ChfObjectRow *r in _rows) {
-        if (r.heading) {
-            [r.heading drawAtPoint:NSMakePoint(6, y + 4) withAttributes:head];
-            y += OBJ_HEAD_H;
-            continue;
+    NSDictionary *pal = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:7 weight:NSFontWeightRegular],
+                           NSForegroundColorAttributeName: NSColor.labelColor };
+    for (int r = 0; r < CHFDEBUG_VRAM_ROWS; r++) {
+        const CGFloat y = 2 + r * STRIP_ROW_H;
+        const BOOL vis = r >= CHFDEBUG_VIS_ROW0 && r < CHFDEBUG_VIS_ROW0 + CHFDEBUG_VIS_ROWS;
+        [[NSString stringWithFormat:@"%2d", r] drawAtPoint:NSMakePoint(0, y - 1) withAttributes:num];
+        [colorFromXrgb(_background[r]) setFill];
+        NSRectFill(NSMakeRect(18, y, 60, STRIP_ROW_H - 1));
+        if (!vis) {
+            [[NSColor colorWithWhite:0.5 alpha:0.55] setFill];
+            NSRectFill(NSMakeRect(18, y, 60, STRIP_ROW_H - 1));
         }
-        const NSRect box = NSMakeRect(6, y + 3, OBJ_THUMB, OBJ_THUMB);
-        [colorFromXrgb(0x101010) setFill];
-        NSRectFill(box);
-        if (r.thumb) {
-            [[NSGraphicsContext currentContext] setImageInterpolation:NSImageInterpolationNone];
-            const NSSize sz = r.thumb.size;
-            const double f = fmin(1.0, fmin(OBJ_THUMB / sz.width, OBJ_THUMB / sz.height));
-            const NSRect dst = NSMakeRect(box.origin.x + floor((OBJ_THUMB - sz.width * f) / 2),
-                                          box.origin.y + floor((OBJ_THUMB - sz.height * f) / 2),
-                                          sz.width * f, sz.height * f);
-            [r.thumb drawInRect:dst fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
-                       fraction:1.0 respectFlipped:YES hints:nil];
+        [[NSString stringWithFormat:@"p%d%@", _palette[r], vis ? @"" : @" hidden"]
+            drawAtPoint:NSMakePoint(82, y - 1) withAttributes:pal];
+    }
+}
+@end
+
+/* ---- the 4 x 4 palette table -------------------------------------------------------------- */
+
+/* Each palette: its name, how many rows use it, and its four values' pens
+ * with their colour names and RGB. */
+@interface ChfPaletteTableView : NSView
+- (void)setVideo:(const chfdebug_video *)v;
+@end
+
+@implementation ChfPaletteTableView {
+    int _rows[4];
+}
+- (BOOL)isFlipped { return YES; }
+- (NSSize)intrinsicContentSize { return NSMakeSize(TABLE_W, TABLE_ROW_H * 4 + 4); }
+
+- (void)setVideo:(const chfdebug_video *)v
+{
+    if (!memcmp(_rows, v->palette_rows, sizeof _rows)) return;
+    memcpy(_rows, v->palette_rows, sizeof _rows);
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    (void)dirty;
+    NSDictionary *head = @{ NSFontAttributeName: [NSFont boldSystemFontOfSize:11],
+                            NSForegroundColorAttributeName: NSColor.labelColor };
+    NSDictionary *small = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular],
+                             NSForegroundColorAttributeName: NSColor.secondaryLabelColor };
+    for (int p = 0; p < 4; p++) {
+        const CGFloat y = 2 + p * TABLE_ROW_H;
+        [[NSString stringWithFormat:@"Palette %d: %@   %d rows", p, nsstr(chfdebug_palette_name(p)), _rows[p]]
+            drawAtPoint:NSMakePoint(0, y) withAttributes:head];
+        for (int v = 0; v < 4; v++) {
+            const int pen = chfdebug_palette_pen(p, v);
+            const uint32_t rgb = chfdebug_colour_rgb(pen) & 0xffffff;
+            const CGFloat x = v * (TABLE_W / 4);
+            NSRect sw = NSMakeRect(x, y + 16, 28, 22);
+            [colorFromXrgb(rgb) setFill];
+            NSRectFill(sw);
+            [NSColor.separatorColor setStroke];
+            NSFrameRect(sw);
+            [[NSString stringWithFormat:@"%d = %@", v, nsstr(chfdebug_colour_name(pen))]
+                drawAtPoint:NSMakePoint(x + 32, y + 15) withAttributes:small];
+            [[NSString stringWithFormat:@"#%06X", rgb] drawAtPoint:NSMakePoint(x + 32, y + 27) withAttributes:small];
         }
-        [r.line1 drawAtPoint:NSMakePoint(OBJ_THUMB + 12, y + 6) withAttributes:one];
-        [r.line2 drawAtPoint:NSMakePoint(OBJ_THUMB + 12, y + 24) withAttributes:two];
-        y += OBJ_ROW_H;
     }
 }
 @end
@@ -135,27 +172,23 @@ static BOOL parseHex(NSString *text, long *out)
 
 @implementation ChfVideoTab {
     chfdebug *_dbg;
-    chfdebug_uvi _uvi;
-    uint32_t *_px;                      /* PX_CAP pixels: every view's scratch */
-    uint32_t *_objPx;                   /* OBJ_CAP pixels: one object's bitmap */
-    uint32_t _pal[8];                   /* the UVI's 8 colours */
-    BOOL _palLoaded;
-    CFAbsoluteTime _regsAt;
+    uint32_t *_px;                      /* PX_CAP pixels: the view's scratch */
 
-    NSPopUpButton *_viewSel;
-    NSButton *_layer[2];
-    NSButton *_overlay[4];
+    NSPopUpButton *_viewSel, *_scaleSel;
+    NSButton *_overlay[8];
     ChfPictureView *_pic;
-    NSTextField *_hover, *_beam;
+    NSTextField *_hover, *_pinned;
+    int _hx, _hy;                       /* the pixel under the pointer, or -1 */
+    int _pinRow, _pinCol;               /* the pinned cell, or -1 */
     NSTabView *_sections;
 
-    ChfObjectsView *_objects;
-    NSTextView *_screen;
-    NSTextField *_screenNote;
-    ChfLineTextView *_regs;
-    NSTextField *_regAddr, *_regVal, *_regNote;
-    NSTextView *_control;
-    ChfPictureView *_fontPic, *_objPic, *_palPic;
+    ChfRowStripView *_strip;
+    ChfPaletteTableView *_table;
+    NSTextView *_ports;
+    NSTextField *_rowFrom, *_rowTo, *_colFrom, *_colTo;
+    NSButton *_changesOnly, *_thisFrame, *_palCols;
+    NSTextField *_counts;
+    NSTextView *_writes;
 }
 
 - (instancetype)initWithDebugger:(chfdebug *)dbg
@@ -164,7 +197,8 @@ static BOOL parseHex(NSString *text, long *out)
     if (!self) return nil;
     _dbg = dbg;
     _px = calloc(PX_CAP, sizeof *_px);
-    _objPx = calloc(OBJ_CAP, sizeof *_objPx);
+    _hx = _hy = -1;
+    _pinRow = _pinCol = -1;
     _view = [self buildView];
     return self;
 }
@@ -172,7 +206,6 @@ static BOOL parseHex(NSString *text, long *out)
 - (void)dealloc
 {
     free(_px);
-    free(_objPx);
 }
 
 /* ---- construction ------------------------------------------------------------------------ */
@@ -180,142 +213,104 @@ static BOOL parseHex(NSString *text, long *out)
 - (NSView *)buildLeft
 {
     _viewSel = [[NSPopUpButton alloc] init];
-    [_viewSel addItemsWithTitles:@[@"Frame (what the display shows)",
-                                   @"Rendered from the registers",
-                                   @"Frame in progress, to the beam"]];
+    [_viewSel addItemsWithTitles:@[@"Frame (what the display shows)", @"Live (the VRAM now)",
+                                   @"Beam (what the CRT shows)", @"VRAM (all 128 x 64 cells)",
+                                   @"Values (raw, false colour)", @"Palettes"]];
     _viewSel.target = self;
-    _viewSel.action = @selector(viewChanged:);
-    NSStackView *viewRow = ChfHStack(@[ChfLabel(@"View"), _viewSel]);
+    _viewSel.action = @selector(optionChanged:);
+    _scaleSel = [[NSPopUpButton alloc] init];
+    [_scaleSel addItemsWithTitles:@[@"1x", @"2x", @"3x", @"4x"]];
+    [_scaleSel selectItemAtIndex:1];
+    _scaleSel.target = self;
+    _scaleSel.action = @selector(optionChanged:);
+    NSStackView *viewRow = ChfHStack(@[ChfLabel(@"View"), _viewSel, ChfLabel(@"Scale"), _scaleSel]);
 
-    NSMutableArray<NSView *> *layerBoxes = [NSMutableArray array];
-    for (int i = 0; i < 2; i++) {
-        _layer[i] = [NSButton checkboxWithTitle:kLayers[i].title target:self action:@selector(optionChanged:)];
-        _layer[i].state = NSControlStateValueOn;
-        _layer[i].controlSize = NSControlSizeSmall;
-        [layerBoxes addObject:_layer[i]];
-    }
-    NSMutableArray<NSView *> *overlayBoxes = [NSMutableArray array];
-    for (int i = 0; i < 4; i++) {
+    NSMutableArray<NSView *> *boxes = [NSMutableArray array];
+    for (int i = 0; i < 8; i++) {
         _overlay[i] = [NSButton checkboxWithTitle:kOverlays[i].title target:self action:@selector(optionChanged:)];
         _overlay[i].controlSize = NSControlSizeSmall;
-        [overlayBoxes addObject:_overlay[i]];
+        _overlay[i].state = kOverlays[i].bit == CHFDEBUG_F_VISIBLE ? NSControlStateValueOn : NSControlStateValueOff;
+        [boxes addObject:_overlay[i]];
     }
-    NSStackView *layerRow = ChfHStack(layerBoxes);
-    NSStackView *ovRow1 = ChfHStack([overlayBoxes subarrayWithRange:NSMakeRange(0, 2)]);
-    NSStackView *ovRow2 = ChfHStack([overlayBoxes subarrayWithRange:NSMakeRange(2, 2)]);
-    layerRow.spacing = 10;
+    NSStackView *ovRow1 = ChfHStack([boxes subarrayWithRange:NSMakeRange(0, 4)]);
+    NSStackView *ovRow2 = ChfHStack([boxes subarrayWithRange:NSMakeRange(4, 4)]);
     ovRow1.spacing = 10;
     ovRow2.spacing = 10;
-    NSTextField *layersTitle = ChfNote(@"Layers (Rendered view)");
-    NSTextField *overlaysTitle = ChfNote(@"Overlays");
 
-    _pic = [[ChfPictureView alloc] initWithFrame:NSMakeRect(0, 0, 384, 524)];
-    [_pic.widthAnchor constraintGreaterThanOrEqualToConstant:192].active = YES;
-    [_pic.heightAnchor constraintGreaterThanOrEqualToConstant:262].active = YES;
+    _pic = [[ChfPictureView alloc] initWithFrame:NSMakeRect(0, 0, 512, 512)];
+    [_pic.widthAnchor constraintGreaterThanOrEqualToConstant:300].active = YES;
+    [_pic.heightAnchor constraintGreaterThanOrEqualToConstant:300].active = YES;
     [_pic setContentHuggingPriority:(NSLayoutPriority)1 forOrientation:NSLayoutConstraintOrientationVertical];
     __weak ChfVideoTab *weakSelf = self;
     _pic.onHover = ^(int x, int y) { [weakSelf hoverX:x y:y]; };
+    _pic.onClick = ^(int x, int y, int clicks) { [weakSelf clickX:x y:y clicks:clicks]; };
 
-    _hover = ChfNote(@"Point at the picture: what is drawn under the pointer is named here and outlined");
+    _hover = ChfNote(@"Point at the picture to read a cell; click pins it, double-click breaks on writes to it");
     _hover.lineBreakMode = NSLineBreakByTruncatingTail;
-    _beam = ChfNote(@"");
-    _beam.lineBreakMode = NSLineBreakByTruncatingTail;
+    _hover.maximumNumberOfLines = 3;
+    _pinned = ChfLabel(@"");
+    _pinned.maximumNumberOfLines = 3;
+    _pinned.lineBreakMode = NSLineBreakByTruncatingTail;
+    [_pinned setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                      forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    NSStackView *left = ChfVStack(@[viewRow, layersTitle, layerRow, overlaysTitle, ovRow1, ovRow2,
-                                   _pic, _hover, _beam]);
+    NSStackView *left = ChfVStack(@[viewRow, ovRow1, ovRow2, _pic, _hover, _pinned]);
     left.distribution = NSStackViewDistributionFill;
     ChfFill(left, _pic);
     ChfFill(left, _hover);
-    ChfFill(left, _beam);
+    ChfFill(left, _pinned);
     return left;
 }
 
-- (NSView *)scrollFor:(NSView *)doc
+- (NSView *)buildPalettes
 {
-    NSScrollView *scroll = [[NSScrollView alloc] init];
-    scroll.hasVerticalScroller = YES;
-    scroll.drawsBackground = NO;
-    scroll.documentView = doc;
+    _strip = [[ChfRowStripView alloc] initWithFrame:NSMakeRect(0, 0, STRIP_W, 520)];
+    ChfFixSize(_strip);
+    _table = [[ChfPaletteTableView alloc] initWithFrame:NSMakeRect(0, 0, TABLE_W, 240)];
+    ChfFixSize(_table);
+    NSTextField *note = ChfNote(@"Each row picks its palette from the values in its columns 125 and 126: "
+                                @"palette = (v126 & 2) | (v125 >> 1).");
+    note.lineBreakMode = NSLineBreakByWordWrapping;
+    note.maximumNumberOfLines = 3;
+    note.preferredMaxLayoutWidth = TABLE_W;
+    NSStackView *right = ChfVStack(@[ChfTitle(@"The four palettes"), _table, note]);
+    NSStackView *left = ChfVStack(@[ChfTitle(@"The 64 rows"), _strip]);
+    NSStackView *h = ChfHStack(@[left, right]);
+    h.alignment = NSLayoutAttributeTop;
+    h.spacing = 14;
+    return h;
+}
+
+- (NSView *)buildPorts
+{
+    NSScrollView *scroll;
+    _ports = ChfMonoView(&scroll, NO);
     return scroll;
 }
 
-- (NSView *)buildObjects
+- (NSView *)buildWrites
 {
-    _objects = [[ChfObjectsView alloc] initWithFrame:NSMakeRect(0, 0, 480, 100)];
-    _objects.autoresizingMask = NSViewWidthSizable;
-    return [self scrollFor:_objects];
-}
-
-/* The 16 x 13 (or 26) character screen: each cell's code, drawn in the
- * colours the chip draws it in (the character's own colour bits in
- * multicolor mode). */
-- (NSView *)buildScreen
-{
+    _rowFrom = ChfField(@"0", 36, self, @selector(optionChanged:));
+    _rowTo = ChfField(@"63", 36, self, @selector(optionChanged:));
+    _colFrom = ChfField(@"0", 36, self, @selector(optionChanged:));
+    _colTo = ChfField(@"127", 40, self, @selector(optionChanged:));
+    _changesOnly = [NSButton checkboxWithTitle:@"Changes only" target:self action:@selector(optionChanged:)];
+    _thisFrame = [NSButton checkboxWithTitle:@"This frame" target:self action:@selector(optionChanged:)];
+    _palCols = [NSButton checkboxWithTitle:@"Palette columns" target:self action:@selector(optionChanged:)];
+    for (NSButton *b in @[_changesOnly, _thisFrame, _palCols]) b.controlSize = NSControlSizeSmall;
+    NSStackView *range = ChfHStack(@[ChfLabel(@"Rows"), _rowFrom, ChfLabel(@"to"), _rowTo,
+                                     ChfLabel(@"columns"), _colFrom, ChfLabel(@"to"), _colTo]);
+    NSStackView *filters = ChfHStack(@[_changesOnly, _thisFrame, _palCols,
+                                       ChfButton(@"Clear log", self, @selector(clearWrites:))]);
+    filters.spacing = 10;
+    _counts = ChfNote(@"");
+    _counts.lineBreakMode = NSLineBreakByTruncatingTail;
     NSScrollView *scroll;
-    _screen = ChfMonoView(&scroll, NO);
-    _screenNote = ChfNote(@"");
-    _screenNote.maximumNumberOfLines = 4;
-    NSStackView *v = ChfVStack(@[ChfTitle(@"The character screen ($1800-$18EF, 16 columns)"), _screenNote, scroll]);
+    _writes = ChfMonoView(&scroll, NO);
+    NSStackView *v = ChfVStack(@[range, filters, _counts, scroll]);
     v.distribution = NSStackViewDistributionFill;
     ChfFill(v, scroll);
-    return v;
-}
-
-- (NSView *)buildRegisters
-{
-    _regs = [[ChfLineTextView alloc] initWithFrame:NSMakeRect(0, 0, 480, 300)];
-    _regs.editable = NO;
-    _regs.richText = NO;
-    _regs.selectable = NO;
-    _regs.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    _regs.horizontallyResizable = YES;
-    _regs.textContainer.widthTracksTextView = NO;
-    _regs.textContainer.containerSize = NSMakeSize(FLT_MAX, FLT_MAX);
-    _regs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    NSScrollView *scroll = [[NSScrollView alloc] init];
-    scroll.hasVerticalScroller = YES;
-    scroll.hasHorizontalScroller = YES;
-    scroll.documentView = _regs;
-    __weak ChfVideoTab *weakSelf = self;
-    _regs.onClickLine = ^(int line) { [weakSelf pickRegister:line]; };
-
-    _regAddr = ChfField(@"$18F0", 70, self, @selector(writeRegister:));
-    _regVal = ChfField(@"$00", 60, self, @selector(writeRegister:));
-    _regNote = ChfNote(@"Click a line, edit the value, Return writes it (stop the machine first: a running program may write it again)");
-    _regNote.lineBreakMode = NSLineBreakByTruncatingTail;
-    NSStackView *edit = ChfHStack(@[ChfLabel(@"Address"), _regAddr, ChfLabel(@"value"), _regVal,
-                                   ChfButton(@"Write", self, @selector(writeRegister:))]);
-    NSStackView *v = ChfVStack(@[scroll, edit, _regNote]);
-    v.distribution = NSStackViewDistributionFill;
-    ChfFill(v, scroll);
-    return v;
-}
-
-- (NSView *)buildControl
-{
-    NSScrollView *scroll;
-    _control = ChfMonoView(&scroll, NO);
-    return scroll;
-}
-
-- (ChfPictureView *)sheetPicture:(CGFloat)height
-{
-    ChfPictureView *p = [[ChfPictureView alloc] initWithFrame:NSMakeRect(0, 0, 480, height)];
-    [p.heightAnchor constraintEqualToConstant:height].active = YES;
-    return p;
-}
-
-- (NSView *)buildSheets
-{
-    _fontPic = [self sheetPicture:170];
-    _objPic = [self sheetPicture:110];
-    _palPic = [self sheetPicture:60];
-    NSStackView *v = ChfVStack(@[ChfTitle(@"Glyphs (64: $00-$37 built in, $38-$3F the UDCs at $1980-$19BF)"), _fontPic,
-                                ChfTitle(@"The four objects' images"), _objPic,
-                                ChfTitle(@"Palette (white, yellow, cyan, green, magenta, red, blue, black)"), _palPic]);
-    ChfFill(v, _fontPic);
-    ChfFill(v, _objPic);
-    ChfFill(v, _palPic);
+    ChfFill(v, _counts);
     return v;
 }
 
@@ -324,9 +319,8 @@ static BOOL parseHex(NSString *text, long *out)
     NSView *left = [self buildLeft];
 
     _sections = [[NSTabView alloc] init];
-    NSArray *pages = @[ @[@"Objects", [self buildObjects]], @[@"Screen", [self buildScreen]],
-                        @[@"Registers", [self buildRegisters]], @[@"Control/Collisions", [self buildControl]],
-                        @[@"Sheets", [self buildSheets]] ];
+    NSArray *pages = @[ @[@"Palettes", [self buildPalettes]], @[@"Ports", [self buildPorts]],
+                        @[@"VRAM writes", [self buildWrites]] ];
     for (NSArray *page in pages) {
         NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:page[0]];
         item.label = page[0];
@@ -346,43 +340,29 @@ static BOOL parseHex(NSString *text, long *out)
     NSStackView *h = ChfHStack(@[left, _sections]);
     h.alignment = NSLayoutAttributeTop;
     h.spacing = 12;
-    [left.widthAnchor constraintGreaterThanOrEqualToConstant:300].active = YES;
-    [_sections.widthAnchor constraintEqualToConstant:560].active = YES;
+    [left.widthAnchor constraintGreaterThanOrEqualToConstant:320].active = YES;
+    [_sections.widthAnchor constraintEqualToConstant:600].active = YES;
     [left.heightAnchor constraintEqualToAnchor:h.heightAnchor].active = YES;
     [_sections.heightAnchor constraintEqualToAnchor:h.heightAnchor].active = YES;
     return h;
 }
 
-/* ---- the controls --------------------------------------------------------------------------- */
+/* ---- the picture ------------------------------------------------------------------------- */
 
-- (unsigned)layers
+- (int)viewKind { return (int)_viewSel.indexOfSelectedItem; }
+- (int)scale { return (int)_scaleSel.indexOfSelectedItem + 1; }
+
+- (unsigned)flags
 {
-    unsigned m = 0;
-    for (int i = 0; i < 2; i++)
-        if (_layer[i].state == NSControlStateValueOn) m |= kLayers[i].bit;
-    return m;
+    unsigned f = 0;
+    for (int i = 0; i < 8; i++)
+        if (_overlay[i].state == NSControlStateValueOn) f |= kOverlays[i].bit;
+    return f;
 }
 
-- (unsigned)overlays
-{
-    unsigned m = 0;
-    for (int i = 0; i < 4; i++)
-        if (_overlay[i].state == NSControlStateValueOn) m |= kOverlays[i].bit;
-    return m;
-}
-
-- (void)viewChanged:(id)sender
-{
-    (void)sender;
-    [self refresh];
-}
-
-/* A layer or an overlay only means something in a re-render: the real frame
- * has neither, so touching a layer switches to it. */
 - (void)optionChanged:(id)sender
 {
     (void)sender;
-    if (_viewSel.indexOfSelectedItem == CHFDEBUG_UVI_FRAME) [_viewSel selectItemAtIndex:CHFDEBUG_UVI_RENDER];
     [self refresh];
 }
 
@@ -390,273 +370,200 @@ static BOOL parseHex(NSString *text, long *out)
 {
     (void)tabView;
     (void)item;
-    _regsAt = 0;
     [self refresh];
 }
 
-/* ---- the pointer ------------------------------------------------------------------------------ */
-
-/* What the chip draws for one hit, and its box on the 192 x 262 picture. */
-- (NSString *)describeHit:(chfdebug_hit)hit box:(NSRect *)box
+/* The picture-pixel rectangle of a cell in the shown view, or empty when the
+ * view does not show it. */
+- (NSRect)rectOfRow:(int)row col:(int)col
 {
-    if (hit.kind == CHFDEBUG_UVI_HIT_OBJECT && hit.index >= 0 && hit.index < 4) {
-        const chfdebug_uvi_object *o = &_uvi.obj[hit.index];
-        *box = NSMakeRect(o->px, o->py, o->width, o->height);
-        return [NSString stringWithFormat:@"Object %d: x=%d y=%d colour=%d (%s) UDC $%02X%s", hit.index, o->x, o->y,
-                o->colour, chfdebug_uvi_colour_name(o->colour), o->udc, o->double_height ? " double height" : ""];
+    const int view = [self viewKind], s = [self scale];
+    int x, y;
+    if (view == CHFDEBUG_VIEW_VRAM || view == CHFDEBUG_VIEW_VALUES) {
+        x = col;
+        y = row;
+    } else if (view == CHFDEBUG_VIEW_FRAME || view == CHFDEBUG_VIEW_LIVE || view == CHFDEBUG_VIEW_BEAM) {
+        if (col < CHFDEBUG_VIS_COL0 || col >= CHFDEBUG_VIS_COL0 + CHFDEBUG_VIS_COLS ||
+            row < CHFDEBUG_VIS_ROW0 || row >= CHFDEBUG_VIS_ROW0 + CHFDEBUG_VIS_ROWS)
+            return NSZeroRect;
+        x = col - CHFDEBUG_VIS_COL0;
+        y = row - CHFDEBUG_VIS_ROW0;
+    } else {
+        return NSZeroRect;
     }
-    if (hit.kind == CHFDEBUG_UVI_HIT_CELL && hit.index >= 0) {
-        const int row = hit.index / CHFDEBUG_UVI_COLS, col = hit.index % CHFDEBUG_UVI_COLS;
-        chfdebug_uvi_cell cells[CHFDEBUG_UVI_COLS * CHFDEBUG_UVI_MAX_ROWS];
-        const int rows = chfdebug_uvi_cells(_dbg, cells);
-        *box = NSMakeRect(32 + col * 8, _uvi.first_line + row * _uvi.cell_height, 8, _uvi.cell_height);
-        if (row < rows) {
-            const chfdebug_uvi_cell *c = &cells[hit.index];
-            return [NSString stringWithFormat:@"Cell row %d col %d: code $%02X glyph $%02X%s fg %s bg %s", row, col,
-                    c->code, c->glyph, c->graphics ? " (block graphics)" : "",
-                    chfdebug_uvi_colour_name(c->fg), chfdebug_uvi_colour_name(c->bg)];
-        }
-    }
-    return nil;
+    return NSMakeRect(x * CELL_W * s, y * CELL_H * s, CELL_W * s, CELL_H * s);
+}
+
+/* The cell under a picture pixel, or NO. */
+- (BOOL)cellAtX:(int)x y:(int)y row:(int *)row col:(int *)col
+{
+    if (x < 0 || y < 0) return NO;
+    return chfdebug_video_hit(_dbg, [self viewKind], x, y, [self scale], row, col) >= 0;
+}
+
+/* Three lines about a VRAM cell: where it is and whether the TV shows it, its
+ * value, palette and colour, and who wrote it last. */
+static NSString *cellText(chfdebug *dbg, int row, int col)
+{
+    chfdebug_vram_cell c;
+    if (chfdebug_vram_cell_get(dbg, row, col, &c) < 0) return [NSString stringWithFormat:@"row %d col %d", row, col];
+    NSMutableString *s = [NSMutableString stringWithFormat:@"Row %d, column %d: ", c.row, c.col];
+    if (c.visible) [s appendString:@"visible on the TV"];
+    else [s appendFormat:@"hidden (%@)", c.hidden_why ? nsstr(c.hidden_why) : @"outside the picture"];
+    [s appendFormat:@"\nvalue %d   palette %d (%@)   pen %d, %@  #%06X", c.value, c.palette,
+        nsstr(chfdebug_palette_name(c.palette)), c.pen, nsstr(chfdebug_colour_name(c.pen)), c.rgb & 0xffffff];
+    if (c.last_pc >= 0)
+        [s appendFormat:@"\n%u writes; the last by PC $%04X in frame %u, line %d, cycle %llu (it was %d)",
+            c.writes, c.last_pc & 0xffff, c.last_frame, c.last_line, (unsigned long long)c.last_cycle, c.last_old];
+    else
+        [s appendFormat:@"\n%u writes; never written since the debugger attached", c.writes];
+    return s;
 }
 
 - (void)hoverX:(int)x y:(int)y
 {
-    if (x < 0 || y < 0) {
-        _hover.stringValue = @"Point at the picture: what is drawn under the pointer is named here and outlined";
-        _pic.highlight = NSZeroRect;
-        return;
+    _hx = x;
+    _hy = y;
+    [self updateCells];
+}
+
+- (void)clickX:(int)x y:(int)y clicks:(int)clicks
+{
+    int row, col;
+    if (![self cellAtX:x y:y row:&row col:&col]) {
+        _pinRow = _pinCol = -1;
+    } else {
+        _pinRow = row;
+        _pinCol = col;
+        if (clicks >= 2) {
+            /* break on writes to the cell */
+            const uint16_t cell = (uint16_t)(row * CHFDEBUG_VRAM_COLS + col);
+            const int id = chfdebug_breakpoint_add(_dbg, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, cell, cell, "");
+            _pinned.stringValue = id >= 0
+                ? [NSString stringWithFormat:@"Breakpoint #%d: stop on writes to row %d, column %d.", id, row, col]
+                : @"Could not set the breakpoint.";
+            return;
+        }
     }
-    chfdebug_hit hits[8];
-    chfdebug_uvi_get(_dbg, &_uvi);
-    const int n = chfdebug_uvi_hit_test(_dbg, x, y, hits, 8);
+    [self updateCells];
+}
+
+/* The hover and pinned readouts, and the outline round the cell. */
+- (void)updateCells
+{
+    int row, col;
     NSRect box = NSZeroRect;
-    NSString *what = n > 0 ? [self describeHit:hits[0] box:&box] : nil;
-    if (!what) {
-        _hover.stringValue = [NSString stringWithFormat:@"(%d, %d): nothing drawn here", x, y];
-        _pic.highlight = NSZeroRect;
-        return;
+    if ([self cellAtX:_hx y:_hy row:&row col:&col]) {
+        _hover.stringValue = cellText(_dbg, row, col);
+        box = [self rectOfRow:row col:col];
+    } else {
+        _hover.stringValue = @"Point at the picture to read a cell; click pins it, double-click breaks on writes to it";
     }
-    _hover.stringValue = [NSString stringWithFormat:@"(%d, %d)  %@%@", x, y, what,
-                          n > 1 ? [NSString stringWithFormat:@"   (+%d more here)", n - 1] : @""];
+    if (_pinRow >= 0) {
+        _pinned.stringValue = [@"Pinned: " stringByAppendingString:cellText(_dbg, _pinRow, _pinCol)];
+        if (NSIsEmptyRect(box)) box = [self rectOfRow:_pinRow col:_pinCol];
+    } else {
+        _pinned.stringValue = @"";
+    }
     _pic.highlight = box;
 }
 
-/* ---- refreshing -------------------------------------------------------------------------------- */
-
-- (NSInteger)section
-{
-    return [_sections indexOfTabViewItem:_sections.selectedTabViewItem];
-}
-
-- (void)refreshPicture
+- (void)drawPicture
 {
     int w = 0, h = 0;
-    if (chfdebug_uvi_view(_dbg, (int)_viewSel.indexOfSelectedItem, [self layers], [self overlays], 1,
-                          _px, PX_CAP, &w, &h) && w > 0 && h > 0)
-        [_pic setImage:ChfNewImage(_px, w, h)];
-}
-
-- (void)refreshBeam
-{
-    _beam.stringValue = [NSString stringWithFormat:@"%s   beam line %d of %d (character row %d)   %s",
-                         _uvi.lines == 312 ? "PAL" : "NTSC", _uvi.line, _uvi.lines, _uvi.charline,
-                         _uvi.vblank ? "vertical blank (SENSE)" : "drawing"];
-}
-
-/* The 8 UVI colours, read off the palette strip. */
-- (void)loadPalette
-{
-    int w = 0, h = 0;
-    if (!chfdebug_uvi_view(_dbg, CHFDEBUG_UVI_PALETTE, 0, 0, 1, _px, PX_CAP, &w, &h) || w < 8 || h < 1) return;
-    const int cell = w / 8;
-    for (int c = 0; c < 8; c++)
-        _pal[c] = _px[(size_t)(h / 2) * (size_t)w + (size_t)(c * cell + cell / 2)];
-    _palLoaded = YES;
-}
-
-/* One object's image as an NSImage, or nil. */
-- (NSImage *)thumbForObject:(int)index
-{
-    int w = 0, h = 0;
-    if (!chfdebug_uvi_thing(_dbg, CHFDEBUG_UVI_OBJECT, index, 2, 0x00101010u, _objPx, OBJ_CAP, &w, &h) ||
-        w <= 0 || h <= 0)
-        return nil;
-    CGImageRef img = ChfNewImage(_objPx, w, h);
-    if (!img) return nil;
-    NSImage *im = [[NSImage alloc] initWithCGImage:img size:NSMakeSize(w, h)];
-    CGImageRelease(img);
-    return im;
-}
-
-- (void)refreshObjects
-{
-    NSMutableArray<ChfObjectRow *> *rows = [NSMutableArray array];
-    ChfObjectRow *head = [[ChfObjectRow alloc] init];
-    head.heading = @"Objects (position $18F0-$18F7, colours $19F8-$19F9 and the size flags; image in UDC $38-$3B)";
-    [rows addObject:head];
-    for (int i = 0; i < 4; i++) {
-        const chfdebug_uvi_object *o = &_uvi.obj[i];
-        ChfObjectRow *r = [[ChfObjectRow alloc] init];
-        r.thumb = [self thumbForObject:i];
-        r.line1 = [NSString stringWithFormat:@"Object %d  x %4d  y %4d  colour %d (%s)  %s  UDC $%02X  %s", i, o->x, o->y,
-                   o->colour, chfdebug_uvi_colour_name(o->colour), o->double_height ? "8x16" : "8x8 ", o->udc,
-                   o->visible ? "visible" : "off screen"];
-        r.line2 = [NSString stringWithFormat:@"X $%02X Y $%02X  image %02X %02X %02X %02X %02X %02X %02X %02X  hits: chars %s objects $%X",
-                   o->reg_x, o->reg_y, o->shape[0], o->shape[1], o->shape[2], o->shape[3], o->shape[4], o->shape[5],
-                   o->shape[6], o->shape[7], o->hits_chars ? "yes" : "no", (unsigned)o->hits_objects];
-        [rows addObject:r];
+    if (!chfdebug_video_view(_dbg, [self viewKind], [self flags], [self scale], _px, PX_CAP, &w, &h)) {
+        [_pic setImage:NULL];
+        return;
     }
-    _objects.rows = rows;
+    [_pic setImage:ChfNewImage(_px, w, h)];
 }
 
-- (void)refreshScreen
+/* ---- the sections ------------------------------------------------------------------------- */
+
+static NSString *hexBits(unsigned v)
 {
-    if (!_palLoaded) [self loadPalette];
-    chfdebug_uvi_cell cells[CHFDEBUG_UVI_COLS * CHFDEBUG_UVI_MAX_ROWS];
-    const int rows = chfdebug_uvi_cells(_dbg, cells);
-    _screenNote.stringValue = [NSString stringWithFormat:
-        @"%d rows of 16, cells %d lines tall, first line %d, fine scroll %d px. %@%@%@",
-        rows, _uvi.cell_height, _uvi.first_line, _uvi.shift,
-        _uvi.multicolor ? @"Multicolor: each character carries its own colour bits. " : @"One character colour for the screen. ",
-        _uvi.block_graphics ? @"Block graphics from the top. " : @"",
-        _uvi.two_screens ? @"Two screens ($1800 and $1A00)." : @""];
-
-    NSFont *font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    NSMutableAttributedString *out = [[NSMutableAttributedString alloc] init];
-    NSDictionary *plain = @{ NSFontAttributeName: font, NSForegroundColorAttributeName: NSColor.secondaryLabelColor };
-    for (int row = 0; row < rows; row++) {
-        [out appendAttributedString:[[NSAttributedString alloc]
-            initWithString:[NSString stringWithFormat:@"%2d  ", row] attributes:plain]];
-        for (int col = 0; col < CHFDEBUG_UVI_COLS; col++) {
-            const chfdebug_uvi_cell *c = &cells[row * CHFDEBUG_UVI_COLS + col];
-            NSMutableDictionary *a = [NSMutableDictionary dictionaryWithObjectsAndKeys:font, NSFontAttributeName, nil];
-            a[NSForegroundColorAttributeName] = colorFromXrgb(_pal[c->fg & 7]);
-            a[NSBackgroundColorAttributeName] = colorFromXrgb(_pal[c->bg & 7]);
-            if (c->graphics) a[NSUnderlineStyleAttributeName] = @(NSUnderlineStyleSingle);
-            [out appendAttributedString:[[NSAttributedString alloc]
-                initWithString:[NSString stringWithFormat:@"%02X", c->code] attributes:a]];
-            [out appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:plain]];
-        }
-        [out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:plain]];
-    }
-    if (rows == 0)
-        [out appendAttributedString:[[NSAttributedString alloc]
-            initWithString:@"(the machine is not running)\n" attributes:plain]];
-    [_screen.textStorage setAttributedString:out];
+    return [NSString stringWithFormat:@"$%02X %%%c%c%c%c%c%c%c%c", v & 0xff,
+            (v & 0x80) ? '1' : '0', (v & 0x40) ? '1' : '0', (v & 0x20) ? '1' : '0', (v & 0x10) ? '1' : '0',
+            (v & 0x08) ? '1' : '0', (v & 0x04) ? '1' : '0', (v & 0x02) ? '1' : '0', (v & 0x01) ? '1' : '0'];
 }
 
-- (void)refreshRegisters
+- (void)refreshPorts:(const chfdebug_video *)v
 {
-    /* 768 decoded lines is a lot of locking for a running machine: twice a second there */
-    const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!chfdebug_is_stopped(_dbg) && now - _regsAt < 0.5) return;
-    _regsAt = now;
-    NSMutableString *s = [NSMutableString stringWithCapacity:0x300 * 64];
-    for (unsigned off = 0; off < 0x300; off++) {
-        char name[64], text[160];
-        name[0] = text[0] = '\0';
-        chfdebug_uvi_describe(_dbg, off, name, sizeof name, text, sizeof text);
-        [s appendFormat:@"$%04X  %02X  %-14s %s\n", 0x1800 + off, _uvi.reg[off], name, text];
-    }
-    ChfSetTextKeepingPlace(_regs, s);
+    static const char *const kModes[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
+    NSMutableString *s = [NSMutableString string];
+    [s appendString:@"The CPU's output latches (raw), their complements, and what they mean\n\n"];
+    [s appendFormat:@"port 0  %@   complement %@\n", hexBits(v->port0), hexBits((unsigned)~v->port0)];
+    [s appendFormat:@"        write strobe %s   hand controllers %s   panel latch $%X\n",
+        v->strobe ? "UP" : "down", v->controllers_enabled ? "enabled" : "off", v->panel_latch & 0xf];
+    [s appendFormat:@"port 1  %@   complement %@\n", hexBits(v->port1), hexBits((unsigned)~v->port1)];
+    [s appendFormat:@"        the next strobe writes colour value %d\n", v->value];
+    [s appendFormat:@"port 4  %@   complement %@\n", hexBits(v->port4), hexBits((unsigned)~v->port4)];
+    [s appendFormat:@"        column %d\n", v->col];
+    [s appendFormat:@"port 5  %@   complement %@\n", hexBits(v->port5), hexBits((unsigned)~v->port5)];
+    [s appendFormat:@"        row %d   beeper %s (mode %d)\n\n", v->row,
+        kModes[v->sound_mode >= 0 && v->sound_mode < 4 ? v->sound_mode : 0], v->sound_mode];
+    [s appendString:@"What the CPU would read now (the pins, then the latch)\n\n"];
+    [s appendFormat:@"port 0  %@\nport 1  %@\nport 4  %@\nport 5  %@\n\n", hexBits(v->in0), hexBits(v->in1),
+        hexBits(v->in4), hexBits(v->in5)];
+    [s appendFormat:@"%s: line %d of %d, cycle %d of %d, frame %u\n", v->is_pal ? "PAL" : "NTSC", v->line,
+        v->lines, v->cycle_in_line, v->cycles_per_line, v->frame];
+    [s appendFormat:@"VRAM writes: %u this frame so far; %u in the last whole one, %u of them changed a cell\n",
+        v->strobes_frame, v->strobes_last, v->changes_last];
+    ChfSetTextKeepingPlace(_ports, s);
 }
 
-/* A click on a register line fills the edit fields from it. */
-- (void)pickRegister:(int)line
+- (void)refreshWrites:(const chfdebug_video *)v
 {
-    if (line < 0 || line >= 0x300) return;
-    _regAddr.stringValue = [NSString stringWithFormat:@"$%04X", 0x1800 + line];
-    _regVal.stringValue = [NSString stringWithFormat:@"$%02X", _uvi.reg[line]];
+    static chfdebug_vram_write w[WRITES_MAX];
+    chfdebug_vram_filter f;
+    f.row0 = parseInt(_rowFrom.stringValue, 0);
+    f.row1 = parseInt(_rowTo.stringValue, CHFDEBUG_VRAM_ROWS - 1);
+    f.col0 = parseInt(_colFrom.stringValue, 0);
+    f.col1 = parseInt(_colTo.stringValue, CHFDEBUG_VRAM_COLS - 1);
+    f.changes_only = _changesOnly.state == NSControlStateValueOn;
+    f.this_frame = _thisFrame.state == NSControlStateValueOn;
+    f.palette_cols = _palCols.state == NSControlStateValueOn;
+    const int n = chfdebug_vram_writes(_dbg, &f, w, WRITES_MAX);
+
+    _counts.stringValue = [NSString stringWithFormat:
+        @"Writes per frame: %u so far this frame, %u in the last (%u changed a cell). Showing the newest %d.",
+        v->strobes_frame, v->strobes_last, v->changes_last, n];
+    const BOOL follow = ChfTextAtEnd(_writes);
+    NSMutableString *s = [NSMutableString stringWithString:@"frame  line      cycle  PC     cell (row,col)  old -> new\n"];
+    for (int i = 0; i < n; i++)
+        [s appendFormat:@"%5u %5d %10llu  $%04X  (%2d,%3d)        %d -> %d\n", w[i].frame, w[i].line,
+            (unsigned long long)w[i].cycle, w[i].pc, w[i].row, w[i].col, w[i].old, w[i].value];
+    if (n == 0) [s appendString:@"(no VRAM writes match; the log fills while the debugger is attached)\n"];
+    ChfSetLogText(_writes, s, follow);
 }
 
-/* The engine takes the write running or stopped; a running program may
- * simply write the register again, so the hint says to stop first. The
- * address is the CPU's ($1800-$1AFF) or the register file's ($000-$2FF). */
-- (void)writeRegister:(id)sender
+- (void)clearWrites:(id)sender
 {
     (void)sender;
-    long off = 0, val = 0;
-    if (!parseHex(_regAddr.stringValue, &off) || !parseHex(_regVal.stringValue, &val)) {
-        _regNote.stringValue = @"Needs a register ($1800-$1AFF, or $000-$2FF) and a value (hex)";
-        return;
-    }
-    if (off >= 0x1800) off -= 0x1800;
-    if (off < 0 || off >= 0x300) {
-        _regNote.stringValue = @"Needs a register ($1800-$1AFF, or $000-$2FF) and a value (hex)";
-        return;
-    }
-    chfdebug_uvi_write(_dbg, (unsigned)off, (uint8_t)val);
-    _regNote.stringValue = [NSString stringWithFormat:@"$%04lX = $%02lX", 0x1800 + off, val & 0xff];
-    _regsAt = 0;
+    chfdebug_vram_writes_clear(_dbg);
     [self refresh];
-}
-
-- (void)refreshControl
-{
-    NSMutableString *s = [NSMutableString string];
-    const chfdebug_uvi *c = &_uvi;
-    [s appendFormat:@"BEAM          line %d of %d, character row %d, %s\n", c->line, c->lines, c->charline,
-        c->vblank ? "vertical blank" : "drawing"];
-    [s appendFormat:@"SCREEN        first line %d ($18FC), fine scroll %d ($18FE bits 5-7), %d rows of %d lines\n",
-        c->first_line, c->shift, c->rows, c->cell_height];
-    [s appendFormat:@"  multicolor %s ($18FD bit 7)   two screens %s ($19F8 bit 6)   block graphics %s ($19F8 bit 7)\n",
-        c->multicolor ? "on" : "off", c->two_screens ? "on" : "off", c->block_graphics ? "on" : "off"];
-    [s appendFormat:@"  pots %s ($19F9 bit 6 %s)\n\n", c->pot_y ? "read the other axis (mux)" : "read the first axis",
-        c->pot_y ? "clear" : "set"];
-
-    [s appendFormat:@"COLOURS       screen %d (%s)  character %d (%s)  ($19F9)\n", c->screen_colour,
-        chfdebug_uvi_colour_name(c->screen_colour), c->char_colour, chfdebug_uvi_colour_name(c->char_colour)];
-    [s appendFormat:@"              alternate screen %d (%s)  character %d (%s)  ($19F8)\n\n", c->alt_screen_colour,
-        chfdebug_uvi_colour_name(c->alt_screen_colour), c->alt_char_colour,
-        chfdebug_uvi_colour_name(c->alt_char_colour)];
-
-    [s appendFormat:@"COLLISIONS    $19FC objects x characters = $%02X, a 0 bit is a hit\n", c->coll_chars];
-    for (int i = 0; i < 4; i++)
-        if (!((c->coll_chars >> i) & 1u)) [s appendFormat:@"  object %d hit the character screen\n", i];
-    [s appendFormat:@"              $19FD object pairs = $%02X, a 0 bit is a hit\n", c->coll_objects];
-    static const char *const pairs[6] = { "0-1", "0-2", "0-3", "1-2", "1-3", "2-3" };
-    for (int i = 0; i < 6; i++)
-        if (!((c->coll_objects >> i) & 1u)) [s appendFormat:@"  objects %s overlap\n", pairs[i]];
-    [s appendString:@"\n"];
-
-    [s appendFormat:@"SOUND         pitch divider %d ($18FD bits 0-6)   volume %d/7 ($18FE bits 0-2)\n",
-        c->sound_pitch, c->sound_volume];
-    [s appendFormat:@"              tone %s ($18FE bit 3)   noise %s ($18FE bit 4)\n\n",
-        c->sound_tone ? "on" : "off", c->sound_noise ? "on" : "off"];
-
-    [s appendFormat:@"POTS          $19FF (disc 1) = $%02X   $19FE (disc 2) = $%02X\n", c->pot[0], c->pot[1]];
-    [s appendString:@"KEYPADS       $1900-$1907:"];
-    for (int i = 0; i < 8; i++) [s appendFormat:@" %02X", c->pad[i]];
-    [s appendFormat:@"\nPANEL         $1908 = $%02X  START %d  OPTION %d  SELECT %d\n", c->panel, c->panel & 1,
-        (c->panel >> 1) & 1, (c->panel >> 2) & 1];
-    ChfSetTextKeepingPlace(_control, s);
-}
-
-- (void)refreshSheets
-{
-    int w = 0, h = 0;
-    if (chfdebug_uvi_view(_dbg, CHFDEBUG_UVI_FONT, 0, 0, 3, _px, PX_CAP, &w, &h) && w > 0 && h > 0)
-        [_fontPic setImage:ChfNewImage(_px, w, h)];
-    if (chfdebug_uvi_view(_dbg, CHFDEBUG_UVI_OBJECTS, 0, 0, 3, _px, PX_CAP, &w, &h) && w > 0 && h > 0)
-        [_objPic setImage:ChfNewImage(_px, w, h)];
-    if (chfdebug_uvi_view(_dbg, CHFDEBUG_UVI_PALETTE, 0, 0, 2, _px, PX_CAP, &w, &h) && w > 0 && h > 0)
-        [_palPic setImage:ChfNewImage(_px, w, h)];
-    [self loadPalette];
 }
 
 - (void)refresh
 {
-    chfdebug_uvi_get(_dbg, &_uvi);
-    [self refreshPicture];
-    [self refreshBeam];
-    switch ([self section]) {
-    case SECTION_OBJECTS: [self refreshObjects]; break;
-    case SECTION_SCREEN:  [self refreshScreen]; break;
-    case SECTION_REGS:    [self refreshRegisters]; break;
-    case SECTION_CONTROL: [self refreshControl]; break;
-    case SECTION_SHEETS:  [self refreshSheets]; break;
-    default: break;
+    chfdebug_video v;
+    memset(&v, 0, sizeof v);
+    chfdebug_video_get(_dbg, &v);
+    [self drawPicture];
+    [self updateCells];
+    switch ([_sections indexOfTabViewItem:_sections.selectedTabViewItem]) {
+    case SECTION_PALETTES:
+        [_strip setVideo:&v];
+        [_table setVideo:&v];
+        break;
+    case SECTION_PORTS:
+        [self refreshPorts:&v];
+        break;
+    case SECTION_WRITES:
+        [self refreshWrites:&v];
+        break;
+    default:
+        break;
     }
 }
 @end

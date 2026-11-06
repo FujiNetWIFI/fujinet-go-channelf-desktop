@@ -1,5 +1,5 @@
 /*
- * MSDOSHelpWindow -- see HelpWindow.h.
+ * ChfHelpWindow -- see HelpWindow.h.
  *
  * The topics in a sidebar, with a search that lists every section having
  * all the words typed; the topic in a text view, as an attributed string
@@ -32,7 +32,7 @@ static NSString *str(const char *s)
     return r ? r : @"";
 }
 
-void MSDOSSetHelpContext(NSWindow *window, NSString *context)
+void ChfSetHelpContext(NSWindow *window, NSString *context)
 {
     if (window) objc_setAssociatedObject(window, &kContextKey, context, OBJC_ASSOCIATION_COPY_NONATOMIC);
 }
@@ -44,21 +44,21 @@ static NSString *contextOf(NSWindow *window)
 }
 
 /* A button's target is weak: the button keeps this one. */
-@interface MSDOSHelpTarget : NSObject
+@interface ChfHelpTarget : NSObject
 @property (nonatomic, copy) NSString *context;
 - (void)help:(NSButton *)sender;
 @end
 
-@implementation MSDOSHelpTarget
+@implementation ChfHelpTarget
 - (void)help:(NSButton *)sender
 {
-    [[MSDOSHelpWindow shared] showAt:self.context ? self.context : contextOf(sender.window)];
+    [[ChfHelpWindow shared] showAt:self.context ? self.context : contextOf(sender.window)];
 }
 @end
 
-NSButton *MSDOSHelpButton(NSString *context)
+NSButton *ChfHelpButton(NSString *context)
 {
-    MSDOSHelpTarget *target = [[MSDOSHelpTarget alloc] init];
+    ChfHelpTarget *target = [[ChfHelpTarget alloc] init];
     target.context = context;
     NSButton *b = [[NSButton alloc] initWithFrame:NSZeroRect];
     b.bezelStyle = NSBezelStyleHelpButton;
@@ -72,11 +72,11 @@ NSButton *MSDOSHelpButton(NSString *context)
 }
 
 /* Command+F finds. */
-@interface MSDOSHelpPanelWindow : NSWindow
+@interface ChfHelpPanelWindow : NSWindow
 @property (nonatomic, copy) void (^onFind)(void);
 @end
 
-@implementation MSDOSHelpPanelWindow
+@implementation ChfHelpPanelWindow
 - (BOOL)performKeyEquivalent:(NSEvent *)e
 {
     const NSEventModifierFlags mods = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask &
@@ -90,12 +90,12 @@ NSButton *MSDOSHelpButton(NSString *context)
 }
 @end
 
-@interface MSDOSHelpWindow () <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextViewDelegate,
+@interface ChfHelpWindow () <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextViewDelegate,
                                NSSearchFieldDelegate, NSSplitViewDelegate>
 @end
 
-@implementation MSDOSHelpWindow {
-    MSDOSHelpPanelWindow *_window;
+@implementation ChfHelpWindow {
+    ChfHelpPanelWindow *_window;
     NSView *_side;
     NSSearchField *_search;
     NSTableView *_list;
@@ -108,11 +108,11 @@ NSButton *MSDOSHelpButton(NSString *context)
     BOOL _searching, _filling;
 }
 
-+ (MSDOSHelpWindow *)shared
++ (ChfHelpWindow *)shared
 {
-    static MSDOSHelpWindow *help;
+    static ChfHelpWindow *help;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ help = [[MSDOSHelpWindow alloc] init]; });
+    dispatch_once(&once, ^{ help = [[ChfHelpWindow alloc] init]; });
     return help;
 }
 
@@ -298,7 +298,7 @@ static NSMutableParagraphStyle *paraStyle(CGFloat before, CGFloat after, CGFloat
         _query = [query copy];
         [_text.textStorage setAttributedString:[self page]];
     }
-    __weak MSDOSHelpWindow *weakSelf = self;
+    __weak ChfHelpWindow *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf scrollToBlock]; });
 }
 
@@ -460,7 +460,7 @@ static NSMutableParagraphStyle *paraStyle(CGFloat before, CGFloat after, CGFloat
 - (void)buildWindow
 {
     const NSRect frame = NSMakeRect(0, 0, 980, 720);
-    _window = [[MSDOSHelpPanelWindow alloc]
+    _window = [[ChfHelpPanelWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
@@ -471,7 +471,7 @@ static NSMutableParagraphStyle *paraStyle(CGFloat before, CGFloat after, CGFloat
     _window.tabbingMode = NSWindowTabbingModeDisallowed;
     _window.minSize = NSMakeSize(560, 360);
     _window.delegate = self;
-    __weak MSDOSHelpWindow *weakSelf = self;
+    __weak ChfHelpWindow *weakSelf = self;
     _window.onFind = ^{ [weakSelf showFor:nil]; };
 
     NSSplitView *split = [[NSSplitView alloc] initWithFrame:frame];
@@ -613,7 +613,7 @@ static NSMutableParagraphStyle *paraStyle(CGFloat before, CGFloat after, CGFloat
     [self showAt:[@"?" stringByAppendingString:searchString]];
 }
 
-/* MSDOS_HELP_SCREENSHOT: the window as it looks */
+/* CHF_HELP_SCREENSHOT: the window as it looks */
 - (BOOL)savePng:(NSString *)path
 {
     NSView *v = _window.contentView;

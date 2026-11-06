@@ -32,8 +32,9 @@
   <!-- .chf is the Channel F cartridge dump's own extension, so the app owns
        it. A raw .bin is every other machine's too: the app takes it as an
        alternate (listed in Finder's Open With, never the default), as it does
-       .rom and a zip holding one cartridge image. No UTI is invented for any
-       of them: Launch Services matches by extension. -->
+       a zip holding one cartridge image. (.rom is the BIOS's extension, not a
+       cartridge's: a dropped BIOS is imported, so it is not listed.) No UTI
+       is invented for any of them: Launch Services matches by extension. -->
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
@@ -45,7 +46,7 @@
       <string>Owner</string>
       <key>CFBundleTypeExtensions</key>
       <array>
-        <string>arc</string>
+        <string>chf</string>
       </array>
     </dict>
     <dict>
@@ -58,7 +59,6 @@
       <key>CFBundleTypeExtensions</key>
       <array>
         <string>bin</string>
-        <string>rom</string>
       </array>
     </dict>
     <dict>

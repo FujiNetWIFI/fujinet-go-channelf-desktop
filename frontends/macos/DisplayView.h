@@ -10,9 +10,10 @@
 
 @interface ChfDisplayView : NSView
 - (instancetype)initWithSession:(chfsession *)session;
-/* YES: the 192x262 picture at the television's 4:3 (setting "aspect" 0, the
- * default); NO: square pixels. */
-- (void)setTvAspect:(BOOL)tv;
+/* The shape the 204x232 picture is shown at: chfsession_display_aspect for
+ * this machine (the TV's 4:3, setting "aspect" 0, the default; or square
+ * pixels, 1). Call again when the machine changes. */
+- (void)setMachine:(int)machine squarePixels:(BOOL)square;
 - (void)setSmooth:(BOOL)smooth;
 /* Starts or stops the frame clock to match whether the window can be seen
  * (on screen, not occluded, not miniaturized, the app not hidden). It follows

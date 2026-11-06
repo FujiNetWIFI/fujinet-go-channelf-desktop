@@ -21,7 +21,9 @@ M5  [x] debugger engine (F8, VRAM/palettes/ports, write log, beam view)
 M6  [x] frontends: GNOME, KDE, Windows, macOS
 M7  [x] A/B campaign (F8, machine, sound, Videocarts, apps: tools/ab/README.md),
         live FujiNet (embedded and external), screenshots, README, COMPLIANCE
-M8  [ ] CI green, v0.1.0, ROM scan, publish, Flatpak remote, fujinet-go-web
+M8  [x] CI green, v0.1.0 (2026-11-06, pinned to the fork bake 31f38886f),
+        ROM scan (1,929 files clean), published, Flatpak remote, fujinet-go-web
+M9  [ ] after fujinet-config #375 and the bake PR merge: re-pin master, 0.1.1
 
 NOT VERIFIED
   - macOS frontend: written without a Mac; CI is its first compile

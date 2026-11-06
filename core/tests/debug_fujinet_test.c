@@ -183,6 +183,10 @@ int main(void)
     }
 
     check(wait_trace(d, 0, 15000, pk, &n), "CONFIG's exchanges with the external FujiNet are in the trace");
+    for (int waited = 0; n < 2 && waited < 15000; waited += 20) {   /* the reply may lag the request */
+        sleep_ms(20);
+        n = chfdebug_fujinet_trace(d, pk, FUJITRACE_MAX);
+    }
     check(n >= 2 && !pk[0].to_host && pk[0].device >= 0 && pk[0].text[0], "the first is a request from the Channel F");
     if (n)
         printf("      %d packets, first '%s'\n", n, pk[0].text);

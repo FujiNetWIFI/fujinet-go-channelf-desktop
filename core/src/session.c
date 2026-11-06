@@ -521,6 +521,9 @@ static int power_cycle(struct chfsession *s, const char *cart_path)
 
     chfdebug_before_power_cycle(s);
     chf_host_stop();
+    /* held until the debugger's hook is in, so an open window stops the
+     * machine on its first instruction */
+    chf_host_lock();
     rc = host_up(s, cart_path);
     if (rc != 0 && cart_path) {
         /* whatever was running is gone: put CONFIG back */
@@ -530,6 +533,7 @@ static int power_cycle(struct chfsession *s, const char *cart_path)
         snprintf(s->last_error, sizeof s->last_error, "%s", err);
     }
     chfdebug_after_power_cycle(s);
+    chf_host_unlock();
     return rc;
 }
 
@@ -613,15 +617,18 @@ int chfsession_start(chfsession *s, const chfsession_start_opts *opts)
     /* A remembered cartridge that no longer loads (moved, an image the
      * console cannot take, a game whose BIOS has gone) must not leave the app
      * unbootable: fall back to CONFIG and say why. */
+    chf_host_lock();                    /* see power_cycle */
     if (host_up(s, s->opts.cart_path) != 0) {
         if (s->opts.cart_path) {
             fprintf(stderr, "chf: %s: %s; booting CONFIG\n", s->cart_path, s->last_error);
             set_cart(s, NULL);
             if (host_up(s, NULL) != 0) {
+                chf_host_unlock();
                 fujinet_stop(s);
                 return -1;
             }
         } else {
+            chf_host_unlock();
             fujinet_stop(s);
             return -1;
         }
@@ -629,6 +636,7 @@ int chfsession_start(chfsession *s, const chfsession_start_opts *opts)
 
     s->running = 1;
     chfdebug_after_power_cycle(s);
+    chf_host_unlock();
 
     if (s->opts.enable_gamepad && gamepad_start(s) != 0) {
         fprintf(stderr, "chf: gamepads unavailable (%s)\n", s->last_error);

@@ -12,13 +12,13 @@
 #include <QWidget>
 
 /* Shows the Help at id: a heading's slug or a context ("debugger/cpu",
- * "prefs/Storage"), or "?words" to search; empty stays where it was. home
+ * "prefs/Machine"), or "?words" to search; empty stays where it was. home
  * is the main window it belongs to. */
-void msdosHelpShow(QWidget *home, const QString &id);
+void chfHelpShow(QWidget *home, const QString &id);
 
-/* Opens the Help for what window shows: its "msdosHelpContext" property
+/* Opens the Help for what window shows: its "chfHelpContext" property
  * (or, in the Help, finds). */
-void msdosHelpFor(QWidget *window);
+void chfHelpFor(QWidget *window);
 
 /* A Help button: opens context, or with an empty one its window's. */
-QAbstractButton *msdosHelpButton(const QString &context);
+QAbstractButton *chfHelpButton(const QString &context);

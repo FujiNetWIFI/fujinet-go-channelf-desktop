@@ -9,7 +9,10 @@
 
 set(CMAKE_AUTOMOC ON)
 
-# Qt 6.7 for QRhiWidget (the GPU display); ShaderTools bakes its shaders.
+# Qt 6.7 for QRhiWidget (the GPU display); ShaderTools bakes its shaders. The
+# display's QRhi types come from GuiPrivate, which ties the build to this Qt:
+# that is known, so its configure-time notice is switched off.
+set(QT_NO_PRIVATE_MODULE_WARNING ON)
 find_package(Qt6 6.7 COMPONENTS Widgets Network GuiPrivate ShaderTools QUIET)
 if(NOT Qt6_FOUND)
   message(STATUS "kde frontend: Qt6 Widgets not found -- skipping")
@@ -34,8 +37,10 @@ add_executable(fujinet-go-channelf-kde
   FujiNetWindows.cpp
   controllers/ControllersWindow.cpp
   debugger/DebuggerWindow.cpp
+  debugger/CpuTab.cpp
   debugger/VideoTab.cpp
   debugger/ChipTabs.cpp
+  help/HelpWindow.cpp
 )
 target_link_libraries(fujinet-go-channelf-kde PRIVATE chf_session Qt6::Widgets Qt6::GuiPrivate Qt6::Network)
 # The display's shaders, baked for every backend and embedded as resources.

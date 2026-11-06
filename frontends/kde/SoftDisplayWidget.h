@@ -23,7 +23,7 @@ public:
     ~SoftDisplayWidget() override;
 
     QWidget *widget() override { return this; }
-    void setTvAspect(bool tv) override;
+    void setAspect(int num, int den) override;
     void setSmooth(bool smooth) override;
 
 protected:
@@ -43,6 +43,6 @@ private:
     QImage m_scratch;          /* FB_WIDTH x FB_HEIGHT, filled by copy_frame */
     uint64_t m_serial = 0;
     bool m_haveFrame = false;
-    bool m_tvAspect = true;
+    double m_aspect = 4.0 / 3.0;
     bool m_smooth = false;
 };

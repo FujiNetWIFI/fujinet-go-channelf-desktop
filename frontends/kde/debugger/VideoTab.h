@@ -1,13 +1,13 @@
 /*
- * The debugger's Video tab: everything the 2637 UVI knows.
+ * The debugger's Video tab: everything the Channel F's video knows.
  *
- * Left, the picture the chip draws -- the last frame, the registers
- * re-rendered with the layers and overlays you choose, or the frame as far as
- * the beam has got -- at 2x with nearest-neighbour scaling, and what is under
- * the pointer. Right, the chip in sections: the four objects with their
- * positions and rendered bitmaps, the 16 x 13 (or 26) character screen with
- * its colours, every register $1800-$1AFF decoded (editable), the control,
- * collision and sound state, and the glyph, object and palette sheets.
+ * Left, the picture in the view you choose -- the last frame, the VRAM as it
+ * is now, what a CRT shows (the beam), the whole 128 x 64 VRAM, its raw values
+ * or the four palettes -- at a chosen scale with the overlays you tick, and
+ * the cell under the pointer (click to pin it, double-click to break on
+ * writes to it). Right, in sections: the cell in full, the row palette strip
+ * and the 4 x 4 palette table, the four ports (raw, complemented, decoded and
+ * as the CPU would read them now) and the VRAM write log with its filters.
  *
  * Refreshed by the debugger window: live while the machine runs (at most ten
  * times a second) and on every stop, only while this tab shows.
@@ -20,68 +20,73 @@
 #include <QImage>
 #include <QWidget>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "chfdebug.h"
 
-class BitsWidget;
-class CharScreen;
 class QCheckBox;
 class QComboBox;
 class QLabel;
 class QPlainTextEdit;
+class QPushButton;
+class QSpinBox;
 class QTabWidget;
 class QTableWidget;
-class UviImage;
+class RowStrip;
+class VideoImage;
 
 class VideoTab : public QWidget {
 public:
-    VideoTab(chfdebug *debugger, QWidget *parent = nullptr);
-    /* Pulls the chip's state and redraws what shows. */
+    explicit VideoTab(chfdebug *debugger, QWidget *parent = nullptr);
+    /* Pulls the video's state and redraws what shows. */
     void refresh();
+
+    std::function<void(const QString &)> onMessage;
 
 private:
     QWidget *buildLeft();
-    QWidget *buildObjects();
-    QWidget *buildScreen();
-    QWidget *buildRegisters();
-    QWidget *buildControl();
-    QWidget *buildSheets();
+    QWidget *buildCell();
+    QWidget *buildPalettes();
+    QWidget *buildPorts();
+    QWidget *buildLog();
 
     void refreshPicture();
-    void refreshObjects();
-    void refreshScreen();
-    void refreshRegisters();
-    void refreshControl();
-    void refreshSheets();
+    void refreshCell();
+    void refreshPalettes();
+    void refreshPorts();
+    void refreshLog();
     void hover(int x, int y);
-    QPixmap thingPixmap(int kind, int index, int scale);
-    QPixmap viewPixmap(int view, int maxWidth);
-    void loadPalette();
-    unsigned layers() const;
+    void click(int x, int y);
+    void doubleClick(int x, int y);
+    bool hitAt(int x, int y, int *row, int *col);
+    QRect cellRect(int row, int col) const;
+    QString cellReadout(int row, int col);
     unsigned overlays() const;
+    int view() const;
+    int scale() const;
 
     chfdebug *m_dbg;
-    chfdebug_uvi m_uvi;
+    chfdebug_video m_v;
     std::vector<uint32_t> m_px;
-    uint32_t m_pal[8] = {};           /* the 8 colours, XRGB */
 
-    QComboBox *m_view = nullptr;
-    QCheckBox *m_layer[2] = {};
-    QCheckBox *m_overlay[4] = {};
-    UviImage *m_image = nullptr;
+    QComboBox *m_view = nullptr, *m_scale = nullptr;
+    QCheckBox *m_overlay[8] = {};
+    VideoImage *m_image = nullptr;
     QLabel *m_hover = nullptr;
-    QLabel *m_beam = nullptr;
     QTabWidget *m_sections = nullptr;
 
-    QTableWidget *m_objects = nullptr;
-    CharScreen *m_screen = nullptr;
-    QPlainTextEdit *m_screenText = nullptr;
-    QTableWidget *m_regs = nullptr;
-    bool m_regsFilling = false;
-    std::vector<char> m_regHot = std::vector<char>(0x300, 0);   /* changed at the last look */
-    QPlainTextEdit *m_ctlText = nullptr;
-    BitsWidget *m_collChars = nullptr;
-    BitsWidget *m_collObjects = nullptr;
-    QLabel *m_fontSheet = nullptr, *m_shapeSheet = nullptr, *m_paletteSheet = nullptr;
+    int m_hoverRow = -1, m_hoverCol = -1;
+    int m_pinRow = -1, m_pinCol = -1;
+    QPlainTextEdit *m_cellText = nullptr;
+
+    QTableWidget *m_palTable = nullptr;
+    RowStrip *m_strip = nullptr;
+    QTableWidget *m_ports = nullptr;
+    QLabel *m_portNote = nullptr;
+
+    QSpinBox *m_row0 = nullptr, *m_row1 = nullptr, *m_col0 = nullptr, *m_col1 = nullptr;
+    QCheckBox *m_changesOnly = nullptr, *m_thisFrame = nullptr, *m_palCols = nullptr;
+    QLabel *m_logCounts = nullptr;
+    QPlainTextEdit *m_logText = nullptr;
 };

@@ -8,14 +8,18 @@
 
 #include <QColor>
 #include <QDesktopServices>
+#include <QDialogButtonBox>
 #include <QFont>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
+
+#include "help/HelpWindow.h"
 
 QColor chfAccentColor()
 {
@@ -31,6 +35,11 @@ QColor chfAccentDarkColor()
                   CHFSESSION_ACCENT_DARK_RGB & 0xff);
 }
 
+QColor chfAccentInk()
+{
+    return QColor(0x1B, 0x16, 0x00);
+}
+
 QColor chfAccentTextColor(const QWidget *w)
 {
     /* a light theme is one whose window background is light */
@@ -40,7 +49,7 @@ QColor chfAccentTextColor(const QWidget *w)
 
 QString chfAccentFill()
 {
-    return QStringLiteral("background: %1; color: #1b1b1b;").arg(chfAccentColor().name());
+    return QStringLiteral("background: %1; color: %2;").arg(chfAccentColor().name(), chfAccentInk().name());
 }
 
 void fujinet_log_show(QWidget *parent, chfsession *session)
@@ -63,9 +72,18 @@ void fujinet_log_show(QWidget *parent, chfsession *session)
     mono.setStyleHint(QFont::TypeWriter);
     view->setFont(mono);
 
+    /* Help, and F1 for it */
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Help);
+    buttons->setContentsMargins(8, 0, 8, 8);
+    QWidget *w = win;
+    QObject::connect(buttons, &QDialogButtonBox::helpRequested, w, [w] { chfHelpFor(w); });
+    new QShortcut(QKeySequence(Qt::Key_F1), w, [w] { chfHelpFor(w); });
+    win->setProperty("chfHelpContext", QStringLiteral("fujilog"));
+
     auto *layout = new QVBoxLayout(win);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(view);
+    layout->addWidget(buttons);
 
     auto *timer = new QTimer(win);
     auto refresh = [view, session]() {

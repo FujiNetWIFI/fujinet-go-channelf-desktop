@@ -29,7 +29,7 @@ SoftDisplayWidget::~SoftDisplayWidget()
     m_feed->setActive(false);
 }
 
-void SoftDisplayWidget::setTvAspect(bool tv) { m_tvAspect = tv; update(); }
+void SoftDisplayWidget::setAspect(int num, int den) { m_aspect = den > 0 ? (double)num / den : 4.0 / 3.0; update(); }
 void SoftDisplayWidget::setSmooth(bool smooth) { m_smooth = smooth; update(); }
 
 void SoftDisplayWidget::updateActive()
@@ -85,5 +85,5 @@ void SoftDisplayWidget::paintEvent(QPaintEvent *)
     if (!m_haveFrame) return;
 
     p.setRenderHint(QPainter::SmoothPixmapTransform, m_smooth);
-    p.drawImage(displayRect(QSizeF(size()), m_tvAspect), m_image);
+    p.drawImage(displayRect(QSizeF(size()), m_aspect), m_image);
 }

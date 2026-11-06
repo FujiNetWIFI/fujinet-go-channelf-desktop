@@ -415,7 +415,7 @@ bool HelpWindow::eventFilter(QObject *obj, QEvent *e)
 
 } // namespace
 
-void msdosHelpShow(QWidget *home, const QString &id)
+void chfHelpShow(QWidget *home, const QString &id)
 {
     if (!g_help) {
         QWidget *root = home;
@@ -431,18 +431,18 @@ void msdosHelpShow(QWidget *home, const QString &id)
     g_help->activateWindow();
 }
 
-void msdosHelpFor(QWidget *window)
+void chfHelpFor(QWidget *window)
 {
     QWidget *w = window ? window->window() : nullptr;
     if (g_help && w == g_help) {
         g_help->findFocus();
         return;
     }
-    const QString ctx = w ? w->property("msdosHelpContext").toString() : QString();
-    msdosHelpShow(w, ctx.isEmpty() ? QStringLiteral("main") : ctx);
+    const QString ctx = w ? w->property("chfHelpContext").toString() : QString();
+    chfHelpShow(w, ctx.isEmpty() ? QStringLiteral("main") : ctx);
 }
 
-QAbstractButton *msdosHelpButton(const QString &context)
+QAbstractButton *chfHelpButton(const QString &context)
 {
     auto *b = new QToolButton;
     b->setIcon(QIcon::fromTheme(QStringLiteral("help-contents"), QIcon::fromTheme(QStringLiteral("help-browser"))));
@@ -453,9 +453,9 @@ QAbstractButton *msdosHelpButton(const QString &context)
     b->setFocusPolicy(Qt::NoFocus);
     QObject::connect(b, &QToolButton::clicked, b, [b, context] {
         if (context.isEmpty())
-            msdosHelpFor(b->window());
+            chfHelpFor(b->window());
         else
-            msdosHelpShow(b->window(), context);
+            chfHelpShow(b->window(), context);
     });
     return b;
 }

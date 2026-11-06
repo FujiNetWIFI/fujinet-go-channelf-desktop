@@ -25,10 +25,10 @@ public:
     explicit MainWindow(chfsession *session, QWidget *parent = nullptr);
 
     /* Starts the session with the saved settings: FujiNet first, then the
-     * machine.  */
+     * machine. A start that fails for want of the BIOS offers the import. */
     void start();
-    /* A dropped (or command-line) file: a cartridge is opened, anything else
-     * is copied to FujiNet's SD folder. */
+    /* A dropped (or command-line) file: a BIOS is imported, a cartridge is
+     * opened, anything else is copied to FujiNet's SD folder. */
     void loadMedia(const QString &path);
     /* A second launch hands over to this window: raise it, and open what it
      * was asked to. */
@@ -55,6 +55,8 @@ private:
     void placeToast();
 
     void openCart(const QString &path);
+    void importToSd();
+    void openSdFolder();
     void toggleControllers();
     void useSoftwareDisplay();
     void applyPicture();
@@ -62,6 +64,13 @@ private:
     void restartSession();
     void showAbout();
     void openAtLaunch();
+
+    /* the BIOS */
+    void importRoms(bool folder, const QString &path = QString());
+    bool importAndApply(bool folder, const QString &path, std::function<void()> retry);
+    void checkNeedsBios(bool force);
+    void needsBiosAlert(const QString &title, const QString &why, std::function<void()> retry,
+                        std::function<void()> fallback);
 
     chfsession *m_session;
     DisplayView *m_display = nullptr;
@@ -79,4 +88,6 @@ private:
     QAction *m_resetAction = nullptr;
     unsigned m_padGen = 0;
     bool m_sysactDown[CHF_SYSACT_COUNT] = {};
+    bool m_needsBiosShown = false;
+    bool m_alertOpen = false;
 };

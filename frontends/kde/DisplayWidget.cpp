@@ -37,7 +37,7 @@ DisplayWidget::~DisplayWidget()
     m_feed->setActive(false);
 }
 
-void DisplayWidget::setTvAspect(bool tv) { m_tvAspect = tv; update(); }
+void DisplayWidget::setAspect(int num, int den) { m_aspect = den > 0 ? (double)num / den : 4.0 / 3.0; update(); }
 void DisplayWidget::setSmooth(bool smooth) { m_smooth = smooth; update(); }
 
 /* ---- idle ------------------------------------------------------------------
@@ -192,7 +192,7 @@ void DisplayWidget::render(QRhiCommandBuffer *cb)
     }
 
     const QSize px = renderTarget()->pixelSize();
-    const QRectF r = displayRect(QSizeF(px), m_tvAspect);
+    const QRectF r = displayRect(QSizeF(px), m_aspect);
 
     /* pixel rect -> clip space (y up), then through the backend's correction
      * so Vulkan's flipped y comes out the right way up */

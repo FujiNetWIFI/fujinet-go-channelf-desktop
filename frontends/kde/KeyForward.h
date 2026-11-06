@@ -22,5 +22,5 @@ uint32_t chfKeysymFromQt(const QKeyEvent *e);
 /* The app's own keys: F9 (Controllers), F11 (fullscreen) and F12
  * (Debugger). They are never sent to the console and cannot be bound. The
  * menus' Ctrl shortcuts are not listed: Qt takes those before a key event
- * exists, and a bare Ctrl (Right Ctrl is Player 1's fire) is the console's. */
+ * exists, and a bare Ctrl is the console's. */
 bool chfIsAppKey(const QKeyEvent *e);

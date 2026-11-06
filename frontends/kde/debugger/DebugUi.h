@@ -17,6 +17,22 @@
 
 namespace dbgui {
 
+/* $0400, 0x0400, 400h, #1024; a bare number is hex, as everywhere in a
+ * debugger. */
+inline bool parseNum(const QString &t, long *out)
+{
+    QString s = t.trimmed();
+    bool ok = false;
+    long v = 0;
+    if (s.startsWith(QLatin1Char('$'))) v = s.mid(1).toLong(&ok, 16);
+    else if (s.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive)) v = s.mid(2).toLong(&ok, 16);
+    else if (s.startsWith(QLatin1Char('#'))) v = s.mid(1).toLong(&ok, 10);
+    else if (s.endsWith(QLatin1Char('h'), Qt::CaseInsensitive)) v = s.chopped(1).toLong(&ok, 16);
+    else v = s.toLong(&ok, 16);
+    if (ok) *out = v;
+    return ok;
+}
+
 inline QFont monoFont(const QFont &base)
 {
     QFont f = base;
@@ -56,6 +72,18 @@ inline bool editing(QAbstractItemView *v)
 }
 
 inline QString yesNo(int v) { return v ? QStringLiteral("yes") : QStringLiteral("no"); }
+
+/* A byte as eight binary digits, "%10110010". */
+inline QString bin8(unsigned v)
+{
+    return QStringLiteral("%") + QStringLiteral("%1").arg(v & 0xFF, 8, 2, QLatin1Char('0'));
+}
+
+/* A colour (XRGB) as "#RRGGBB". */
+inline QString rgbText(uint32_t v)
+{
+    return QStringLiteral("#%1").arg(v & 0xFFFFFF, 6, 16, QLatin1Char('0')).toUpper();
+}
 
 /* Whether a view's reader is at its end (a log then follows new lines). */
 inline bool atEnd(QPlainTextEdit *v)

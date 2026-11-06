@@ -12,6 +12,8 @@
 #include "MainWindow.h"
 
 #include <QApplication>
+#include <QDesktopServices>
+#include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
@@ -34,6 +36,7 @@
 #include "SoftDisplayWidget.h"
 #include "controllers/ControllersWindow.h"
 #include "debugger/DebuggerWindow.h"
+#include "help/HelpWindow.h"
 
 namespace {
 
@@ -46,6 +49,16 @@ bool envOn(const char *name)
 {
     const QByteArray v = qgetenv(name);
     return !v.isEmpty() && v[0] != '0';
+}
+
+/* An action whose key works from every window of the app (the Controllers
+ * window and the Debugger have the keyboard too). */
+QAction *appShortcut(QWidget *owner, QAction *a, const QKeySequence &key)
+{
+    a->setShortcut(key);
+    a->setShortcutContext(Qt::ApplicationShortcut);
+    owner->addAction(a);
+    return a;
 }
 
 /* A status line that elides instead of widening the window. */
@@ -63,12 +76,28 @@ protected:
     }
 };
 
+/* A refusal with a Help button that opens the topic that explains it. */
+void warnWithHelp(QWidget *parent, const QString &title, const QString &text, const QString &helpContext)
+{
+    QMessageBox box(QMessageBox::Warning, title, text, QMessageBox::Ok, parent);
+    QPushButton *help = box.addButton(QStringLiteral("Help"), QMessageBox::HelpRole);
+    box.exec();
+    if (box.clickedButton() == help) chfHelpShow(parent, helpContext);
+}
+
+int machineSetting(chfsession *s)
+{
+    const int m = chfsession_get_int(s, "machine", CHF_MACHINE_CHANNELF);
+    return m >= 0 && m < CHF_MACHINE_COUNT ? m : CHF_MACHINE_CHANNELF;
+}
+
 } // namespace
 
 MainWindow::MainWindow(chfsession *session, QWidget *parent)
     : QMainWindow(parent), m_session(session)
 {
     setWindowTitle(QStringLiteral("FujiNet Go Channel F"));
+    setProperty("chfHelpContext", QStringLiteral("main"));
     /* 4:3 at 972 x 729, and the chrome */
     resize(972, 729 + 60);
     setAcceptDrops(true);
@@ -119,9 +148,20 @@ MainWindow::MainWindow(chfsession *session, QWidget *parent)
 
 void MainWindow::start()
 {
-    if (chfsession_start(m_session, nullptr) != 0)
-        QMessageBox::warning(this, QStringLiteral("Cannot Start the Console"),
-                             local(chfsession_last_error(m_session)));
+    if (chfsession_start(m_session, nullptr) != 0) {
+        const QString why = local(chfsession_last_error(m_session));
+        if (why.contains(QStringLiteral("BIOS"))) {
+            /* the saved cartridge is a game and the BIOS is gone: import it, or
+             * go on without the cartridge */
+            needsBiosAlert(QStringLiteral("Cannot Start the Console"), why, [this] { start(); },
+                           [this] {
+                               chfsession_set_str(m_session, "cart", "");
+                               start();
+                           });
+        } else {
+            QMessageBox::warning(this, QStringLiteral("Cannot Start the Console"), why);
+        }
+    }
     updateStatus();
     syncMenus();
     openAtLaunch();
@@ -144,7 +184,7 @@ void MainWindow::openAtLaunch()
 void MainWindow::buildMenus()
 {
     QMenu *machine = menuBar()->addMenu(QStringLiteral("&Machine"));
-    machine->addAction(QStringLiteral("&Open Cartridge..."), QKeySequence(Qt::CTRL | Qt::Key_O), this, [this] {
+    machine->addAction(QStringLiteral("&Open Cartridge…"), QKeySequence(Qt::CTRL | Qt::Key_O), this, [this] {
         const QString f = QFileDialog::getOpenFileName(this, QStringLiteral("Open Cartridge"), QString(),
                                                        QString::fromUtf8(kCartFilter));
         if (!f.isEmpty()) openCart(f);
@@ -153,20 +193,14 @@ void MainWindow::buildMenus()
         if (chfsession_eject(m_session) != 0)
             QMessageBox::warning(this, QStringLiteral("Eject failed"), local(chfsession_last_error(m_session)));
         else
-            toast(QStringLiteral("Cartridge ejected: back to the FujiNet CONFIG client"));
+            toast(QStringLiteral("Cartridge ejected: back to the FujiNet CONFIG"));
         updateStatus();
     });
-    machine->addAction(QStringLiteral("&Import Cartridge to SD..."), this, [this] {
-        const QString f = QFileDialog::getOpenFileName(this, QStringLiteral("Import Cartridge to SD"), QString(),
-                                                       QString::fromUtf8(kCartFilter));
-        if (f.isEmpty()) return;
-        char dest[1024];
-        if (chfsession_import_cart_to_sd(m_session, f.toLocal8Bit().constData(), dest, sizeof dest) != 0)
-            QMessageBox::warning(this, QStringLiteral("Import failed"), local(chfsession_last_error(m_session)));
-        else
-            toast(QStringLiteral("%1 is on the SD host: boot it from the CONFIG client")
-                      .arg(QFileInfo(local(dest)).fileName()));
-    });
+    machine->addAction(QStringLiteral("&Import Cartridge to SD…"), this, &MainWindow::importToSd);
+    machine->addAction(QStringLiteral("Open &SD Folder"), this, &MainWindow::openSdFolder);
+    machine->addSeparator();
+    machine->addAction(QStringLiteral("Import &BIOS…"), this, [this] { importRoms(false); });
+    machine->addAction(QStringLiteral("Import BIOS from a &Folder…"), this, [this] { importRoms(true); });
     machine->addSeparator();
     m_pauseAction = machine->addAction(QStringLiteral("&Pause"));
     m_pauseAction->setCheckable(true);
@@ -185,12 +219,12 @@ void MainWindow::buildMenus()
         if (chfsession_reset_to_config(m_session) != 0)
             QMessageBox::warning(this, QStringLiteral("Reset failed"), local(chfsession_last_error(m_session)));
         else
-            toast(QStringLiteral("Back to the FujiNet CONFIG client"));
+            toast(QStringLiteral("Back to the FujiNet CONFIG"));
         updateStatus();
     });
     connect(machine, &QMenu::aboutToShow, this, &MainWindow::syncMenus);
     machine->addSeparator();
-    machine->addAction(QStringLiteral("P&references..."), QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
+    machine->addAction(QStringLiteral("P&references…"), QKeySequence(Qt::CTRL | Qt::Key_Comma), this,
                        &MainWindow::showSettings);
     machine->addSeparator();
     machine->addAction(QStringLiteral("&Quit"), QKeySequence::Quit, this, [this] { close(); });
@@ -220,13 +254,13 @@ void MainWindow::buildMenus()
     });
 
     QMenu *fuji = menuBar()->addMenu(QStringLiteral("&FujiNet"));
-    fuji->addAction(QStringLiteral("&Web UI"), this, [this] {
+    fuji->addAction(QStringLiteral("FujiNet &Web UI"), this, [this] {
         if (chfsession_fujinet_external(m_session)) {
             toast(QStringLiteral("FujiNet is external: use its own web UI"));
             return;
         }
         if (!chfsession_fujinet_running(m_session)) {
-            toast(QStringLiteral("FujiNet is off (Preferences > FujiNet)"));
+            toast(QStringLiteral("FujiNet is off (Preferences ▸ FujiNet)"));
             return;
         }
         fujinet_config_show(this, m_session);
@@ -240,6 +274,12 @@ void MainWindow::buildMenus()
     });
 
     QMenu *help = menuBar()->addMenu(QStringLiteral("&Help"));
+    connect(appShortcut(this, help->addAction(QStringLiteral("FujiNet Go Channel F &Help")),
+                        QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_H)),
+            &QAction::triggered, this, [this] {
+        chfHelpFor(QApplication::activeWindow() ? QApplication::activeWindow() : this);
+    });
+    help->addSeparator();
     help->addAction(QStringLiteral("&About FujiNet Go Channel F"), this, &MainWindow::showAbout);
     syncMenus();
 }
@@ -260,13 +300,12 @@ void MainWindow::showAbout()
 {
     QMessageBox::about(this, QStringLiteral("About FujiNet Go Channel F"),
         QStringLiteral("<b>FujiNet Go Channel F</b> %1<br><br>"
-                       "The Fairchild Channel F (and its Bandai and Hanimex-style clones), with a "
-                       "built-in FujiNet.<br><br>"
-                       "The emulator is MAME's Channel F -- the Signetics 2650 CPU and the 2637 "
-                       "UVI video and sound chip (Peter Trauner, Wilbert Pol, Couriersud, Miodrag "
-                       "Milanovic, Juergen Buchmueller and the MAME team) -- transposed to C. The FujiNet firmware "
-                       "and the cartridge are by Thomas Cherryhomes and the FujiNet "
-                       "contributors (GPL-3.0-or-later).<br><br>"
+                       "The Fairchild Channel F with a built-in FujiNet cartridge.<br><br>"
+                       "The console is MAME's Channel F (the driver by Juergen Buchmueller, Frank Palazzolo "
+                       "and Sean Riddle; the F8 processor and the cartridge slot by Juergen Buchmueller and "
+                       "the MAME team), transposed to C. The FujiNet firmware and the cartridge are by "
+                       "Thomas Cherryhomes and the FujiNet contributors (GPL-3.0-or-later). No BIOS or other "
+                       "copyrighted ROM is part of the app.<br><br>"
                        "Copyright &copy; 2026 Thomas Cherryhomes -- GPL-3.0-or-later<br>"
                        "<a href=\"https://fujinet.online/\">fujinet.online</a> &middot; "
                        "<a href=\"https://github.com/FujiNetWIFI/fujinet-go-channelf-desktop/issues\">"
@@ -299,7 +338,9 @@ void MainWindow::applyPicture()
 {
     const bool tv = chfsession_get_int(m_session, "aspect", 0) == 0;
     const bool smooth = chfsession_get_int(m_session, "smooth", 0) != 0;
-    m_display->setTvAspect(tv);
+    int num = 4, den = 3;
+    chfsession_display_aspect(machineSetting(m_session), tv ? 0 : 1, &num, &den);
+    m_display->setAspect(num, den);
     m_display->setSmooth(smooth);
     if (m_tvAction) m_tvAction->setChecked(tv);
     if (m_smoothAction) m_smoothAction->setChecked(smooth);
@@ -310,10 +351,19 @@ void MainWindow::applyPicture()
 void MainWindow::restartSession()
 {
     if (chfsession_restart(m_session) != 0) {
-        QMessageBox::warning(this, QStringLiteral("Restart failed"), local(chfsession_last_error(m_session)));
+        const QString why = local(chfsession_last_error(m_session));
+        if (why.contains(QStringLiteral("BIOS")))
+            needsBiosAlert(QStringLiteral("Restart failed"), why, [this] { restartSession(); },
+                           [this] {
+                               chfsession_set_str(m_session, "cart", "");
+                               restartSession();
+                           });
+        else
+            QMessageBox::warning(this, QStringLiteral("Restart failed"), why);
     } else {
         toast(QStringLiteral("Machine options applied (power cycled)"));
     }
+    applyPicture();
     chfControllersRefresh();
     updateStatus();
     syncMenus();
@@ -330,6 +380,7 @@ void MainWindow::tick()
 {
     drainSysactions();
     if (++m_ticks % 3 == 0) pollGamepads();
+    if (m_ticks % 5 == 0) checkNeedsBios(false);
     if (m_ticks % 10 == 0) updateStatus();
 }
 
@@ -344,7 +395,7 @@ void MainWindow::runSysaction(int sa)
     switch (sa) {
     case CHF_SYSACT_RESET_CONFIG:
         chfsession_sysaction(m_session, sa);
-        toast(QStringLiteral("Back to the FujiNet CONFIG client"));
+        toast(QStringLiteral("Back to the FujiNet CONFIG"));
         updateStatus();
         break;
     case CHF_SYSACT_DEBUG_STOP:
@@ -380,6 +431,7 @@ void MainWindow::updateStatus()
         else if (!chfsession_cart_booted_game(m_session))
             text = QStringLiteral("CONFIG — %1").arg(text);
         if (chfsession_is_paused(m_session)) text = QStringLiteral("Paused — %1").arg(text);
+        if (chfsession_needs_bios(m_session)) text = QStringLiteral("Needs BIOS — %1").arg(text);
     }
     m_status->setText(text);
     m_status->setToolTip(text);
@@ -415,23 +467,148 @@ void MainWindow::resizeEvent(QResizeEvent *e)
     if (m_toast->isVisible()) placeToast();
 }
 
+/* ---- the BIOS ---------------------------------------------------------------- */
+
+/* The "Needs BIOS" alert: what is missing and why, with Import BIOS…, Help and
+ * Not Now. After an import `retry` runs (the thing that was refused, again);
+ * Not Now runs `fallback`. Not exec(): this can run from the timer, and a
+ * nested event loop would run it again. */
+void MainWindow::needsBiosAlert(const QString &title, const QString &why, std::function<void()> retry,
+                                std::function<void()> fallback)
+{
+    if (m_alertOpen) return;
+    m_alertOpen = true;
+    auto *box = new QMessageBox(QMessageBox::Information, title,
+                                QStringLiteral("This needs the console's BIOS"), QMessageBox::NoButton, this);
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setInformativeText(QStringLiteral("%1\n\nThe BIOS is not part of this app. Import your own copy (a file, a "
+                                           "zip such as MAME's channelf.zip, or a folder) and the console runs it.")
+                                .arg(why));
+    QPushButton *import = box->addButton(QStringLiteral("Import BIOS…"), QMessageBox::AcceptRole);
+    QPushButton *help = box->addButton(QStringLiteral("Help"), QMessageBox::HelpRole);
+    box->addButton(QStringLiteral("Not Now"), QMessageBox::RejectRole);
+    box->setDefaultButton(import);
+    connect(box, &QMessageBox::buttonClicked, this, [this, import, help, retry, fallback](QAbstractButton *b) {
+        m_alertOpen = false;
+        if (b == help) {
+            chfHelpShow(this, QStringLiteral("nobios"));
+        } else if (b == import) {
+            importAndApply(false, QString(), retry);
+        } else if (fallback) {
+            fallback();
+        }
+    });
+    connect(box, &QDialog::finished, this, [this] { m_alertOpen = false; });
+    box->open();
+}
+
+void MainWindow::importRoms(bool folder, const QString &path)
+{
+    importAndApply(folder, path, nullptr);
+}
+
+/* Import, then power-cycle onto what was running when the BIOS had been the
+ * missing piece (so CONFIG runs on it), or run `retry`. */
+bool MainWindow::importAndApply(bool folder, const QString &path, std::function<void()> retry)
+{
+    const int machine = machineSetting(m_session);
+    const bool had = chfsession_have_bios(m_session, machine) != 0;
+    if (SettingsDialog::importRoms(this, m_session, folder, path) <= 0) return false;
+    const bool has = chfsession_have_bios(m_session, machine) != 0;
+    if (!chfsession_is_running(m_session)) {
+        start();
+    } else if (retry) {
+        retry();
+    } else if (!had && has) {
+        const QString cart = local(chfsession_cart_path(m_session));
+        const int rc = cart.isEmpty() ? chfsession_reset_to_config(m_session)
+                                      : chfsession_load_cart(m_session, cart.toLocal8Bit().constData());
+        if (rc != 0)
+            QMessageBox::warning(this, QStringLiteral("Could not restart"), local(chfsession_last_error(m_session)));
+        else
+            toast(QStringLiteral("BIOS imported: the console was power-cycled to use it"));
+    } else {
+        toast(QStringLiteral("BIOS imported: it takes effect at the next power cycle"));
+    }
+    m_needsBiosShown = false;
+    updateStatus();
+    return true;
+}
+
+/* A game met the stand-in on the network (or a FujiNet app called a BIOS
+ * routine it lacks): say so once, with the way out. Shown again only after
+ * the flag has cleared (a power cycle) and come back, or when forced. */
+void MainWindow::checkNeedsBios(bool force)
+{
+    const bool needs = chfsession_needs_bios(m_session) != 0;
+    setProperty("chfHelpContext", needs ? QStringLiteral("nobios") : QStringLiteral("main"));
+    if (!needs) {
+        m_needsBiosShown = false;
+        return;
+    }
+    if (m_needsBiosShown && !force) return;
+    m_needsBiosShown = true;
+    char why[256] = "";
+    chfsession_missing_reason(m_session, why, sizeof why);
+    needsBiosAlert(QStringLiteral("Needs BIOS"),
+                   why[0] ? local(why) : QStringLiteral("The console needs its BIOS to run this."), nullptr, nullptr);
+}
+
 /* ---- cartridges -------------------------------------------------------- */
 
 void MainWindow::openCart(const QString &path)
 {
     if (chfsession_load_cart(m_session, path.toLocal8Bit().constData()) != 0) {
-        QMessageBox::warning(this, QStringLiteral("Could not open"), local(chfsession_last_error(m_session)));
+        const QString why = local(chfsession_last_error(m_session));
+        if (why.contains(QStringLiteral("BIOS"))) {
+            m_needsBiosShown = true;
+            needsBiosAlert(QStringLiteral("Could not open"), why, [this, path] { openCart(path); }, nullptr);
+        } else {
+            QMessageBox::warning(this, QStringLiteral("Could not open"), why);
+        }
+        updateStatus();
         return;
     }
     toast(QStringLiteral("Running %1").arg(QFileInfo(path).fileName()));
     updateStatus();
 }
 
+void MainWindow::importToSd()
+{
+    const QStringList files = QFileDialog::getOpenFileNames(this, QStringLiteral("Import Cartridge to SD"), QString(),
+                                                            QString::fromUtf8(kCartFilter));
+    int n = 0;
+    QString first;
+    for (const QString &f : files) {
+        char dest[1024];
+        if (chfsession_import_cart_to_sd(m_session, f.toLocal8Bit().constData(), dest, sizeof dest) != 0) {
+            /* the FujiNet cartridge can serve only some images: the Help says which */
+            warnWithHelp(this, QStringLiteral("Import failed"),
+                         QStringLiteral("%1: %2").arg(QFileInfo(f).fileName(), local(chfsession_last_error(m_session))),
+                         QStringLiteral("import-sd"));
+            continue;
+        }
+        if (!n++) first = QFileInfo(local(dest)).fileName();
+    }
+    if (n == 1)
+        toast(QStringLiteral("%1 is on the SD host: boot it from CONFIG").arg(first));
+    else if (n > 1)
+        toast(QStringLiteral("%1 cartridges are on the SD host: boot them from CONFIG").arg(n));
+}
+
+void MainWindow::openSdFolder()
+{
+    const QString dir = local(chfsession_sd_path(m_session));
+    QDir().mkpath(dir);
+    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+}
+
 void MainWindow::loadMedia(const QString &path)
 {
     const QByteArray p = path.toLocal8Bit();
-    if (chfsession_media_is_cartridge(p.constData())) {
-        openCart(path);
+    /* a BIOS first: one may well be named .bin, as a cartridge can be */
+    if (chfsession_media_is_rom(p.constData())) {
+        importRoms(false, path);
         return;
     }
     char dest[1024];
@@ -439,7 +616,12 @@ void MainWindow::loadMedia(const QString &path)
         QMessageBox::warning(this, QStringLiteral("Import failed"), local(chfsession_last_error(m_session)));
         return;
     }
-    toast(QStringLiteral("Copied to FujiNet's SD folder: mount it from the CONFIG client"));
+    /* a cartridge is copied to the carts folder and opened from there; the
+     * rest went to FujiNet's SD folder */
+    if (chfsession_media_is_cartridge(p.constData()))
+        openCart(local(dest));
+    else
+        toast(QStringLiteral("Copied to FujiNet's SD folder: mount it from CONFIG"));
 }
 
 void MainWindow::activateFor(const QString &path)

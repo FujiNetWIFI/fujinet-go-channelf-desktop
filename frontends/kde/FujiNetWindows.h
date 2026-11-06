@@ -22,16 +22,17 @@ void fujinet_log_show(QWidget *parent, chfsession *session);
  * new tab, and both providers refuse OAuth from an embedded web view. */
 void fujinet_config_show(QWidget *parent, chfsession *session);
 
-/* The accent colour: the Channel F's power-button red. It carries WHITE text
- * (a held key, the debugger's current line, the Map target). */
+/* The accent colour: the Videocarts' yellow. It carries DARK text (a held
+ * key, the debugger's current line, the Map target). */
 QColor chfAccentColor();
-/* Its darker variant, the console's reset key: outlines and text on the
- * light themes, and the RESET cap. */
+/* Its darker variant: outlines and text in the accent on the light themes. */
 QColor chfAccentDarkColor();
+/* The text on the accent. */
+QColor chfAccentInk();
 /* The accent for TEXT (and text-like marks: the status dot, a breakpoint
- * dot): the red on a dark theme, the darker variant on a light one, where
- * the red is too strong to read as a mark. */
+ * dot): the yellow on a dark theme, the darker variant on a light one, where
+ * the yellow is too pale to read as a mark. */
 QColor chfAccentTextColor(const QWidget *w);
-/* A style sheet that fills a button (or a label) in the accent with white
+/* A style sheet that fills a button (or a label) in the accent with dark
  * text. */
 QString chfAccentFill();

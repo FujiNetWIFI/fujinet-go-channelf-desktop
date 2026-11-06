@@ -13,8 +13,8 @@ class DisplayView {
 public:
     virtual ~DisplayView() = default;
     virtual QWidget *widget() = 0;
-    /* "aspect" setting: the picture at the TV's 4:3 when true, square pixels
-     * (the raw 192:262 buffer) when false. */
-    virtual void setTvAspect(bool tv) = 0;
+    /* The shape of the picture, width : height (chfsession_display_aspect:
+     * the TV's 4:3, or square pixels for the machine). */
+    virtual void setAspect(int num, int den) = 0;
     virtual void setSmooth(bool smooth) = 0;
 };

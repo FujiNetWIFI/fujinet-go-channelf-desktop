@@ -1,8 +1,9 @@
 /*
- * Debugger window (Qt6 Widgets) over the Signetics 2650 / 2637 UVI debugger
- * engine, via core/include/chfdebug.h. Mirrors the GNOME one tab for tab:
- * Prompt, CPU & RAM, Disassembly, Video (the UVI), Sound & I/O, Breakpoints,
- * Cart, FujiNet.
+ * Debugger window (Qt6 Widgets) over the Fairchild F8 / Channel F video
+ * debugger engine, via core/include/chfdebug.h. Mirrors the other frontends
+ * tab for tab: Prompt, CPU & RAM, Disassembly, Video (the VRAM, its palettes
+ * and the four ports), Sound & I/O, Breakpoints, Cart, FujiNet; each with a
+ * Help button.
  *
  * The engine is attached while the window is shown (which stops the machine,
  * as on every sibling) and detached when it is hidden, which lets the
@@ -34,6 +35,7 @@ extern "C" {
 }
 
 class CartTab;
+class CpuTab;
 class IoTab;
 class VideoTab;
 
@@ -55,29 +57,26 @@ private:
     explicit DebuggerWindow(chfsession *session, QWidget *parent);
     QWidget *buildToolbar();
     QWidget *buildPrompt();
-    QWidget *buildCpu();
     QWidget *buildDisasm();
     QWidget *buildBreaks();
     QWidget *buildFujinet();
-    QTableWidget *hexTable(int rows);
-    QLineEdit *regEdit(int reg, int digits, const QString &tip);
 
     void refreshAll();
     void refreshTab(int index);
     void refreshStatus();
-    void refreshCpu();
-    void refreshRam();
     void refreshDisasm();
     void refreshBps();
     void refreshFujinet(bool force);
     void tick();
     void toggleRun();
+    void runToCursor();
     void runPrompt();
     void appendPrompt(const QString &text);
     void jumpTo(const QString &text);
     void stepAnd(void (*fn)(chfdebug *));
     void loadSymbols(bool fromFile);
-    void setRegister(int reg, QLineEdit *edit);
+    void addBreakpoint();
+    void note(const QString &text);
     bool addressOf(const QString &text, long *out);
 
     chfsession *m_session;
@@ -96,25 +95,15 @@ private:
     QStringList m_history;
     int m_historyPos = 0;
 
-    static constexpr int kMemRows = 24;      /* the memory view: 24 rows of 16 */
-    QLineEdit *m_reg[CHF_REG_COUNT] = {};
-    QLabel *m_bankHead[2] = {};
-    QLabel *m_rasLabel[8] = {};
-    QLabel *m_pageLabel = nullptr;
-    QCheckBox *m_state[3] = {};
-    QLabel *m_cpuInfo = nullptr;
-    QComboBox *m_memSpace = nullptr;
-    QLineEdit *m_memGo = nullptr;
-    uint32_t m_memBase = 0;
-    QTableWidget *m_hex = nullptr;
-    std::vector<uint8_t> m_hexPrev;
-    bool m_hexFilling = false;
+    CpuTab *m_cpu = nullptr;
 
     QPlainTextEdit *m_disasm = nullptr;
     QCheckBox *m_followPc = nullptr;
     QLineEdit *m_jump = nullptr;
     uint16_t m_disasmTop = 0;
     std::vector<uint16_t> m_lineAddr;
+    int m_selLine = -1;            /* the line Run to Cursor runs to */
+    int m_selAddr = -1;
 
     VideoTab *m_video = nullptr;
     IoTab *m_io = nullptr;

@@ -1,9 +1,9 @@
 /*
- * The Controllers window (F9): the console drawn like the photo -- two hand
- * controllers (disc, 12-key keypad, side fire) and the START / OPTION / SELECT
- * / RESET keys -- the gamepads with their assignments, and Map mode for
- * rebinding any key, disc direction or fire button. Hidden at start; a
- * fixed-size floating window.
+ * The Controllers window (F9): the console drawn as a player sees it -- the
+ * panel (RESET and the four numbered buttons) and both hand controllers, each
+ * as the Channel F's knob seen from above and from the side -- the gamepads
+ * with their assignments, and Map mode for rebinding any control. Hidden at
+ * start; a fixed-size floating window.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later

@@ -10,22 +10,20 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QGridLayout>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
-#include <QHelpEvent>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QPixmap>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QScrollArea>
-#include <QSplitter>
+#include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
-#include <QToolTip>
 #include <QVBoxLayout>
 #include <cstring>
-#include <functional>
 
 #include "../FujiNetWindows.h"
 #include "DebugUi.h"
@@ -34,26 +32,33 @@ using dbgui::hx;
 
 namespace {
 
-constexpr int kZoom = 2;   /* the picture is shown at 2x, nearest neighbour */
-constexpr int kCellW = 16;  /* one character cell in the Screen section: 8 pixels wide at 2x, */
-constexpr int kCellH8 = 16; /* 8 lines tall at 2x (a 16-line cell is drawn twice that) */
+/* the overlay checkboxes: label, the engine's flag, what it marks */
+const struct { const char *label; unsigned flag; const char *tip; bool on; } kOverlays[8] = {
+    { "Visible area", CHFDEBUG_F_VISIBLE, "VISIBLE: the TV's rectangle, columns 4-105 and rows 4-61 (VRAM and Values)", true },
+    { "Grid", CHFDEBUG_F_GRID, "GRID: cell borders (from scale 2)", false },
+    { "Palette columns", CHFDEBUG_F_PALCOLS, "PALCOLS: columns 125-127, where the row's palette is chosen (VRAM and Values)", false },
+    { "Beam", CHFDEBUG_F_BEAM, "BEAM: the line the beam is on", false },
+    { "Write cursor", CHFDEBUG_F_CURSOR, "CURSOR: the cell the next strobe writes (ports 4 and 5)", false },
+    { "Heat", CHFDEBUG_F_HEAT, "HEAT: cells written this frame, brighter the more", false },
+    { "Changed", CHFDEBUG_F_DIRTY, "DIRTY: cells that changed since the last frame", false },
+    { "Palette rows", CHFDEBUG_F_PALROWS, "PALROWS: a tick at the left of the rows whose palette changed this frame", false },
+};
 
-QString colourText(int c)
-{
-    return QStringLiteral("%1 %2").arg(c).arg(QString::fromUtf8(chfdebug_uvi_colour_name(c)));
-}
-
-QString shapeText(const uint8_t shape[8], int rows)
-{
-    QStringList b;
-    for (int i = 0; i < rows; ++i) b << hx(shape[i], 2);
-    return b.join(QLatin1Char(' '));
-}
+const char *const kViews[] = { "Frame", "Live", "Beam", "VRAM", "Values", "Palettes" };
+const char *const kViewTips[] = {
+    "The last frame the machine finished: what the window shows",
+    "The video RAM as it is now, drawn the same way",
+    "What a CRT shows: rows the beam has passed this frame as they were when it drew them, the rest from the last frame, dimmed",
+    "All 128 × 64 cells, the hidden columns and rows hatched",
+    "The raw values 0-3 in false colour, whatever the palettes say",
+    "The four palettes",
+};
+const char *const kSoundModes[] = { "off", "1 kHz", "500 Hz", "120 Hz" };
 
 QColor fromXrgb(uint32_t v) { return QColor((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF); }
 
-/* Sets a table cell's text (creating the item), touching it only when it
- * changed. */
+QColor inkOn(const QColor &c) { return c.lightness() > 140 ? QColor(0, 0, 0) : QColor(255, 255, 255); }
+
 void setCell(QTableWidget *t, int row, int col, const QString &text)
 {
     QTableWidgetItem *it = t->item(row, col);
@@ -65,12 +70,11 @@ void setCell(QTableWidget *t, int row, int col, const QString &text)
     if (it->text() != text) it->setText(text);
 }
 
-QTableWidget *objectTable(const QStringList &headers, int rows, int rowHeight)
+QTableWidget *plainTable(const QStringList &headers, int rows)
 {
     auto *t = new QTableWidget(rows, headers.size());
     t->setHorizontalHeaderLabels(headers);
     t->verticalHeader()->setVisible(false);
-    t->verticalHeader()->setDefaultSectionSize(rowHeight);
     t->setEditTriggers(QAbstractItemView::NoEditTriggers);
     t->setSelectionMode(QAbstractItemView::NoSelection);
     t->setFocusPolicy(Qt::NoFocus);
@@ -78,41 +82,39 @@ QTableWidget *objectTable(const QStringList &headers, int rows, int rowHeight)
     t->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     t->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     t->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    t->horizontalHeader()->setStretchLastSection(true);
-    t->setIconSize(QSize(rowHeight - 4, rowHeight - 4));
-    /* tall enough for every row, so the section scrolls, not the table */
-    t->setFixedHeight(t->horizontalHeader()->sizeHint().height() + rows * rowHeight + 4);
+    t->horizontalHeader()->setStretchLastSection(false);
+    t->setFixedHeight(t->horizontalHeader()->sizeHint().height() + rows * t->verticalHeader()->defaultSectionSize() + 6);
     return t;
 }
-
-
-const char *const kObjectBoxes[4] = { "red", "green", "blue", "orange" };
 
 } // namespace
 
 /* ---- the picture ---------------------------------------------------------------- */
 
-/* The chip's picture at 2x, nearest neighbour, with a box round the object or
- * cell under the pointer. */
-class UviImage : public QWidget {
+/* The chosen view, exactly as the engine drew it (it scales), with a box round
+ * the cell under the pointer and a second round the pinned one. */
+class VideoImage : public QWidget {
 public:
-    std::function<void(int, int)> onHover;   /* frame pixel, or -1 -1 when the pointer leaves */
+    std::function<void(int, int)> onHover;   /* a pixel, or -1 -1 when the pointer leaves */
+    std::function<void(int, int)> onClick, onDouble;
 
-    UviImage()
+    VideoImage()
     {
         setMouseTracking(true);
-        setFixedSize(CHFSESSION_FB_WIDTH * kZoom, CHFSESSION_FB_HEIGHT * kZoom);
         setCursor(Qt::CrossCursor);
+        setFixedSize(204 * 2, 232 * 2);
     }
     void setImage(const QImage &img)
     {
         m_img = img;
+        if (size() != img.size()) setFixedSize(img.size());
         update();
     }
-    void setHighlight(const QRect &r)
+    void setMarks(const QRect &hover, const QRect &pin)
     {
-        if (r == m_hl) return;
-        m_hl = r;
+        if (hover == m_hover && pin == m_pin) return;
+        m_hover = hover;
+        m_pin = pin;
         update();
     }
 
@@ -122,436 +124,301 @@ protected:
         QPainter p(this);
         p.fillRect(rect(), Qt::black);
         if (m_img.isNull()) return;
-        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-        p.drawImage(rect(), m_img);
-        if (!m_hl.isNull()) {
-            const QRect r(m_hl.x() * kZoom, m_hl.y() * kZoom, m_hl.width() * kZoom, m_hl.height() * kZoom);
-            p.setBrush(Qt::NoBrush);
-            p.setPen(QPen(Qt::black, 3));
-            p.drawRect(r.adjusted(-1, -1, 1, 1));
-            p.setPen(QPen(Qt::white, 1));
-            p.drawRect(r.adjusted(-1, -1, 1, 1));
-        }
+        p.drawImage(0, 0, m_img);
+        p.setBrush(Qt::NoBrush);
+        auto box = [&](const QRect &r, const QColor &c) {
+            if (r.isNull()) return;
+            p.setPen(QPen(Qt::black, 4));
+            p.drawRect(r.adjusted(-2, -2, 2, 2));
+            p.setPen(QPen(c, 2));
+            p.drawRect(r.adjusted(-2, -2, 2, 2));
+        };
+        box(m_hover, Qt::white);
+        box(m_pin, chfAccentColor());
     }
     void mouseMoveEvent(QMouseEvent *e) override
     {
-        if (onHover) onHover(qBound(0, (int)e->position().x() / kZoom, CHFSESSION_FB_WIDTH - 1),
-                             qBound(0, (int)e->position().y() / kZoom, CHFSESSION_FB_HEIGHT - 1));
+        if (onHover) onHover(e->position().toPoint().x(), e->position().toPoint().y());
     }
     void leaveEvent(QEvent *) override
     {
         if (onHover) onHover(-1, -1);
     }
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && onClick) onClick(e->position().toPoint().x(), e->position().toPoint().y());
+    }
+    void mouseDoubleClickEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && onDouble) onDouble(e->position().toPoint().x(), e->position().toPoint().y());
+    }
 
 private:
     QImage m_img;
-    QRect m_hl;
+    QRect m_hover, m_pin;
 };
 
-/* ---- rows of labelled bits ------------------------------------------------------------ */
+/* ---- the row palette strip ------------------------------------------------------- */
 
-/* Rows of bit cells under a header: the shift register (24 cells) and the
- * collision matrix. Bit j of a row's value is the cell at column j, or, with
- * msbFirst, at column n-1-j. */
-class BitsWidget : public QWidget {
+/* All 64 rows' palettes: each row's number, its background colour and the
+ * palette its columns 125 and 126 chose. A row whose palette changed since
+ * the last look is marked in the accent for a few looks. */
+class RowStrip : public QWidget {
 public:
-    BitsWidget(const QStringList &columns, const QStringList &rows, int cellW, bool msbFirst = false)
-        : m_cols(columns), m_rows(rows), m_cw(cellW), m_msbFirst(msbFirst), m_values(rows.size(), 0)
+    RowStrip()
     {
-        QFontMetrics fm(font());
-        for (const QString &r : rows) m_labelW = qMax(m_labelW, fm.horizontalAdvance(r) + 10);
-        m_ch = fm.height() + 8;
-        setFixedSize(m_labelW + columns.size() * m_cw + 2, (rows.size() + 1) * (m_ch + 2) + 2);
+        setFixedSize(2 * kW + 12, 32 * kH + 4);
+        memset(m_pal, 0, sizeof m_pal);
+        memset(m_age, 0, sizeof m_age);
     }
-    void set(int row, uint32_t value)
+    void set(const uint8_t pal[64], const uint32_t bg[64])
     {
-        if (m_values[(size_t)row] == value) return;
-        m_values[(size_t)row] = value;
-        update();
+        bool changed = false;
+        for (int i = 0; i < 64; ++i) {
+            if (m_have && pal[i] != m_pal[i]) m_age[i] = 12;
+            else if (m_age[i] > 0) m_age[i]--;
+            if (pal[i] != m_pal[i] || bg[i] != m_bg[i] || m_age[i] != m_shown[i]) changed = true;
+            m_pal[i] = pal[i];
+            m_bg[i] = bg[i];
+            m_shown[i] = m_age[i];
+        }
+        m_have = true;
+        if (changed) update();
     }
 
 protected:
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
-        const int n = m_cols.size();
-        p.setPen(palette().color(QPalette::Text));
-        for (int j = 0; j < n; ++j)
-            p.drawText(QRect(m_labelW + j * m_cw, 0, m_cw, m_ch), Qt::AlignCenter, m_cols[j]);
-        for (int r = 0; r < m_rows.size(); ++r) {
-            const int y = (r + 1) * (m_ch + 2);
+        QFont small = dbgui::monoFont(font());
+        small.setPointSizeF(qMax(7.0, font().pointSizeF() * 0.85));
+        p.setFont(small);
+        for (int i = 0; i < 64; ++i) {
+            const int x = 2 + (i / 32) * (kW + 4), y = 2 + (i % 32) * kH;
+            const QRect cell(x, y, kW, kH - 1);
             p.setPen(palette().color(QPalette::Text));
-            p.drawText(QRect(0, y, m_labelW - 6, m_ch), Qt::AlignRight | Qt::AlignVCenter, m_rows[r]);
-            for (int j = 0; j < n; ++j) {
-                const int bit = m_msbFirst ? n - 1 - j : j;
-                const bool on = (m_values[(size_t)r] >> bit) & 1u;
-                const QRect c(m_labelW + j * m_cw + 1, y, m_cw - 2, m_ch);
-                p.setPen(palette().color(QPalette::Mid));
-                p.setBrush(on ? chfAccentColor() : palette().color(QPalette::Base));
-                p.drawRoundedRect(c, 3, 3);
-                p.setPen(on ? QColor(0x1B, 0x14, 0x08) : palette().color(QPalette::Text));
-                p.drawText(c, Qt::AlignCenter, on ? QStringLiteral("1") : QStringLiteral("0"));
-            }
-        }
-    }
-
-private:
-    QStringList m_cols, m_rows;
-    int m_cw, m_ch = 0, m_labelW = 0;
-    bool m_msbFirst;
-    std::vector<uint32_t> m_values;
-};
-
-/* ---- the character screen ------------------------------------------------------------ */
-
-/* The 16 x 13 (or 26) character screen as the chip draws it: every cell's
- * glyph in its own colours. Hover a cell for its code. */
-class CharScreen : public QWidget {
-public:
-    CharScreen() { setMouseTracking(true); setFixedSize(CHFDEBUG_UVI_COLS * kCellW + 2, CHFDEBUG_UVI_MAX_ROWS * kCellH8 + 2); }
-    void set(const chfdebug_uvi &u, const chfdebug_uvi_cell *cells, int rows, const QColor *pal)
-    {
-        std::memcpy(m_chars, u.chars, sizeof m_chars);
-        std::memcpy(m_cells, cells, sizeof(chfdebug_uvi_cell) * (size_t)rows * CHFDEBUG_UVI_COLS);
-        for (int i = 0; i < 8; ++i) m_pal[i] = pal[i];
-        m_rows = rows;
-        m_cellH = u.cell_height >= 16 ? 2 * kCellH8 : kCellH8;
-        update();
-    }
-
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QPainter p(this);
-        p.fillRect(rect(), palette().color(QPalette::Window));
-        const qreal px = kCellW / 8.0, py = m_cellH / 8.0;
-        for (int r = 0; r < m_rows; ++r)
-            for (int c = 0; c < CHFDEBUG_UVI_COLS; ++c) {
-                const chfdebug_uvi_cell &cell = m_cells[r * CHFDEBUG_UVI_COLS + c];
-                const QRectF box(1 + c * kCellW, 1 + r * m_cellH, kCellW, m_cellH);
-                p.fillRect(box, m_pal[cell.bg & 7]);
+            p.drawText(QRect(x, y, 26, kH - 1), Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("r%1").arg(i));
+            const QRect sw(x + 30, y + 1, 96, kH - 3);
+            p.setPen(palette().color(QPalette::Mid));
+            p.setBrush(fromXrgb(m_bg[i]));
+            p.drawRect(sw);
+            p.setPen(inkOn(fromXrgb(m_bg[i])));
+            p.drawText(sw, Qt::AlignCenter, QStringLiteral("palette %1").arg(m_pal[i]));
+            if (m_age[i] > 0) {
                 p.setPen(Qt::NoPen);
-                p.setBrush(m_pal[cell.fg & 7]);
-                if (cell.graphics) {
-                    /* 2 x 3 blocks, a bit each, low bit top left */
-                    for (int b = 0; b < 6; ++b)
-                        if ((cell.code >> b) & 1)
-                            p.drawRect(QRectF(box.x() + (b & 1) * kCellW / 2.0, box.y() + (b >> 1) * m_cellH / 3.0,
-                                              kCellW / 2.0, m_cellH / 3.0));
-                } else {
-                    for (int y = 0; y < 8; ++y)
-                        for (int x = 0; x < 8; ++x)
-                            if ((m_chars[cell.glyph & 0x3F][y] >> (7 - x)) & 1)
-                                p.drawRect(QRectF(box.x() + x * px, box.y() + y * py, px, py));
-                }
+                p.setBrush(chfAccentColor());
+                p.drawEllipse(QPoint(x + 136, y + kH / 2), 4, 4);
+                p.setPen(palette().color(QPalette::Text));
+                p.drawText(QRect(x + 144, y, kW - 144, kH - 1), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("changed"));
             }
-        p.setPen(QColor(128, 128, 128, 90));
-        for (int c = 0; c <= CHFDEBUG_UVI_COLS; ++c) p.drawLine(1 + c * kCellW, 1, 1 + c * kCellW, 1 + m_rows * m_cellH);
-        for (int r = 0; r <= m_rows; ++r) p.drawLine(1, 1 + r * m_cellH, 1 + CHFDEBUG_UVI_COLS * kCellW, 1 + r * m_cellH);
-    }
-    bool event(QEvent *e) override
-    {
-        if (e->type() == QEvent::ToolTip) {
-            auto *he = static_cast<QHelpEvent *>(e);
-            const int c = (he->pos().x() - 1) / kCellW, r = (he->pos().y() - 1) / m_cellH;
-            if (c < 0 || c >= CHFDEBUG_UVI_COLS || r < 0 || r >= m_rows) {
-                QToolTip::hideText();
-                return true;
-            }
-            const chfdebug_uvi_cell &cell = m_cells[r * CHFDEBUG_UVI_COLS + c];
-            QToolTip::showText(he->globalPos(),
-                               QStringLiteral("row %1 column %2: $%3 %4, foreground %5, background %6")
-                                   .arg(r).arg(c).arg(hx(cell.code, 2),
-                                       cell.graphics ? QStringLiteral("block graphics")
-                                                     : QStringLiteral("glyph $%1").arg(hx(cell.glyph, 2)),
-                                       colourText(cell.fg), colourText(cell.bg)),
-                               this);
-            return true;
+            (void)cell;
         }
-        return QWidget::event(e);
     }
 
 private:
-    chfdebug_uvi_cell m_cells[CHFDEBUG_UVI_COLS * CHFDEBUG_UVI_MAX_ROWS] = {};
-    uint8_t m_chars[0x40][8] = {};
-    QColor m_pal[8];
-    int m_rows = 13;
-    int m_cellH = 2 * kCellH8;
+    static constexpr int kW = 220, kH = 16;
+    uint8_t m_pal[64];
+    uint32_t m_bg[64] = {};
+    uint8_t m_age[64], m_shown[64] = {};
+    bool m_have = false;
 };
 
-/* ---- the tab --------------------------------------------------------------------------- */
+/* ---- the tab ---------------------------------------------------------------------- */
 
-VideoTab::VideoTab(chfdebug *debugger, QWidget *parent)
-    : QWidget(parent), m_dbg(debugger), m_px(CHFDEBUG_UVI_VIEW_MAX_PIXELS)
+VideoTab::VideoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
 {
-    memset(&m_uvi, 0, sizeof m_uvi);
-    loadPalette();
-
-    auto *split = new QSplitter(Qt::Horizontal);
-    auto *left = new QScrollArea;
-    left->setWidget(buildLeft());
-    left->setFrameShape(QFrame::NoFrame);
-    split->addWidget(left);
-    m_sections = new QTabWidget;
-    m_sections->addTab(buildObjects(), QStringLiteral("Objects"));
-    m_sections->addTab(buildScreen(), QStringLiteral("Screen"));
-    m_sections->addTab(buildRegisters(), QStringLiteral("Registers"));
-    m_sections->addTab(buildControl(), QStringLiteral("Control/Collisions"));
-    m_sections->addTab(buildSheets(), QStringLiteral("Sheets"));
-    connect(m_sections, &QTabWidget::currentChanged, this, [this] { refresh(); });
-    split->addWidget(m_sections);
-    split->setStretchFactor(0, 0);
-    split->setStretchFactor(1, 1);
-    split->setChildrenCollapsible(false);
-    left->setMinimumWidth(CHFSESSION_FB_WIDTH * kZoom + 36);
-    m_sections->setMinimumWidth(460);
-
+    memset(&m_v, 0, sizeof m_v);
     auto *h = new QHBoxLayout(this);
-    h->setContentsMargins(0, 0, 0, 0);
-    h->addWidget(split);
-    hover(-1, -1);
-}
+    h->addWidget(buildLeft());
 
-/* The 8 colours as the chip draws them, sampled from the palette strip (one
- * cell each in a row), for the swatches and the character screen. */
-void VideoTab::loadPalette()
-{
-    for (int i = 0; i < 8; ++i) m_pal[i] = 0x808080;
-    int w = 0, h = 0;
-    if (!chfdebug_uvi_view(m_dbg, CHFDEBUG_UVI_PALETTE, CHFDEBUG_UVI_L_ALL, 0, 1, m_px.data(), m_px.size(), &w, &h)
-        || w < 8 || h < 1)
-        return;
-    const int cell = w / 8;
-    if (cell < 1) return;
-    for (int col = 0; col < 8; ++col)
-        m_pal[col] = m_px[(size_t)(h / 2) * w + col * cell + cell / 2];
+    m_sections = new QTabWidget;
+    m_sections->addTab(buildCell(), QStringLiteral("Cell"));
+    m_sections->addTab(buildPalettes(), QStringLiteral("Palettes"));
+    m_sections->addTab(buildPorts(), QStringLiteral("Ports"));
+    m_sections->addTab(buildLog(), QStringLiteral("Write log"));
+    if (qEnvironmentVariableIsSet("CHF_DEBUGGER_SECTION")) {
+        const int n = qEnvironmentVariable("CHF_DEBUGGER_SECTION").toInt();
+        if (n >= 0 && n < m_sections->count()) m_sections->setCurrentIndex(n);
+    }
+    connect(m_sections, &QTabWidget::currentChanged, this, [this] { refresh(); });
+    h->addWidget(m_sections, 1);
 }
-
-/* ---- building ------------------------------------------------------------------------------ */
 
 QWidget *VideoTab::buildLeft()
 {
     auto *w = new QWidget;
     auto *v = new QVBoxLayout(w);
-    v->setSizeConstraint(QLayout::SetFixedSize);
+    v->setContentsMargins(0, 0, 0, 0);
 
     auto *row = new QHBoxLayout;
-    row->addWidget(new QLabel(QStringLiteral("View")));
     m_view = new QComboBox;
-    m_view->addItems({ QStringLiteral("Frame (what the display shows)"),
-                       QStringLiteral("Rendered from the registers"),
-                       QStringLiteral("Frame in progress, up to the beam") });
-    m_view->setCurrentIndex(CHFDEBUG_UVI_RENDER);
-    m_view->setToolTip(QStringLiteral("Rendered re-draws the chip's registers as they are now with the layers "
-                                      "and overlays below, whatever the beam is doing; Frame is the last "
-                                      "finished frame; Frame in progress shows what the beam has drawn so far"));
-    connect(m_view, &QComboBox::currentIndexChanged, this, [this] { refresh(); });
-    row->addWidget(m_view, 1);
+    for (int i = 0; i < 6; ++i) {
+        m_view->addItem(QString::fromLatin1(kViews[i]));
+        m_view->setItemData(i, QString::fromLatin1(kViewTips[i]), Qt::ToolTipRole);
+    }
+    m_scale = new QComboBox;
+    for (int s = 1; s <= 4; ++s) m_scale->addItem(QStringLiteral("%1×").arg(s), s);
+    m_scale->setCurrentIndex(1);
+    row->addWidget(new QLabel(QStringLiteral("View")));
+    row->addWidget(m_view);
+    row->addWidget(new QLabel(QStringLiteral("Scale")));
+    row->addWidget(m_scale);
+    row->addStretch(1);
     v->addLayout(row);
 
-    static const char *const layerNames[2] = { "Character screen", "Objects" };
-    auto *lg = new QGridLayout;
-    lg->addWidget(dbgui::titleLabel(QStringLiteral("Layers")), 0, 0, 1, 2);
-    for (int i = 0; i < 2; ++i) {
-        m_layer[i] = new QCheckBox(QString::fromLatin1(layerNames[i]));
-        m_layer[i]->setChecked(true);
-        m_layer[i]->setFocusPolicy(Qt::NoFocus);
-        connect(m_layer[i], &QCheckBox::toggled, this, [this] { refresh(); });
-        lg->addWidget(m_layer[i], 1, i);
-    }
-    v->addLayout(lg);
-
-    static const struct { const char *name, *tip; bool on; } overlays[4] = {
-        { "Object boxes", "Outline every visible object (red, green, blue, orange for 0-3)", true },
-        { "Collisions", "Outline the objects that hit something in magenta", false },
-        { "Character grid", "Draw the character cells' borders", false },
-        { "Beam cross-hair", "A cross-hair where the beam is", true },
-    };
-    auto *og = new QGridLayout;
-    og->addWidget(dbgui::titleLabel(QStringLiteral("Overlays")), 0, 0, 1, 2);
-    for (int i = 0; i < 4; ++i) {
-        m_overlay[i] = new QCheckBox(QString::fromLatin1(overlays[i].name));
-        m_overlay[i]->setToolTip(QString::fromLatin1(overlays[i].tip));
-        m_overlay[i]->setChecked(overlays[i].on);
+    auto *ov = new QGridLayout;
+    for (int i = 0; i < 8; ++i) {
+        m_overlay[i] = new QCheckBox(QString::fromLatin1(kOverlays[i].label));
+        m_overlay[i]->setToolTip(QString::fromLatin1(kOverlays[i].tip));
+        m_overlay[i]->setChecked(kOverlays[i].on);
         m_overlay[i]->setFocusPolicy(Qt::NoFocus);
-        connect(m_overlay[i], &QCheckBox::toggled, this, [this] { refresh(); });
-        og->addWidget(m_overlay[i], 1 + i / 2, i % 2);
+        connect(m_overlay[i], &QCheckBox::toggled, this, [this] { refreshPicture(); });
+        ov->addWidget(m_overlay[i], i / 4, i % 4);
     }
-    v->addLayout(og);
-
-    m_image = new UviImage;
-    m_image->onHover = [this](int x, int y) { hover(x, y); };
-    v->addWidget(m_image);
-    m_hover = new QLabel;
-    m_hover->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    m_hover->setFixedWidth(CHFSESSION_FB_WIDTH * kZoom);
-    m_hover->setWordWrap(true);
-    m_hover->setMinimumHeight(m_hover->fontMetrics().lineSpacing() * 3 + 4);
-    m_hover->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    v->addWidget(m_hover);
-    m_beam = dbgui::dimLabel();
-    m_beam->setFixedWidth(CHFSESSION_FB_WIDTH * kZoom);
-    v->addWidget(m_beam);
-    v->addStretch();
-    return w;
-}
-
-QWidget *VideoTab::buildObjects()
-{
-    auto *content = new QWidget;
-    auto *v = new QVBoxLayout(content);
-    v->addWidget(dbgui::titleLabel(QStringLiteral("Objects: four 8-wide shapes (8 or 16 lines), held in the UDCs $38-$3B")));
-    m_objects = objectTable({ QStringLiteral("#"), QStringLiteral("Bitmap"), QStringLiteral("X"), QStringLiteral("Y"),
-                              QStringLiteral("Raw X,Y"), QStringLiteral("Colour"), QStringLiteral("Size"),
-                              QStringLiteral("UDC"), QStringLiteral("Hits"), QStringLiteral("State"),
-                              QStringLiteral("Shape rows") }, 4, 40);
-    v->addWidget(m_objects);
-    v->addWidget(dbgui::dimLabel(QStringLiteral("X and Y are screen pixels of the 128-pixel playfield; (0,0) is its "
-                                                "top-left and the object may sit past an edge. Hits: the "
-                                                "characters (C) and the other objects it overlaps. Shape rows "
-                                                "are the UDC bytes, bit 7 leftmost.")));
-    v->addStretch();
-
-    auto *scroll = new QScrollArea;
-    scroll->setWidget(content);
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    return scroll;
-}
-
-QWidget *VideoTab::buildScreen()
-{
-    auto *w = new QWidget;
-    auto *h = new QHBoxLayout(w);
-    auto *left = new QVBoxLayout;
-    left->addWidget(dbgui::titleLabel(QStringLiteral("Character screen: 16 columns x 13 rows (26 with two screens)")));
-    m_screen = new CharScreen;
-    left->addWidget(m_screen);
-    left->addWidget(dbgui::dimLabel(QStringLiteral("Each cell in its own colours; hover for its code. The lower "
-                                                   "screen ($1A00) shows when $19F8 bit 6 is set.")));
-    left->addStretch();
-    h->addLayout(left);
-    m_screenText = dbgui::monoView();
-    m_screenText->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-    h->addWidget(m_screenText, 1);
-    return w;
-}
-
-QWidget *VideoTab::buildRegisters()
-{
-    constexpr int kRegs = 0x300;
-    m_regs = new QTableWidget(kRegs, 4);
-    m_regs->setHorizontalHeaderLabels({ QStringLiteral("Addr"), QStringLiteral("Name"), QStringLiteral("Value"),
-                                        QStringLiteral("Decoded") });
-    m_regs->verticalHeader()->setVisible(false);
-    m_regs->verticalHeader()->setDefaultSectionSize(m_regs->fontMetrics().height() + 6);
-    m_regs->setFont(dbgui::monoFont(m_regs->font()));
-    m_regs->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_regs->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_regs->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
-    m_regs->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    m_regs->horizontalHeader()->setStretchLastSection(true);
-    m_regsFilling = true;
-    for (int off = 0; off < kRegs; ++off) {
-        for (int col = 0; col < 4; ++col) {
-            auto *it = new QTableWidgetItem;
-            if (col != 2) it->setFlags(it->flags() & ~Qt::ItemIsEditable);
-            m_regs->setItem(off, col, it);
-        }
-        m_regs->item(off, 0)->setText(QStringLiteral("$") + hx(0x1800 + off, 4));
-    }
-    m_regsFilling = false;
-    /* a store into the chip's registers, with its write effects */
-    connect(m_regs, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *it) {
-        if (m_regsFilling || it->column() != 2) return;
-        bool ok = false;
-        QString t = it->text().trimmed();
-        if (t.startsWith(QLatin1Char('$'))) t = t.mid(1);
-        const unsigned v = t.toUInt(&ok, 16);
-        if (ok && v <= 0xFF)
-            chfdebug_uvi_write(m_dbg, (unsigned)it->row(), (uint8_t)v);
+    v->addLayout(ov);
+    connect(m_view, &QComboBox::currentIndexChanged, this, [this] {
+        m_hoverRow = m_hoverCol = m_pinRow = m_pinCol = -1;
         refresh();
     });
-    return m_regs;
+    connect(m_scale, &QComboBox::currentIndexChanged, this, [this] { refresh(); });
+
+    m_image = new VideoImage;
+    m_image->onHover = [this](int x, int y) { hover(x, y); };
+    m_image->onClick = [this](int x, int y) { click(x, y); };
+    m_image->onDouble = [this](int x, int y) { doubleClick(x, y); };
+    auto *area = new QScrollArea;
+    area->setWidget(m_image);
+    area->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    area->setMinimumWidth(256 * 2 + 36);
+    v->addWidget(area, 1);
+
+    m_hover = dbgui::dimLabel();
+    m_hover->setMinimumHeight(m_hover->fontMetrics().lineSpacing() * 2 + 4);
+    m_hover->setWordWrap(true);
+    v->addWidget(m_hover);
+    return w;
 }
 
-QWidget *VideoTab::buildControl()
+QWidget *VideoTab::buildCell()
 {
     auto *w = new QWidget;
     auto *v = new QVBoxLayout(w);
-    m_ctlText = dbgui::monoView();
-    m_ctlText->setMaximumHeight(380);
-    v->addWidget(m_ctlText, 1);
-    v->addWidget(dbgui::titleLabel(QStringLiteral("Collisions: objects against characters ($19FC)")));
-    m_collChars = new BitsWidget({ QStringLiteral("obj 0"), QStringLiteral("obj 1"), QStringLiteral("obj 2"),
-                                   QStringLiteral("obj 3") },
-                                 { QStringLiteral("hit") }, 56);
-    v->addWidget(m_collChars);
-    v->addWidget(dbgui::titleLabel(QStringLiteral("Collisions: object pairs ($19FD)")));
-    m_collObjects = new BitsWidget({ QStringLiteral("0-1"), QStringLiteral("0-2"), QStringLiteral("0-3"),
-                                     QStringLiteral("1-2"), QStringLiteral("1-3"), QStringLiteral("2-3") },
-                                   { QStringLiteral("hit") }, 56);
-    v->addWidget(m_collObjects);
-    v->addWidget(dbgui::dimLabel(QStringLiteral("A hit reads as 0 in the register; lit here means a hit. The "
-                                                "registers clear when the CPU reads them.")));
-    v->addStretch();
+    m_cellText = dbgui::monoView();
+    v->addWidget(m_cellText, 1);
+    v->addWidget(dbgui::dimLabel(QStringLiteral("Hover a cell of the picture for its row, column, value, palette and "
+                                                "last write; click to pin it (click it again to let go); "
+                                                "double-click to break on writes to it (again to remove).")));
     return w;
 }
 
-QWidget *VideoTab::buildSheets()
+QWidget *VideoTab::buildPalettes()
 {
-    auto *content = new QWidget;
-    auto *v = new QVBoxLayout(content);
-    auto section = [&](const QString &title, QLabel *&label, const QString &note) {
-        v->addWidget(dbgui::titleLabel(title));
-        v->addWidget(dbgui::dimLabel(note));
-        label = new QLabel;
-        label->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-        v->addWidget(label);
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    v->addWidget(dbgui::titleLabel(QStringLiteral("The four palettes")));
+    m_palTable = plainTable({ QStringLiteral("Palette"), QStringLiteral("Value 0"), QStringLiteral("Value 1"),
+                              QStringLiteral("Value 2"), QStringLiteral("Value 3"), QStringLiteral("Rows") }, 4);
+    m_palTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    v->addWidget(m_palTable);
+    v->addWidget(dbgui::dimLabel(QStringLiteral("A row's palette is (column 126 & 2) | (column 125 >> 1), from the "
+                                                "values in its own columns 125 and 126. Rows: how many of the 64 "
+                                                "rows use it now.")));
+    v->addWidget(dbgui::titleLabel(QStringLiteral("Each row's palette")));
+    m_strip = new RowStrip;
+    auto *area = new QScrollArea;
+    area->setWidget(m_strip);
+    area->setFrameShape(QFrame::NoFrame);
+    v->addWidget(area, 1);
+    return w;
+}
+
+QWidget *VideoTab::buildPorts()
+{
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    v->addWidget(dbgui::titleLabel(QStringLiteral("The F8's four video ports")));
+    m_ports = plainTable({ QStringLiteral("Port"), QStringLiteral("Latch"), QStringLiteral("Complement"),
+                           QStringLiteral("Decoded"), QStringLiteral("CPU reads now") }, 4);
+    m_ports->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    v->addWidget(m_ports);
+    m_portNote = dbgui::dimLabel();
+    v->addWidget(m_portNote);
+    v->addStretch(1);
+    return w;
+}
+
+QWidget *VideoTab::buildLog()
+{
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    auto *f = new QGridLayout;
+    auto spin = [](int lo, int hi, int val) {
+        auto *s = new QSpinBox;
+        s->setRange(lo, hi);
+        s->setValue(val);
+        return s;
     };
-    section(QStringLiteral("Glyphs: 64 characters"), m_fontSheet,
-            QStringLiteral("The built-in set ($00-$37) and the eight user-defined characters ($38-$3F, the last "
-                           "row; the first four are the objects' images), in the character colour."));
-    section(QStringLiteral("Objects"), m_shapeSheet, QStringLiteral("The four objects' images, in their colours."));
-    section(QStringLiteral("Palette"), m_paletteSheet, QStringLiteral("The chip's eight colours."));
-    v->addStretch();
-    auto *scroll = new QScrollArea;
-    scroll->setWidget(content);
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    return scroll;
+    m_row0 = spin(0, 63, 0);
+    m_row1 = spin(0, 63, 63);
+    m_col0 = spin(0, 127, 0);
+    m_col1 = spin(0, 127, 127);
+    f->addWidget(new QLabel(QStringLiteral("Rows")), 0, 0);
+    f->addWidget(m_row0, 0, 1);
+    f->addWidget(new QLabel(QStringLiteral("to")), 0, 2);
+    f->addWidget(m_row1, 0, 3);
+    f->addWidget(new QLabel(QStringLiteral("Columns")), 1, 0);
+    f->addWidget(m_col0, 1, 1);
+    f->addWidget(new QLabel(QStringLiteral("to")), 1, 2);
+    f->addWidget(m_col1, 1, 3);
+    m_changesOnly = new QCheckBox(QStringLiteral("Changes only"));
+    m_changesOnly->setToolTip(QStringLiteral("Only the writes that changed their cell"));
+    m_thisFrame = new QCheckBox(QStringLiteral("This frame"));
+    m_palCols = new QCheckBox(QStringLiteral("Palette columns"));
+    m_palCols->setToolTip(QStringLiteral("Only writes to columns 125-127"));
+    f->addWidget(m_changesOnly, 0, 4);
+    f->addWidget(m_thisFrame, 1, 4);
+    f->addWidget(m_palCols, 0, 5);
+    auto *clear = new QPushButton(QStringLiteral("Clear"));
+    connect(clear, &QPushButton::clicked, this, [this] {
+        chfdebug_vram_writes_clear(m_dbg);
+        refreshLog();
+    });
+    f->addWidget(clear, 1, 5);
+    f->setColumnStretch(6, 1);
+    v->addLayout(f);
+    for (QSpinBox *s : { m_row0, m_row1, m_col0, m_col1 })
+        connect(s, &QSpinBox::valueChanged, this, [this] { refreshLog(); });
+    for (QCheckBox *c : { m_changesOnly, m_thisFrame, m_palCols })
+        connect(c, &QCheckBox::toggled, this, [this] { refreshLog(); });
+    m_logCounts = dbgui::dimLabel();
+    v->addWidget(m_logCounts);
+    m_logText = dbgui::monoView();
+    v->addWidget(m_logText, 1);
+    return w;
 }
 
-/* ---- refreshing --------------------------------------------------------------------------- */
+/* ---- refreshing --------------------------------------------------------------- */
 
-unsigned VideoTab::layers() const
-{
-    unsigned m = 0;
-    if (m_layer[0]->isChecked()) m |= CHFDEBUG_UVI_L_CHARS;
-    if (m_layer[1]->isChecked()) m |= CHFDEBUG_UVI_L_OBJECTS;
-    return m;
-}
+int VideoTab::view() const { return m_view->currentIndex(); }
+int VideoTab::scale() const { return m_scale->currentData().toInt(); }
 
 unsigned VideoTab::overlays() const
 {
-    static const unsigned flags[4] = { CHFDEBUG_UVI_F_BOXES, CHFDEBUG_UVI_F_COLLIDE, CHFDEBUG_UVI_F_GRID,
-                                       CHFDEBUG_UVI_F_BEAM };
     unsigned f = 0;
-    for (int i = 0; i < 4; ++i)
-        if (m_overlay[i]->isChecked()) f |= flags[i];
+    for (int i = 0; i < 8; ++i)
+        if (m_overlay[i]->isChecked()) f |= kOverlays[i].flag;
     return f;
 }
 
 void VideoTab::refresh()
 {
-    chfdebug_uvi_get(m_dbg, &m_uvi);
+    chfdebug_video_get(m_dbg, &m_v);
     refreshPicture();
+    refreshCell();
     switch (m_sections->currentIndex()) {
-    case 0: refreshObjects(); break;
-    case 1: refreshScreen(); break;
-    case 2: refreshRegisters(); break;
-    case 3: refreshControl(); break;
-    case 4: refreshSheets(); break;
+    case 1: refreshPalettes(); break;
+    case 2: refreshPorts(); break;
+    case 3: refreshLog(); break;
     default: break;
     }
 }
@@ -559,206 +426,200 @@ void VideoTab::refresh()
 void VideoTab::refreshPicture()
 {
     int w = 0, h = 0;
-    if (chfdebug_uvi_view(m_dbg, m_view->currentIndex(), layers(), overlays(), 1, m_px.data(), m_px.size(), &w, &h)
-        && w > 0 && h > 0) {
-        const QImage img(reinterpret_cast<const uchar *>(m_px.data()), w, h, w * 4, QImage::Format_RGB32);
-        m_image->setImage(img.copy());   /* the buffer is reused by the next call */
+    if (!chfdebug_video_view(m_dbg, view(), overlays(), scale(), nullptr, 0, &w, &h) || w <= 0 || h <= 0) return;
+    m_px.assign((size_t)w * (size_t)h, 0);
+    int w2 = 0, h2 = 0;
+    if (!chfdebug_video_view(m_dbg, view(), overlays(), scale(), m_px.data(), m_px.size(), &w2, &h2)) return;
+    /* the pixels are 0x00RRGGBB: make them opaque, or a compositor shows through */
+    for (uint32_t &px : m_px) px |= 0xFF000000u;
+    m_image->setImage(QImage(reinterpret_cast<const uchar *>(m_px.data()), w2, h2, w2 * 4, QImage::Format_RGB32).copy());
+    QRect hover, pin;
+    if (m_hoverRow >= 0) hover = cellRect(m_hoverRow, m_hoverCol);
+    if (m_pinRow >= 0) pin = cellRect(m_pinRow, m_pinCol);
+    m_image->setMarks(hover, pin);
+}
+
+/* where a VRAM cell is in the view (null when it is not shown) */
+QRect VideoTab::cellRect(int row, int col) const
+{
+    const int s = scale();
+    switch (view()) {
+    case CHFDEBUG_VIEW_FRAME:
+    case CHFDEBUG_VIEW_LIVE:
+    case CHFDEBUG_VIEW_BEAM:
+        if (row < CHFDEBUG_VIS_ROW0 || row >= CHFDEBUG_VIS_ROW0 + CHFDEBUG_VIS_ROWS || col < CHFDEBUG_VIS_COL0
+            || col >= CHFDEBUG_VIS_COL0 + CHFDEBUG_VIS_COLS)
+            return QRect();
+        return QRect((col - CHFDEBUG_VIS_COL0) * 2 * s, (row - CHFDEBUG_VIS_ROW0) * 4 * s, 2 * s, 4 * s);
+    case CHFDEBUG_VIEW_VRAM:
+    case CHFDEBUG_VIEW_VALUES: return QRect(col * 2 * s, row * 4 * s, 2 * s, 4 * s);
+    default: return QRect();
     }
-    m_beam->setText(QStringLiteral("Beam at line %1 of %2 (%3), character row %4; %5.")
-                        .arg(m_uvi.line).arg(m_uvi.lines)
-                        .arg(m_uvi.vblank ? QStringLiteral("vertical blank") : QStringLiteral("drawing"))
-                        .arg(m_uvi.charline)
-                        .arg(m_uvi.lines == 312 ? QStringLiteral("PAL, 50 Hz") : QStringLiteral("NTSC, 60 Hz")));
 }
 
-/* An object or glyph as the tables draw it, as a pixmap of `scale` per pixel. */
-QPixmap VideoTab::thingPixmap(int kind, int index, int scale)
+bool VideoTab::hitAt(int x, int y, int *row, int *col)
 {
-    int w = 0, h = 0;
-    if (!chfdebug_uvi_thing(m_dbg, kind, index, scale, 0xFF202020u, m_px.data(), m_px.size(), &w, &h) || w <= 0 || h <= 0)
-        return QPixmap();
-    const QImage img(reinterpret_cast<const uchar *>(m_px.data()), w, h, w * 4, QImage::Format_RGB32);
-    /* copied: the image only wraps the buffer the next call overwrites */
-    return QPixmap::fromImage(img.copy());
+    if (x < 0 || y < 0) return false;
+    return chfdebug_video_hit(m_dbg, view(), x, y, scale(), row, col) >= 0;
 }
-
-/* A sheet view scaled up by a whole number to fit maxWidth. */
-QPixmap VideoTab::viewPixmap(int view, int maxWidth)
-{
-    int w = 0, h = 0;
-    if (!chfdebug_uvi_view(m_dbg, view, CHFDEBUG_UVI_L_ALL, 0, 1, m_px.data(), m_px.size(), &w, &h) || w <= 0 || h <= 0)
-        return QPixmap();
-    const QImage img(reinterpret_cast<const uchar *>(m_px.data()), w, h, w * 4, QImage::Format_RGB32);
-    const int scale = qBound(1, maxWidth / w, 8);
-    return QPixmap::fromImage(img.scaled(w * scale, h * scale, Qt::IgnoreAspectRatio, Qt::FastTransformation));
-}
-
-/* The colour cell: a swatch and the number and name. */
-static void setColourCell(QTableWidget *t, int row, int col, int colour, const uint32_t *pal)
-{
-    setCell(t, row, col, colourText(colour));
-    QPixmap sw(10, 10);
-    sw.fill(fromXrgb(pal[colour & 7]));
-    t->item(row, col)->setData(Qt::DecorationRole, sw);
-}
-
-/* A table as wide as its columns, so the section scrolls sideways when the
- * window is narrow instead of cutting the last columns off. */
-static void fitWidth(QTableWidget *t)
-{
-    t->setMinimumWidth(t->horizontalHeader()->length() + 2 * t->frameWidth() + 2);
-}
-
-void VideoTab::refreshObjects()
-{
-    for (int i = 0; i < 4; ++i) {
-        const chfdebug_uvi_object &o = m_uvi.obj[i];
-        setCell(m_objects, i, 0, QString::number(i));
-        setCell(m_objects, i, 1, QString());
-        m_objects->item(i, 1)->setData(Qt::DecorationRole, thingPixmap(CHFDEBUG_UVI_OBJECT, i, 2));
-        setCell(m_objects, i, 2, QString::number(o.x));
-        setCell(m_objects, i, 3, QString::number(o.y));
-        setCell(m_objects, i, 4, QStringLiteral("$%1,$%2").arg(hx(o.reg_x, 2), hx(o.reg_y, 2)));
-        setColourCell(m_objects, i, 5, o.colour, m_pal);
-        setCell(m_objects, i, 6, o.double_height ? QStringLiteral("8 x 16") : QStringLiteral("8 x 8"));
-        setCell(m_objects, i, 7, QStringLiteral("$") + hx(o.udc, 2));
-        QStringList hits;
-        if (o.hits_chars) hits << QStringLiteral("C");
-        for (int k = 0; k < 4; ++k)
-            if ((o.hits_objects >> k) & 1) hits << QString::number(k);
-        setCell(m_objects, i, 8, hits.isEmpty() ? QStringLiteral("-") : hits.join(QLatin1Char(' ')));
-        setCell(m_objects, i, 9, o.visible ? QStringLiteral("visible") : QStringLiteral("off screen"));
-        setCell(m_objects, i, 10, shapeText(o.shape, 8));
-    }
-    fitWidth(m_objects);
-}
-
-void VideoTab::refreshScreen()
-{
-    static chfdebug_uvi_cell cells[CHFDEBUG_UVI_COLS * CHFDEBUG_UVI_MAX_ROWS];
-    const int rows = chfdebug_uvi_cells(m_dbg, cells);
-    QColor pal[8];
-    for (int i = 0; i < 8; ++i) pal[i] = fromXrgb(m_pal[i]);
-    if (rows > 0) m_screen->set(m_uvi, cells, rows, pal);
-    const chfdebug_uvi &u = m_uvi;
-    QString t;
-    t += QStringLiteral("Rows            %1 of %2 lines\n").arg(u.rows).arg(u.cell_height);
-    t += QStringLiteral("Two screens     %1 ($19F8 bit 6)\n").arg(u.two_screens ? "yes" : "no");
-    t += QStringLiteral("First line      %1 ($18FC)\n").arg(u.first_line);
-    t += QStringLiteral("Fine scroll     %1 pixels ($18FE bits 5-7)\n").arg(u.shift);
-    t += QStringLiteral("Block graphics  %1 from the top ($19F8 bit 7)\n").arg(u.block_graphics ? "on" : "off");
-    t += QStringLiteral("Multicolor      %1 ($18FD bit 7: colour bits per character)\n").arg(u.multicolor ? "on" : "off");
-    t += QStringLiteral("\nColours\n");
-    t += QStringLiteral("  screen ($19F9)        %1\n  characters            %2\n").arg(colourText(u.screen_colour), colourText(u.char_colour));
-    t += QStringLiteral("  lower screen ($19F8)  %1\n  lower characters      %2\n").arg(colourText(u.alt_screen_colour), colourText(u.alt_char_colour));
-    dbgui::setText(m_screenText, t);
-}
-
-void VideoTab::refreshRegisters()
-{
-    m_regsFilling = true;
-    for (int off = 0; off < 0x300; ++off) {
-        char name[64] = "", text[200] = "";
-        chfdebug_uvi_describe(m_dbg, (unsigned)off, name, sizeof name, text, sizeof text);
-        setCell(m_regs, off, 1, QString::fromUtf8(name));
-        const QString value = QStringLiteral("$") + hx(m_uvi.reg[off], 2);
-        QTableWidgetItem *v = m_regs->item(off, 2);
-        /* leave a value being typed alone */
-        if (!(dbgui::editing(m_regs) && m_regs->currentRow() == off)) {
-            /* a register that changed since the last look is shown in the accent */
-            const char hot = !v->text().isEmpty() && v->text() != value;
-            if (v->text() != value) v->setText(value);
-            if (hot != m_regHot[(size_t)off]) {
-                m_regHot[(size_t)off] = hot;
-                v->setForeground(hot ? QBrush(chfAccentTextColor(this)) : QBrush());
-            }
-        }
-        const QString decoded = QString::fromUtf8(text);
-        setCell(m_regs, off, 3, decoded);
-        if (m_regs->item(off, 3)->toolTip() != decoded) m_regs->item(off, 3)->setToolTip(decoded);
-    }
-    m_regsFilling = false;
-}
-
-void VideoTab::refreshControl()
-{
-    const chfdebug_uvi &u = m_uvi;
-    auto flag = [](int v) { return v ? QStringLiteral("1") : QStringLiteral("0"); };
-    QString t;
-    t += QStringLiteral("Beam            line %1 of %2, character row %3, SENSE (vblank) %4\n")
-             .arg(u.line).arg(u.lines).arg(u.charline).arg(flag(u.vblank));
-    t += QStringLiteral("\nScreen geometry\n");
-    t += QStringLiteral("  first line      %1 ($18FC)\n").arg(u.first_line);
-    t += QStringLiteral("  fine scroll     %1 ($18FE bits 5-7)\n").arg(u.shift);
-    t += QStringLiteral("  character rows  %1, %2 lines each\n").arg(u.rows).arg(u.cell_height);
-    t += QStringLiteral("  two screens     %1 ($19F8 bit 6)\n").arg(flag(u.two_screens));
-    t += QStringLiteral("  block graphics  %1 ($19F8 bit 7)\n").arg(flag(u.block_graphics));
-    t += QStringLiteral("  multicolor      %1 ($18FD bit 7)\n").arg(flag(u.multicolor));
-    t += QStringLiteral("\nColours ($19F8, $19F9)\n");
-    t += QStringLiteral("  screen          %1\n  characters      %2\n").arg(colourText(u.screen_colour), colourText(u.char_colour));
-    t += QStringLiteral("  lower screen    %1\n  lower chars     %2\n").arg(colourText(u.alt_screen_colour), colourText(u.alt_char_colour));
-    t += QStringLiteral("\nSound ($18FD, $18FE)\n");
-    t += QStringLiteral("  pitch divider %1, volume %2, tone %3, noise %4\n")
-             .arg(u.sound_pitch).arg(u.sound_volume).arg(flag(u.sound_tone), flag(u.sound_noise));
-    t += QStringLiteral("\nPots ($19FF / $19FE)  controller 1 $%1, controller 2 $%2; axis read: %3 ($19F9 bit 6)\n")
-             .arg(hx(u.pot[0], 2), hx(u.pot[1], 2), u.pot_y ? "Y" : "X");
-    t += QStringLiteral("Panel $1908       $%1\n").arg(hx(u.panel, 2));
-    t += QStringLiteral("Collisions        characters $%1, objects $%2\n").arg(hx(u.coll_chars, 2), hx(u.coll_objects, 2));
-    dbgui::setText(m_ctlText, t);
-    /* a 0 bit is a hit */
-    m_collChars->set(0, ~(uint32_t)u.coll_chars & 0x0F);
-    m_collObjects->set(0, ~(uint32_t)u.coll_objects & 0x3F);
-}
-
-void VideoTab::refreshSheets()
-{
-    m_fontSheet->setPixmap(viewPixmap(CHFDEBUG_UVI_FONT, 560));
-    m_shapeSheet->setPixmap(viewPixmap(CHFDEBUG_UVI_OBJECTS, 280));
-    m_paletteSheet->setPixmap(viewPixmap(CHFDEBUG_UVI_PALETTE, 280));
-}
-
-/* ---- under the pointer ------------------------------------------------------------------------- */
 
 void VideoTab::hover(int x, int y)
 {
-    if (x < 0) {
-        m_hover->setText(QStringLiteral("Move the pointer over the picture to see what draws under it."));
-        m_hover->setStyleSheet(QStringLiteral("color: gray;"));
-        m_image->setHighlight(QRect());
-        return;
-    }
-    m_hover->setStyleSheet(QString());
-    chfdebug_hit hits[8];
-    const int n = chfdebug_uvi_hit_test(m_dbg, x, y, hits, 8);
-    QString text = QStringLiteral("x=%1 y=%2: ").arg(x).arg(y);
-    QRect box;
-    if (n <= 0) {
-        text += QStringLiteral("nothing drawn (the border or the screen colour)");
+    int row, col;
+    if (hitAt(x, y, &row, &col)) {
+        m_hoverRow = row;
+        m_hoverCol = col;
     } else {
-        const chfdebug_hit &h = hits[0];
-        if (h.kind == CHFDEBUG_UVI_HIT_OBJECT && h.index >= 0 && h.index < 4) {
-            const chfdebug_uvi_object &o = m_uvi.obj[h.index];
-            box = QRect(o.px, o.py, o.width, o.height);
-            text += QStringLiteral("Object %1 (%2 box): x=%3 y=%4 colour=%5, %6")
-                        .arg(h.index).arg(QString::fromLatin1(kObjectBoxes[h.index])).arg(o.x).arg(o.y)
-                        .arg(colourText(o.colour), o.double_height ? QStringLiteral("8 x 16") : QStringLiteral("8 x 8"));
-        } else if (h.kind == CHFDEBUG_UVI_HIT_CELL) {
-            const int row = h.index / CHFDEBUG_UVI_COLS, col = h.index % CHFDEBUG_UVI_COLS;
-            box = QRect(32 + col * 8, m_uvi.first_line + row * m_uvi.cell_height, 8, m_uvi.cell_height);
-            static chfdebug_uvi_cell cells[CHFDEBUG_UVI_COLS * CHFDEBUG_UVI_MAX_ROWS];
-            const int rows = chfdebug_uvi_cells(m_dbg, cells);
-            if (row < rows) {
-                const chfdebug_uvi_cell &c = cells[h.index];
-                text += QStringLiteral("Character row %1 column %2: code $%3, %4, foreground %5, background %6")
-                            .arg(row).arg(col).arg(hx(c.code, 2),
-                                c.graphics ? QStringLiteral("block graphics") : QStringLiteral("glyph $%1").arg(hx(c.glyph, 2)),
-                                colourText(c.fg), colourText(c.bg));
-            }
-        } else {
-            text += QStringLiteral("kind %1 index %2").arg(h.kind).arg(h.index);
-        }
-        if (n > 1) text += QStringLiteral(" (+%1 under it)").arg(n - 1);
+        m_hoverRow = m_hoverCol = -1;
     }
-    m_hover->setText(text);
-    m_image->setHighlight(box);
+    refreshPicture();
+    refreshCell();
+}
+
+void VideoTab::click(int x, int y)
+{
+    int row, col;
+    if (!hitAt(x, y, &row, &col)) return;
+    if (row == m_pinRow && col == m_pinCol) m_pinRow = m_pinCol = -1;
+    else { m_pinRow = row; m_pinCol = col; }
+    refreshPicture();
+    refreshCell();
+}
+
+/* Double-click: break on writes to the cell, or take that breakpoint off. */
+void VideoTab::doubleClick(int x, int y)
+{
+    int row, col;
+    if (!hitAt(x, y, &row, &col)) return;
+    const int cell = row * CHFDEBUG_VRAM_COLS + col;
+    chfdebug_breakpoint bps[256];
+    const int n = chfdebug_breakpoint_list(m_dbg, bps, 256);
+    for (int i = 0; i < n; ++i)
+        if (bps[i].type == CHFDEBUG_BP_VRAM && bps[i].start == cell && bps[i].end == cell) {
+            chfdebug_breakpoint_remove(m_dbg, bps[i].id);
+            if (onMessage) onMessage(QStringLiteral("Breakpoint on writes to row %1 column %2 removed").arg(row).arg(col));
+            return;
+        }
+    if (chfdebug_breakpoint_add(m_dbg, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, (uint16_t)cell, (uint16_t)cell, "") >= 0 && onMessage)
+        onMessage(QStringLiteral("Breaking on writes to row %1 column %2").arg(row).arg(col));
+}
+
+QString VideoTab::cellReadout(int row, int col)
+{
+    chfdebug_vram_cell c;
+    if (chfdebug_vram_cell_get(m_dbg, row, col, &c) < 0) return QStringLiteral("(no such cell)");
+    QString t = QStringLiteral("Row %1, column %2  (cell %3)\n").arg(c.row).arg(c.col).arg(c.row * 128 + c.col);
+    t += c.visible ? QStringLiteral("Shown on the TV\n")
+                   : QStringLiteral("Hidden: %1\n").arg(QString::fromUtf8(c.hidden_why ? c.hidden_why : "outside the picture"));
+    t += QStringLiteral("Value       %1\n").arg(c.value);
+    t += QStringLiteral("Palette     %1 (%2)\n").arg(c.palette).arg(QString::fromUtf8(chfdebug_palette_name(c.palette)));
+    t += QStringLiteral("Colour      pen %1, %2, %3\n").arg(c.pen).arg(QString::fromUtf8(chfdebug_colour_name(c.pen)),
+                                                                     dbgui::rgbText(c.rgb));
+    t += QStringLiteral("Writes      %1 since the debugger attached\n").arg(c.writes);
+    if (c.last_pc >= 0)
+        t += QStringLiteral("Last write  PC $%1, frame %2, line %3, over value %4")
+                 .arg(hx((unsigned)c.last_pc, 4)).arg(c.last_frame).arg(c.last_line).arg(c.last_old);
+    else
+        t += QStringLiteral("Last write  never");
+    return t;
+}
+
+void VideoTab::refreshCell()
+{
+    QString text;
+    if (m_pinRow >= 0)
+        text += QStringLiteral("Pinned\n") + cellReadout(m_pinRow, m_pinCol) + QStringLiteral("\n\n");
+    if (m_hoverRow >= 0)
+        text += QStringLiteral("Under the pointer\n") + cellReadout(m_hoverRow, m_hoverCol);
+    else if (m_pinRow < 0)
+        text = QStringLiteral("(no cell under the pointer)");
+    dbgui::setText(m_cellText, text);
+
+    /* one line under the picture */
+    auto brief = [&](int row, int col) {
+        chfdebug_vram_cell c;
+        if (chfdebug_vram_cell_get(m_dbg, row, col, &c) < 0) return QString();
+        return QStringLiteral("row %1 col %2: value %3, palette %4, %5 %6%7").arg(c.row).arg(c.col).arg(c.value)
+            .arg(c.palette).arg(QString::fromUtf8(chfdebug_colour_name(c.pen)), dbgui::rgbText(c.rgb),
+                                 c.visible ? QString() : QStringLiteral(" (hidden: %1)").arg(QString::fromUtf8(c.hidden_why ? c.hidden_why : "?")));
+    };
+    QString line;
+    if (m_hoverRow >= 0) line = brief(m_hoverRow, m_hoverCol);
+    if (m_pinRow >= 0) line += (line.isEmpty() ? QString() : QStringLiteral("\n")) + QStringLiteral("Pinned: ") + brief(m_pinRow, m_pinCol);
+    if (line.isEmpty()) line = QStringLiteral("Hover a cell");
+    m_hover->setText(line);
+}
+
+void VideoTab::refreshPalettes()
+{
+    for (int p = 0; p < 4; ++p) {
+        setCell(m_palTable, p, 0, QStringLiteral("%1 %2").arg(p).arg(QString::fromUtf8(chfdebug_palette_name(p))));
+        for (int v = 0; v < 4; ++v) {
+            const int pen = chfdebug_palette_pen(p, v);
+            const uint32_t rgb = chfdebug_colour_rgb(pen);
+            setCell(m_palTable, p, 1 + v, QStringLiteral("%1 %2").arg(QString::fromUtf8(chfdebug_colour_name(pen)), dbgui::rgbText(rgb)));
+            QTableWidgetItem *it = m_palTable->item(p, 1 + v);
+            it->setBackground(fromXrgb(rgb));
+            it->setForeground(inkOn(fromXrgb(rgb)));
+        }
+        setCell(m_palTable, p, 5, QString::number(m_v.palette_rows[p]));
+    }
+    m_strip->set(m_v.row_palette, m_v.row_background);
+}
+
+void VideoTab::refreshPorts()
+{
+    const struct { int port; uint8_t latch, in; } ports[4] = {
+        { 0, m_v.port0, m_v.in0 }, { 1, m_v.port1, m_v.in1 }, { 4, m_v.port4, m_v.in4 }, { 5, m_v.port5, m_v.in5 } };
+    const QString decoded[4] = {
+        QStringLiteral("strobe %1, controllers %2, panel latch %3")
+            .arg(m_v.strobe ? "up" : "down", m_v.controllers_enabled ? "read" : "off", hx(m_v.panel_latch, 1)),
+        QStringLiteral("colour value %1").arg(m_v.value),
+        QStringLiteral("column %1").arg(m_v.col),
+        QStringLiteral("row %1, sound %2").arg(m_v.row).arg(QString::fromLatin1(kSoundModes[m_v.sound_mode & 3])),
+    };
+    for (int i = 0; i < 4; ++i) {
+        setCell(m_ports, i, 0, QStringLiteral("%1").arg(ports[i].port));
+        setCell(m_ports, i, 1, QStringLiteral("$%1 %2").arg(hx(ports[i].latch, 2), dbgui::bin8(ports[i].latch)));
+        const unsigned comp = (~ports[i].latch) & 0xFF;
+        setCell(m_ports, i, 2, QStringLiteral("$%1 %2").arg(hx(comp, 2), dbgui::bin8(comp)));
+        setCell(m_ports, i, 3, decoded[i]);
+        setCell(m_ports, i, 4, QStringLiteral("$%1 %2").arg(hx(ports[i].in, 2), dbgui::bin8(ports[i].in)));
+    }
+    m_portNote->setText(QStringLiteral("The CPU writes a cell by putting the colour on port 1 (bits 7-6, complemented), "
+                                       "the column on port 4 (complemented) and the row on port 5 (bits 5-0, "
+                                       "complemented; bits 7-6 are the sound), then strobing port 0 bit 5. Ports 1 and 4 "
+                                       "read player 1's (right) and player 2's (left) controller, active low, while "
+                                       "port 0 bit 6 is clear; port 0 reads the panel's buttons.\n\n"
+                                       "Beam: line %1 of %2, cycle %3 of %4. Frame %5. "
+                                       "VRAM writes: %6 so far this frame; the last whole frame had %7, %8 of them "
+                                       "changing their cell.")
+                            .arg(m_v.line).arg(m_v.lines).arg(m_v.cycle_in_line).arg(m_v.cycles_per_line).arg(m_v.frame)
+                            .arg(m_v.strobes_frame).arg(m_v.strobes_last).arg(m_v.changes_last));
+}
+
+void VideoTab::refreshLog()
+{
+    static chfdebug_vram_write w[500];
+    chfdebug_vram_filter f;
+    f.row0 = m_row0->value();
+    f.row1 = m_row1->value();
+    f.col0 = m_col0->value();
+    f.col1 = m_col1->value();
+    f.changes_only = m_changesOnly->isChecked();
+    f.this_frame = m_thisFrame->isChecked();
+    f.palette_cols = m_palCols->isChecked();
+    const int n = chfdebug_vram_writes(m_dbg, &f, w, 500);
+    chfdebug_video v;
+    chfdebug_video_get(m_dbg, &v);
+    m_logCounts->setText(QStringLiteral("This frame so far: %1 writes. Last whole frame: %2 writes, %3 changing their "
+                                        "cell. Showing the newest %4.")
+                             .arg(v.strobes_frame).arg(v.strobes_last).arg(v.changes_last).arg(n));
+    QString t = QStringLiteral("frame  line  cycle      PC     cell        old → new\n");
+    for (int i = 0; i < n; ++i)
+        t += QStringLiteral("%1 %2 %3  $%4  r%5 c%6  %7 → %8\n").arg(w[i].frame, 5).arg(w[i].line, 4)
+                 .arg((qulonglong)w[i].cycle, 10).arg(hx(w[i].pc, 4)).arg(w[i].row, 2).arg(w[i].col, -3)
+                 .arg(w[i].old).arg(w[i].value);
+    if (n == 0) t += QStringLiteral("(no writes match)\n");
+    dbgui::setText(m_logText, t, dbgui::atEnd(m_logText));
 }

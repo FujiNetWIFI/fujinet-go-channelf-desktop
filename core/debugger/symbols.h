@@ -31,6 +31,7 @@ typedef struct {
     uint16_t addr;
     int16_t bank;            /* 16K ROM bank, or SYM_BANK_ANY */
     uint8_t builtin;
+    uint32_t seq;            /* the order it was added: ties sort by it */
     char name[SYM_NAME_MAX];
 } sym_entry;
 
@@ -38,6 +39,7 @@ typedef struct {
     sym_entry *v;
     int n, cap;
     int sorted;
+    uint32_t seq;
 } symtab;
 
 void symtab_init(symtab *t);           /* empty, then the built-ins */

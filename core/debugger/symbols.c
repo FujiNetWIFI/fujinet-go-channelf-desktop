@@ -62,6 +62,7 @@ int symtab_add(symtab *t, uint16_t addr, int bank, const char *name, int builtin
     e->addr = addr;
     e->bank = (int16_t)bank;
     e->builtin = (uint8_t)(builtin != 0);
+    e->seq = t->seq++;
     {
         /* a longer name is clipped to the table's width */
         size_t len = strlen(name);
@@ -83,7 +84,8 @@ static int cmp_addr(const void *a, const void *b)
      * name for a place is the better one */
     if (x->builtin != y->builtin)
         return (int)x->builtin - (int)y->builtin;
-    return 0;
+    /* qsort is not stable everywhere (Windows'): keep the order they came in */
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
 }
 
 static void ensure_sorted(symtab *t)

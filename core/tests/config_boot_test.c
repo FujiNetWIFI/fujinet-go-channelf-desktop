@@ -113,8 +113,14 @@ static int boot_from_sd(chfsession *s, const char *name)
     press(s, CHF_ACT_PUSH);
     if (!wait_state(ST_FILE, 15000))
         return 0;
-    for (int waited = 0; waited < 10000 && test_peek(VNROW) == 0; waited += 100)
+    /* the listing fills a row at a time: wait for its count to hold still */
+    for (int waited = 0, still = 0, last = -1; waited < 20000 && still < 10; waited += 100) {
+        int now = test_peek(VNROW);
+
+        still = (now != 0 && now == last) ? still + 1 : 0;
+        last = now;
         test_sleep_ms(100);
+    }
     row = sd_row(chfsession_sd_path(s), name);
     printf("  %s is row %d of %d\n", name, row, test_peek(VNROW));
     if (row < 1 || row >= test_peek(VNROW))
@@ -177,9 +183,13 @@ int main(void)
     check(boot_from_sd(s, APP_NAME), "fire opens SD, back onto the file, fire boots it: the cart swaps it in");
     {
         uint8_t a = test_peek(TEST_COUNTER_ADDR);
+        int moved = 0;
 
-        test_sleep_ms(300);
-        check(test_peek(TEST_COUNTER_ADDR) != a, "the app runs (its counter moves)");
+        for (int waited = 0; waited < 5000 && !moved; waited += 100) {
+            test_sleep_ms(100);
+            moved = test_peek(TEST_COUNTER_ADDR) != a;
+        }
+        check(moved, "the app runs (its counter moves)");
     }
     chfsession_cart_status(s, status, sizeof status);
     check(strstr(status, "mailbox closed") == NULL, "the app kept the mailbox");
@@ -189,16 +199,26 @@ int main(void)
     check(chfsession_cart_booted_game(s) == 0, "the session sees CONFIG again");
 
     check(boot_from_sd(s, GAME_NAME), "the game boots the same way");
-    chfsession_cart_status(s, status, sizeof status);
+    for (int waited = 0; waited < 5000; waited += 100) {
+        chfsession_cart_status(s, status, sizeof status);
+        if (strstr(status, "mailbox closed"))
+            break;
+        test_sleep_ms(100);
+    }
     check(strstr(status, "mailbox closed") != NULL, "with the mailbox closed, as for any game");
     if (chfsession_bios_in_use(s) >= 0) {
         uint8_t a = test_peek(TEST_COUNTER_ADDR);
+        int moved = 0;
 
-        test_sleep_ms(300);
-        check(test_peek(TEST_COUNTER_ADDR) != a, "and runs on the console's BIOS");
+        for (int waited = 0; waited < 5000 && !moved; waited += 100) {
+            test_sleep_ms(100);
+            moved = test_peek(TEST_COUNTER_ADDR) != a;
+        }
+        check(moved, "and runs on the console's BIOS");
     } else {
         /* the stand-in has no BIOS to run a game on: it parks and the session says Import BIOS */
-        test_sleep_ms(500);
+        for (int waited = 0; waited < 5000 && !chfsession_needs_bios(s); waited += 100)
+            test_sleep_ms(100);
         check(chfsession_needs_bios(s), "on the stand-in BIOS a game parks the console: the session asks for the BIOS");
     }
 

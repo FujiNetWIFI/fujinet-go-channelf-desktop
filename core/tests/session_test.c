@@ -440,20 +440,24 @@ int main(void)
     check(chfsession_buttons_held(s, 1) == B(CHF_ACT_LEFT), "the left controller is Player 2's (port 1)");
     chfsession_pointer_set(s, 1, 0);
 
-    /* a wheel notch twists for six frames, then lets go */
-    chfsession_twist_pulse(s, 0, 1);
-    check(chfsession_buttons_held(s, 0) == B(CHF_ACT_TWIST_CW), "a notch forward twists clockwise");
+    /* a wheel notch twists for six frames, then lets go (counted in machine
+     * frames, not time: a loaded runner catches up frames in a burst) */
     {
+        const uint64_t f0 = chfsession_frame_count(s);
         int waited = 0;
-        while (waited < 1000 && chfsession_buttons_held(s, 0) != 0) { sleep_ms(10); waited += 10; }
-        check(chfsession_buttons_held(s, 0) == 0 && waited >= 40 && waited < 1000,
-              "and lets go a few frames later, on its own");
+
+        chfsession_twist_pulse(s, 0, 1);
+        check(chfsession_buttons_held(s, 0) == B(CHF_ACT_TWIST_CW), "a notch forward twists clockwise");
+        while (waited < 5000 && chfsession_buttons_held(s, 0) != 0) { sleep_ms(10); waited += 10; }
+        check(chfsession_buttons_held(s, 0) == 0 && chfsession_frame_count(s) - f0 >= 6,
+              "and lets go six frames later, on its own");
     }
     chfsession_twist_pulse(s, 1, -1);
     check(chfsession_buttons_held(s, 1) == B(CHF_ACT_TWIST_CCW), "a notch back twists counter-clockwise, on Player 2");
     chfsession_twist_pulse(s, 1, 1);
     check(chfsession_buttons_held(s, 1) == B(CHF_ACT_TWIST_CW), "a notch the other way ends the first");
-    sleep_ms(400);
+    for (int waited = 0; waited < 5000 && chfsession_buttons_held(s, 1) != 0; waited += 10)
+        sleep_ms(10);
     check(chfsession_buttons_held(s, 1) == 0, "released");
     check(wait_frames(s, &serial, 10, 3000), "the machine keeps running after input");
 

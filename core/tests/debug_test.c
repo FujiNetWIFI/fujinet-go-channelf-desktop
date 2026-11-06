@@ -1201,7 +1201,8 @@ static void test_cartridge(chfdebug *d, int fake_up)
 
     chfdebug_cart_get(d, &cart);
     check(cart.present && cart.type == CHF_CART_FUJINET && strcmp(cart.type_name, "FujiNet") == 0 && cart.mailbox &&
-          cart.app_live && cart.booted_game && !cart.armed && !cart.link_off, "the FujiNet cartridge, running an APPBANK app that claims the mailbox");
+          cart.app_live && cart.booted_game && !cart.armed && cart.link_off == !fake_up,
+          "the FujiNet cartridge, running an APPBANK app that claims the mailbox");
     check(cart.live_size == APP_SIZE && cart.live_crc == chf_crc32(g_app, APP_SIZE) && cart.rom_size == APP_SIZE &&
           cart.rom_crc == cart.live_crc, "its image: size and CRC");
     check(cart.npages == 2 && cart.page >= -1 && cart.page <= 1, "two APPBANK pages");

@@ -52,17 +52,13 @@ set(CHF_FUJI_SOURCES
   ${FUJI_GEN}/chfmap.c)
 
 # The emulator's own modules. A module that has not landed yet is skipped, so
-# the library builds at every step of the bring-up. Until stub.c (the stand-in
-# BIOS) exists, stub_placeholder.c supplies an image that only parks the machine.
+# the library builds at every step of the bring-up.
 set(CHF_EMU_SOURCES)
 foreach(_f f8 dasmf8 video sound carts machine stub fujinet_cart fujitcp_host host)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/${_f}.c")
     list(APPEND CHF_EMU_SOURCES chf/${_f}.c)
   endif()
 endforeach()
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/stub.c")
-  list(APPEND CHF_EMU_SOURCES chf/stub_placeholder.c)
-endif()
 
 # The debugger drives the machine, so it joins once the machine and the
 # debugger's own Channel F port (vidview.c is its marker) exist.

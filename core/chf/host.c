@@ -5,7 +5,8 @@
  * lock are the siblings' (the SMS's, astrocade's and the ColecoVision's
  * host.c): a latest-wins video slot with a serial, an audio ring that trims
  * all the way down to a small fixed cushion when the consumer lags, and a
- * lock that refuses tick sources that are not at the machine's own rate.
+ * lock that refuses tick sources that are not at the machine's own rate. The
+ * machine runs a whole frame (to the next vertical blank) at a time.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -44,17 +45,21 @@ static atomic_bool s_paused;
 static char s_boip[128];
 static bool s_have_boip = false;
 static bool s_cart_sync = false;
-static long s_frame_ns = 16672727;
+static long s_frame_ns = 16520000;
 static chf_host_pacing_t s_pacing;     /* machine thread only; read after stop */
 static atomic_uint_fast64_t s_frames = 0;
 static double s_frame_hz = 0.0;
 
 /* inputs, written by any thread, latched by the machine at VBLANK */
-static atomic_uint_fast64_t s_keys;
-static atomic_uint_least8_t s_joy[2];
-static atomic_int_least8_t s_disc[2][2];
+static atomic_uint s_panel;
+static atomic_uint_least8_t s_ctl[2];
 static atomic_bool s_reset;
 static atomic_int s_reset_pulse;        /* frames left of a clicked RESET */
+
+/* what the stand-in BIOS could not do, as of the last frame */
+static pthread_mutex_t s_miss_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned s_missing;
+static char s_missing_why[96];
 
 /* ---- the run lock -----------------------------------------------------------
  * The machine thread holds it while it runs a frame and lets go of it between
@@ -268,24 +273,16 @@ void chf_host_audio_reset(void)
 
 /* ---- inputs ---- */
 
-void chf_host_keys_set(uint64_t matrix)
+void chf_host_keys_set(unsigned buttons)
 {
-    atomic_store(&s_keys, matrix);
+    atomic_store(&s_panel, buttons & 0x0f);
 }
 
-void chf_host_stick_set(int stick, uint8_t bits)
+void chf_host_controller_set(int port, unsigned mask)
 {
-    if (stick < 0 || stick > 1)
+    if (port < 0 || port > 1)
         return;
-    atomic_store(&s_joy[stick], (uint_least8_t)(bits & 0x1f));
-}
-
-void chf_host_disc_set(int stick, int x, int y)
-{
-    if (stick < 0 || stick > 1)
-        return;
-    atomic_store(&s_disc[stick][0], (int_least8_t)(x < -128 ? -128 : x > 127 ? 127 : x));
-    atomic_store(&s_disc[stick][1], (int_least8_t)(y < -128 ? -128 : y > 127 ? 127 : y));
+    atomic_store(&s_ctl[port], (uint_least8_t)(mask & 0xff));
 }
 
 void chf_host_reset_set(bool down)
@@ -295,7 +292,7 @@ void chf_host_reset_set(bool down)
 
 void chf_host_reset_pulse(void)
 {
-    /* long enough for the CPU to sit in RESET, as a finger on the key would */
+    /* long enough for the CPU to sit in RESET, as a finger on the button would */
     atomic_store(&s_reset_pulse, 3);
 }
 
@@ -305,12 +302,9 @@ static void inputs_take(chf_machine_t *m)
 {
     int pulse = atomic_load(&s_reset_pulse);
 
-    m->keys_live = atomic_load(&s_keys);
-    m->joy_live[0] = (uint8_t)atomic_load(&s_joy[0]);
-    m->joy_live[1] = (uint8_t)atomic_load(&s_joy[1]);
-    for (int s = 0; s < 2; s++)
-        for (int a = 0; a < 2; a++)
-            m->disc_live[s][a] = (int8_t)atomic_load(&s_disc[s][a]);
+    m->panel_live = atomic_load(&s_panel);
+    m->ctl_live[0] = (uint8_t)atomic_load(&s_ctl[0]);
+    m->ctl_live[1] = (uint8_t)atomic_load(&s_ctl[1]);
     m->reset_live = atomic_load(&s_reset) || pulse > 0;
     if (pulse > 0)
         atomic_store(&s_reset_pulse, pulse - 1);
@@ -319,10 +313,8 @@ static void inputs_take(chf_machine_t *m)
 void chf_host_release_all(void)
 {
     chf_host_keys_set(0);
-    chf_host_stick_set(0, 0);
-    chf_host_stick_set(1, 0);
-    chf_host_disc_set(0, 0, 0);
-    chf_host_disc_set(1, 0, 0);
+    chf_host_controller_set(0, 0);
+    chf_host_controller_set(1, 0);
     chf_host_reset_set(false);
 }
 
@@ -334,6 +326,31 @@ void chf_host_set_paused(bool paused)
 bool chf_host_is_paused(void)
 {
     return atomic_load(&s_paused);
+}
+
+unsigned chf_host_missing(char *why, int whysz)
+{
+    unsigned miss;
+
+    pthread_mutex_lock(&s_miss_lock);
+    miss = s_missing;
+    if (why && whysz > 0)
+        snprintf(why, (size_t)whysz, "%s", s_missing_why);
+    pthread_mutex_unlock(&s_miss_lock);
+    return miss;
+}
+
+static void missing_update(chf_machine_t *m)
+{
+    char why[sizeof s_missing_why];
+    const unsigned miss = chf_machine_missing(m, why, sizeof why);
+
+    if (miss != s_missing) {
+        pthread_mutex_lock(&s_miss_lock);
+        s_missing = miss;
+        memcpy(s_missing_why, why, sizeof s_missing_why);
+        pthread_mutex_unlock(&s_miss_lock);
+    }
 }
 
 void chf_host_cart_status(chf_cart_status_t *out)
@@ -533,6 +550,8 @@ static void *machine_thread(void *arg)
                             s_cart_sync, why, sizeof why);
     }
     atomic_store(&s_cart_up, true);
+    chf_machine_check_cart(&s_machine);
+    missing_update(&s_machine);
 
     clock_gettime(CLOCK_MONOTONIC, &next);
 
@@ -555,6 +574,7 @@ static void *machine_thread(void *arg)
         clock_gettime(CLOCK_MONOTONIC, &frame_start);
 
         chf_machine_run_frame(&s_machine);
+        missing_update(&s_machine);
         frame_publish(s_machine.fb);
         audio_publish(s_machine.out, s_machine.out_frames);
         s_machine.out_frames = 0;
@@ -655,6 +675,11 @@ int chf_host_start(const chf_host_opts_t *opts)
     }
 
     s_cart_app = opts->cart == NULL || opts->cart_app;
+    if (opts->bios_id < -1 || opts->bios_id >= CHF_ROM_SL31254 || (!!opts->bios_lo != !!opts->bios_hi))
+    {
+        snprintf(s_error, sizeof s_error, "the BIOS needs both halves");
+        return -1;
+    }
     if (s_cart_app && opts->cart && opts->cart_size &&
         !chf_fujinet_check_image(opts->cart, opts->cart_size, NULL, why, sizeof why))
     {
@@ -713,11 +738,18 @@ int chf_host_start(const chf_host_opts_t *opts)
     s_cart_sync = opts->cart_sync;
 
     mo.machine = opts->machine;
+    mo.bios_lo = opts->bios_lo;
+    mo.bios_hi = opts->bios_hi;
+    mo.bios_id = opts->bios_id;
 
+    s_missing = 0;
+    s_missing_why[0] = '\0';
+    chf_machine_track(&s_machine, false);      /* a debugger's leftovers from the last session */
     chf_machine_init(&s_machine, &mo);
+    missing_update(&s_machine);
 
     /* the exact frame period from the exact clocks */
-    s_frame_hz = 1e18 / ((double)s_machine.line_as * (double)s_machine.uvi.lines);
+    s_frame_hz = chf_machine_frame_hz(&s_machine);
     s_frame_ns = (long)(1e9 / s_frame_hz + 0.5);
 
     atomic_store(&s_reset_pulse, 0);

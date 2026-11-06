@@ -63,6 +63,10 @@ chf_cart_t *chf_fujinet_cart(chf_fujinet_t *c);
  * (read on the emulation thread) and the CPU clock. */
 void chf_fujinet_set_clock(chf_fujinet_t *c, const uint64_t *cycles, double cycle_hz);
 
+/* The CPU's PC0 register (read on the emulation thread), for the debugger's event
+ * ring: the instruction making a write is at *pc0 - 1. */
+void chf_fujinet_set_pc(chf_fujinet_t *c, const uint16_t *pc0);
+
 /* Power on, as MAME's device_reset with the image it was given:
  *   - `image` NULL: the baked CONFIG client (fujiconfigrom.h), mailbox live;
  *   - an image: served in its place; the mailbox is live when it carries the
@@ -116,6 +120,13 @@ void chf_fujinet_mailbox(chf_fujinet_t *c, uint8_t out[CHF_FJ_MAILBOX_BYTES]);
 uint8_t chf_fujinet_image_byte(chf_fujinet_t *c, uint32_t offset);
 /* ... and an edit of it: the running image's own buffer, never a hotspot. */
 void chf_fujinet_image_poke(chf_fujinet_t *c, uint32_t offset, uint8_t data);
+
+/* What the console reads at `addr` ($0800-$FFFF), with no side effects (the
+ * tick as painted now); and a debugger edit of what a read there returns: the
+ * image window, the APPBANK page in view, the RAM and the painted mailbox
+ * pages. An edit never fires a hotspot ($FD00 up is ignored). */
+uint8_t chf_fujinet_peek(chf_fujinet_t *c, uint16_t addr);
+void chf_fujinet_poke(chf_fujinet_t *c, uint16_t addr, uint8_t data);
 
 /* The arena byte at the console's address $8000 + offset (0 .. $7FFF), no
  * side effects; and a debugger edit of it (never a hotspot). */

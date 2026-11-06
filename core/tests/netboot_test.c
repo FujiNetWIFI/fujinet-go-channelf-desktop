@@ -3,19 +3,21 @@
  * FujiNet, opened as cartridges (they claim the mailbox, so they are FujiNet
  * apps):
  *
- *   fujitest  one real transaction (GET_ADAPTERCONFIG_EXTENDED), its answer
- *             printed on the UVI's character screen straight from the reply
- *             window;
+ *   fujitest  one real transaction (GET_ADAPTERCONFIG_EXTENDED): the cartridge's
+ *             status page shows it answered (ACKSEQ 1, no error, an ACK) and the
+ *             reply window ($F800) holds the adapter's answer;
  *   fujiboot  MOUNT_HOST -> SET_DEVICE_FULLPATH -> MOUNT_IMAGE of
  *             /ACOUNTER.BIN on the SD host (put there by Import Cartridge to
- *             SD): FujiNet pushes it, the cart stages it, BOOTLOCK, the
- *             hand-over through the stub at $18E0, and the counter app runs.
+ *             SD): FujiNet pushes it, the cart stages it, BOOTLOCK, the swap
+ *             stub in the cartridge's RAM stores to $FDFE, the BIOS re-enters at
+ *             $0802 and the counter app runs (its byte at $8000 moves).
  *
  * Run twice by ctest: with the mailbox on the cart's worker thread, and inline
  * (CHF_CART_SYNC=1 -> FUJINET_ASYNC=0). Needs CHF_TESTROM_DIR: fujinet-firmware's
  * pico/channelf/build, built with
  *   BOOT_HOST=0 BOOT_PATH=/ACOUNTER.BIN pico/channelf/build.sh fujiboot fujitest
- * (the pinned tree under third_party/ will do; needs Macroassembler AS).
+ * (the pinned tree under third_party/ will do; needs Macroassembler AS). The
+ * stand-in BIOS runs both (they use no BIOS routine).
  * SKIPs (77) without it or without the FujiNet runtime.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
@@ -28,7 +30,7 @@
 #include <string.h>
 
 #include "chfsession.h"
-#include "test_arc.h"
+#include "test_chf.h"
 #include "test_tmpdir.h"
 
 static int failures;
@@ -49,7 +51,7 @@ static int file_exists(const char *p)
 
 int main(void)
 {
-    static uint8_t img[8192];
+    static uint8_t img[16384];
     char cfg[512], data[512], src[700], dest[1200], fujiboot[1200], fujitest[1200], status[128];
     const char *dir = getenv("CHF_TESTROM_DIR");
     chfsession_paths p;
@@ -100,16 +102,18 @@ int main(void)
     /* fujitest: one transaction, the adapter's own answer on screen */
     check(chfsession_load_cart(s, fujitest) == 0, "fujitest opens");
     {
+        chf_cart_status_t st;
         int got = 0;
 
         for (int waited = 0; waited < 20000 && !got; waited += 100) {
-            got = test_find_row("127.0.0.1") >= 0 || test_find_row("ERR 00") >= 0;
+            chf_host_cart_status(&st);
+            got = st.ackseq >= 1 && st.reply_cmd == 0x06 && st.err == 0 && st.rxlen > 0;
             if (!got)
                 test_sleep_ms(100);
         }
-        if (!got)
-            test_dump_screen();
-        check(got, "GET_ADAPTERCONFIG_EXTENDED answered, printed from the reply window");
+        check(got, "GET_ADAPTERCONFIG_EXTENDED answered: ACKSEQ, an ACK, no error, a reply");
+        check(got && (test_peek(0xf800) | test_peek(0xf801) | test_peek(0xf802) | test_peek(0xf803)) != 0,
+              "and the reply is in the window at $F800");
     }
 
     /* fujiboot: mount, push, stage, hand over */
@@ -118,19 +122,17 @@ int main(void)
         int swapped = 0;
 
         for (int waited = 0; waited < 30000 && !swapped; waited += 100) {
-            swapped = chfsession_cart_booted_game(s) && test_uvi_ram(TEST_COUNTER) != 0;
+            swapped = chfsession_cart_booted_game(s) && test_peek(TEST_COUNTER_ADDR) != 0;
             if (!swapped)
                 test_sleep_ms(100);
         }
-        if (!swapped)
-            test_dump_screen();
         check(swapped, "the image was pushed, staged and swapped in, and is running");
     }
     {
-        uint8_t a = test_uvi_ram(TEST_COUNTER);
+        uint8_t a = test_peek(TEST_COUNTER_ADDR);
 
         test_sleep_ms(300);
-        check(test_uvi_ram(TEST_COUNTER) != a, "its counter moves");
+        check(test_peek(TEST_COUNTER_ADDR) != a, "its counter moves");
     }
     chfsession_cart_status(s, status, sizeof status);
     check(strstr(status, "mailbox closed") == NULL, "and it claimed the mailbox, so the cart keeps it");

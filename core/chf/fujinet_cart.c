@@ -2,7 +2,10 @@
  *
  * Transposed from the firmware's MAME device (fujinet-firmware
  * pico/channelf/emu/fujinet.cpp, BSD-3-Clause, copyright-holders Thomas
- * Cherryhomes) onto the staged cartridge sources. The names follow it.
+ * Cherryhomes) onto the staged cartridge sources: the bus decode
+ * (channelf_cart.h's chf_read / chf_write), the image planner (chfmap.c), the
+ * mailbox service (fujimail.c) and the wire codec (fujibus.c). The names follow
+ * the device's.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -18,33 +21,34 @@
 #include <time.h>
 
 /* the cartridge firmware's own sources (core/chf/fuji-generated) */
+#include "channelf_cart.h"      /* chf_mem_t, chf_read, chf_write, CHF_EV_* */
 #include "fuji_mailbox.h"
 #include "fujibus.h"
 #include "fujimail.h"
 #include "fujitcp.h"
 #include "chfmap.h"
-#include "arcapp.h"
 #include "fujiconfigrom.h"      /* _configrom, FUJI_CONFIGROM_SIZE */
 
 #include "fujitcp_host.h"
 
-#define QUEUE_SIZE 1024         /* console hotspot reads waiting for the worker */
+#define QUEUE_SIZE 1024         /* console mailbox events waiting for the worker */
 #define MAX_POKES  4096
+#define EV_RING    1024         /* power of two */
+#define HQ_PAINT   0xffff       /* in the event queue: run fujimail_paint() */
 
 struct chf_fujinet {
     chf_cart_t base;            /* the slot interface; first */
 
-    /* Two slots, as on the cartridge: slot[live] is the one served, the push
-     * lands in the other. Each holds a whole image, flat (8K) or APPBANK. */
+    /* Two slots, as on the cartridge: slot[live] is served, a push lands in
+     * the other. Each holds a whole image: the 16K window, then APPBANK pages. */
     uint8_t *slot[2];
     uint8_t npages[2];
     unsigned live;
-    arcapp_t app;
-    uint8_t ffpage[FN_APP_PAGE];
+    uint8_t *arena;             /* 32K at $8000: RAM and the painted mailbox */
     uint8_t *rx[2];             /* per-stream push buffers */
     uint32_t rx_len[2], rx_cap[2];
 
-    atomic_bool mailbox_live;   /* the running image owns the mailbox pages */
+    chf_mem_t mem;             /* the shared decode's view of the above */
     bool powered;
 
     /* the image served first (the baked CONFIG or the opened app) */
@@ -53,16 +57,17 @@ struct chf_fujinet {
     /* A staged image, built by whichever thread runs the transaction and taken
      * by the console's thread. loadlock covers it and the swap. */
     pthread_mutex_t loadlock;
-    bool have_staged, staged_claims, staged_app;
+    bool have_staged, staged_claims;
+    chfmap_plan_t staged_plan;
     atomic_bool swap_armed;
     uint32_t staged_size, staged_crc;
     unsigned swaps;
     bool served_other;          /* anything but the baked CONFIG has run */
 
     /* The worker owns fujimail and the socket; the console's thread owns the
-     * slots, the swap and the app state. The worker's pokes reach the slots
-     * through pokes[], applied before the next fetch; the console's hotspot
-     * reads reach the worker through the hq[] queue. */
+     * slots, the arena, the swap and the page. The worker's pokes reach the
+     * arena through pokes[], applied before the next fetch; the console's
+     * mailbox writes reach the worker through the hq[] queue. */
     bool async;
     bool worker_running;
     pthread_t worker;
@@ -71,16 +76,21 @@ struct chf_fujinet {
     uint16_t hq[QUEUE_SIZE];
     unsigned qhead, qtail;
     atomic_bool stop;
-    atomic_bool busy;           /* the worker is inside fujimail_read_hotspot() */
+    atomic_bool busy;           /* the worker is inside fujimail */
     pthread_mutex_t pklock;
     uint16_t pk_addr[MAX_POKES];
     uint8_t pk_data[MAX_POKES];
     unsigned npokes;
     atomic_bool poked;
 
-    /* the 60 Hz tick's clock */
+    /* the events the debugger watches */
+    chf_fj_event_t ev[EV_RING];
+    uint64_t evn;
+
+    /* the 60 Hz tick's clock: the CPU's cycle counter, and its PC0 */
     const uint64_t *cycles;
-    double cycle_hz;
+    const uint16_t *pc0;
+    uint64_t cycle_as;          /* attoseconds a CPU clock lasts */
 
     /* the link */
     char boip[96];
@@ -115,16 +125,36 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-static void apply_poke(chf_fujinet_t *c, unsigned offset, uint8_t value);
+/*-------------------------------------------------
+    the tick
+-------------------------------------------------*/
+
+/* machine().time().as_ticks(60): floor(seconds * 60), from the CPU's cycle
+ * count and MAME's integer attoseconds per cycle */
+static uint16_t tick_now(const chf_fujinet_t *c)
+{
+    uint64_t t;
+
+    if (!c->cycles || !c->cycle_as)
+        return 0;
+#ifdef __SIZEOF_INT128__
+    t = (uint64_t)(((unsigned __int128)*c->cycles * c->cycle_as * 60u) / UINT64_C(1000000000000000000));
+#else
+    t = (uint64_t)((long double)*c->cycles * (long double)c->cycle_as * 60.0L / 1e18L);
+#endif
+    return (uint16_t)t;
+}
 
 /*-------------------------------------------------
     C port callbacks
 -------------------------------------------------*/
 
+/* poke(): a byte of the arena. The worker's go through the queue. */
 static void poke(chf_fujinet_t *c, unsigned offset, uint8_t value)
 {
     if (!t_on_worker) {
-        apply_poke(c, offset, value);
+        if (offset < FN_ARENA_SIZE)
+            c->arena[offset] = value;
         return;
     }
     pthread_mutex_lock(&c->pklock);
@@ -237,21 +267,41 @@ static const fujimail_port_t quiet_port = {
 };
 
 /*-------------------------------------------------
-    the slots
+    the slots, the page and the mailbox switch
 -------------------------------------------------*/
 
-/* fuji_cart_poke(): the running image's slot, and a staged one that claims the
- * mailbox, so its client never sees a stale status page. The tick is the
- * timer's. A game that does not claim keeps its bytes pristine. */
-static void apply_poke(chf_fujinet_t *c, unsigned offset, uint8_t value)
+/* set_image(): called at power-on and after every swap, so a swap always maps
+ * page 0 */
+static void set_image(chf_fujinet_t *c)
 {
-    if (!atomic_load(&c->mailbox_live))
+    const uint8_t np = c->npages[c->live];
+
+    c->mem.rom = c->slot[c->live];
+    c->mem.rom_size = CHFMAP_WINDOW;
+    c->mem.npages = np;
+    c->mem.pages = np ? c->slot[c->live] + CHFMAP_WINDOW : NULL;
+    c->mem.bank = c->mem.pages;
+}
+
+/* set_mailbox(): the arena always answers, since the swap stub runs from it;
+ * only the mailbox decode comes and goes */
+static void set_mailbox(chf_fujinet_t *c, bool live)
+{
+    c->mem.ram = c->arena;
+    c->mem.ram_base = FN_ARENA_BASE;
+    c->mem.ram_size = FN_ARENA_SIZE;
+    c->mem.mailbox = live;
+}
+
+static void apply_pokes(chf_fujinet_t *c, const uint16_t *addr, const uint8_t *data, unsigned n)
+{
+    /* only while the mailbox is live: a transaction in flight when a swap made
+     * the arena plain RAM must not scribble on it */
+    if (!c->mem.mailbox)
         return;
-    if (offset == FN_R_TICK_LO || offset == FN_R_TICK_HI)
-        return;
-    c->slot[c->live][offset & 0x1fff] = value;
-    if (c->have_staged && c->staged_claims)
-        c->slot[c->live ^ 1][offset & 0x1fff] = value;
+    for (unsigned i = 0; i < n; i++)
+        if (addr[i] < FN_ARENA_SIZE)
+            c->arena[addr[i]] = data[i];
 }
 
 static void drain_pokes(chf_fujinet_t *c)
@@ -269,35 +319,77 @@ static void drain_pokes(chf_fujinet_t *c)
     c->npokes = 0;
     atomic_store_explicit(&c->poked, false, memory_order_relaxed);
     pthread_mutex_unlock(&c->pklock);
-    pthread_mutex_lock(&c->loadlock);
-    for (unsigned i = 0; i < n; i++)
-        apply_poke(c, addr[i], data[i]);
-    pthread_mutex_unlock(&c->loadlock);
+    apply_pokes(c, addr, data, n);
 }
 
-/* do_swap(): no repaint -- the status page was carried into the staged slot
- * when it was staged, exactly as the cartridge does it, so the protocol state
- * (ACKSEQ against fujimail's last sequence) stays one piece. */
+/* hand an event to fujimail: inline, or through the worker's queue */
+static void queue_hotspot(chf_fujinet_t *c, unsigned img)
+{
+    if (!c->async) {
+        if (img == HQ_PAINT)
+            fujimail_paint();
+        else
+            fujimail_read_hotspot((uint16_t)img);
+        return;
+    }
+    pthread_mutex_lock(&c->qlock);
+    {
+        unsigned next = (c->qhead + 1) % QUEUE_SIZE;
+
+        if (next != c->qtail) {
+            c->hq[c->qhead] = (uint16_t)img;
+            c->qhead = next;
+        }
+    }
+    pthread_cond_signal(&c->qcv);
+    pthread_mutex_unlock(&c->qlock);
+}
+
+/* Wait (at most `limit_ms`) until the worker has handled every event queued
+ * so far. */
+static void wait_worker_idle(chf_fujinet_t *c, unsigned limit_ms)
+{
+    const uint64_t deadline = now_ms() + limit_ms;
+
+    for (;;) {
+        bool empty;
+
+        pthread_mutex_lock(&c->qlock);
+        empty = c->qhead == c->qtail;
+        pthread_mutex_unlock(&c->qlock);
+        if ((empty && !atomic_load(&c->busy)) || atomic_load(&c->stop) || now_ms() >= deadline)
+            return;
+        sleep_us(20);
+    }
+}
+
+/* do_swap(): the staged image becomes the served one, on page 0, and the
+ * mailbox follows the new image's claim. Inline in whatever serves the bus. */
 static void do_swap(chf_fujinet_t *c)
 {
+    bool live;
+
     pthread_mutex_lock(&c->loadlock);
     if (!c->have_staged || !atomic_load(&c->swap_armed)) {
         pthread_mutex_unlock(&c->loadlock);
         return;
     }
     c->live ^= 1;
-    arcapp_reset(&c->app, c->slot[c->live], c->npages[c->live], c->ffpage);
+    c->npages[c->live ^ 1] = 0;
+    set_image(c);
     atomic_store(&c->swap_armed, false);
     c->have_staged = false;
-    atomic_store(&c->mailbox_live, c->staged_claims);
+    live = c->staged_claims;
+    set_mailbox(c, live);
     c->swaps++;
     c->served_other = true;
     c->live_size = c->staged_size;
     c->live_crc = c->staged_crc;
-    c->staged_app = false;
     pthread_mutex_unlock(&c->loadlock);
-    fprintf(stderr, "fujinet: swapped in the staged image; mailbox %s for this session\n",
-            c->staged_claims ? "kept" : "disabled");
+    if (live)
+        queue_hotspot(c, HQ_PAINT);
+    fprintf(stderr, "fujinet: swapped in the staged image (%u bytes); mailbox %s for this session\n",
+            (unsigned)c->staged_size, live ? "kept" : "disabled");
 }
 
 /*-------------------------------------------------
@@ -307,18 +399,24 @@ static void do_swap(chf_fujinet_t *c)
 static uint8_t c_stream_open(int stream, uint32_t size)
 {
     chf_fujinet_t *c = s_cart;
-    uint8_t err = (stream == 0) ? chfmap_gate(size) : 0;
+    const unsigned s = (unsigned)stream & 1;
+    uint8_t err = (stream == FN_STREAM_ROM) ? chfmap_gate(size) : 0;
 
     if (err != 0)
         return err;
-    c->rx_len[stream & 1] = 0;
-    if (size && size > c->rx_cap[stream & 1]) {
-        uint8_t *p = realloc(c->rx[stream & 1], size);
+    if (stream == FN_STREAM_ROM) {
+        pthread_mutex_lock(&c->loadlock);
+        c->have_staged = false;         /* its slot is about to be overwritten */
+        pthread_mutex_unlock(&c->loadlock);
+    }
+    c->rx_len[s] = 0;
+    if (size && size > c->rx_cap[s]) {
+        uint8_t *p = realloc(c->rx[s], size);
 
         if (!p)
             return FN_BOOT_ERR_TOOBIG;
-        c->rx[stream & 1] = p;
-        c->rx_cap[stream & 1] = size;
+        c->rx[s] = p;
+        c->rx_cap[s] = size;
     }
     return 0;
 }
@@ -352,33 +450,25 @@ static uint8_t c_stream_close(int stream, uint32_t got, bool aborted)
     uint8_t *staged;
 
     (void)got;          /* rx_len is the byte count that actually landed */
-    if (aborted || stream != 0) {
-        c->rx_len[s] = 0;       /* the .cfg sibling means nothing to this cartridge */
+    if (stream != FN_STREAM_ROM) {
+        c->rx_len[s] = 0;       /* the .cfg sibling: there are no mappers here, so it is dropped */
         return 0;
     }
-    switch (chfmap_plan(c->rx[s], c->rx_len[s], &plan)) {
-    case CHFMAP_OK:
-        break;
-    case CHFMAP_ETOOBIG:
+    if (aborted) {
         c->rx_len[s] = 0;
-        return FN_BOOT_ERR_TOOBIG;
-    case CHFMAP_ENOMAP:
-    case CHFMAP_ENOCLAIM:
+        return 0;
+    }
+    if (c->rx_len[s] == 0 || chfmap_plan(c->rx[s], c->rx_len[s], &plan) != CHFMAP_OK) {
         c->rx_len[s] = 0;
         return FN_BOOT_ERR_NOMAP;
-    default:
-        c->rx_len[s] = 0;
-        return FN_BOOT_ERR_TRUNCATED;
     }
     pthread_mutex_lock(&c->loadlock);
     staged = c->slot[c->live ^ 1];
     memset(staged, 0xff, CHFMAP_STORE);
     chfmap_apply(c->rx[s], &plan, staged);
-    if (plan.mailbox_ok)
-        chfmap_carry_status(staged, c->slot[c->live]);
     c->npages[c->live ^ 1] = plan.npages;
+    c->staged_plan = plan;
     c->staged_claims = plan.mailbox_ok;
-    c->staged_app = plan.npages != 0;
     c->staged_size = c->rx_len[s];
     c->staged_crc = chf_crc32(c->rx[s], c->rx_len[s]);
     c->have_staged = true;
@@ -401,107 +491,84 @@ static void c_arm_swap(void)
     the slot interface
 -------------------------------------------------*/
 
-static uint16_t tick_now(const chf_fujinet_t *c)
-{
-    if (!c->cycles || c->cycle_hz <= 0.0)
-        return 0;
-    return (uint16_t)(uint64_t)((double)*c->cycles * 60.0 / c->cycle_hz);
-}
-
-static void queue_hotspot(chf_fujinet_t *c, unsigned img)
-{
-    if (!c->async) {
-        fujimail_read_hotspot((uint16_t)img);
-        return;
-    }
-    pthread_mutex_lock(&c->qlock);
-    {
-        unsigned next = (c->qhead + 1) % QUEUE_SIZE;
-
-        if (next != c->qtail) {
-            c->hq[c->qhead] = (uint16_t)img;
-            c->qhead = next;
-        }
-    }
-    pthread_cond_signal(&c->qcv);
-    pthread_mutex_unlock(&c->qlock);
-}
-
-/* Wait (at most `limit_ms`) until the worker has handled every hotspot read
- * queued so far. */
-static void wait_worker_idle(chf_fujinet_t *c, unsigned limit_ms)
-{
-    const uint64_t deadline = now_ms() + limit_ms;
-
-    for (;;) {
-        bool empty;
-
-        pthread_mutex_lock(&c->qlock);
-        empty = c->qhead == c->qtail;
-        pthread_mutex_unlock(&c->qlock);
-        if ((empty && !atomic_load(&c->busy)) || atomic_load(&c->stop) || now_ms() >= deadline)
-            return;
-        sleep_us(20);
-    }
-}
-
-/* One cartridge access, in connector terms: a14 = console address & $3FFF.
- * Both read_rom and extra_rom funnel here so the alias behaviour ($4000,
- * $6000) and the open-bus holes ($3000, $5000, $7000) fall out of
- * chfmap_decode rather than being special-cased. */
-static uint8_t serve(chf_fujinet_t *c, unsigned a14, int peek)
-{
-    int img = chfmap_decode(a14);
-    uint8_t data;
-
-    if (img < 0)
-        return 0xff;                /* A12 high: chip select off, open bus */
-    if (c->async)
-        drain_pokes(c);
-
-    /* the tick: the cartridge's timer repaints it; here it is emulated time */
-    if (atomic_load_explicit(&c->mailbox_live, memory_order_relaxed) &&
-        (img == FN_R_TICK_LO || img == FN_R_TICK_HI)) {
-        const uint16_t tick = tick_now(c);
-
-        return img == FN_R_TICK_LO ? (uint8_t)tick : (uint8_t)(tick >> 8);
-    }
-
-    data = arcapp_byte(&c->app, (unsigned)img);
-
-    /* hotspot side effects: never for the debugger, never once the mailbox is
-     * dead. The swap, bank selects and cart RAM writes are handled here
-     * rather than in fujimail because they must happen inline in whatever
-     * serves the bus (core1 does the same). */
-    if (!peek && img >= FN_H_REGSEL) {
-        if (img == FN_H_REGSEL + FN_HOT_SWAP) {
-            /* The client wrote BOOTLOCK a few cycles ago; on the cartridge core0
-             * has long since seen it. Here the worker may not have yet, so give
-             * it the moment it needs rather than let the swap be missed. */
-            if (!atomic_load(&c->swap_armed) && c->async)
-                wait_worker_idle(c, 50);
-            if (atomic_load(&c->swap_armed))
-                do_swap(c);
-        } else if (atomic_load(&c->mailbox_live) && !arcapp_hotspot(&c->app, (unsigned)img)) {
-            queue_hotspot(c, (unsigned)img);
-        }
-    }
-    return data;
-}
-
+/* read_rom(): the driver maps $0800-$FFFF here. Reads have no side effects. */
 static uint8_t fj_read_rom(chf_cart_t *base, uint16_t offset, int peek)
 {
-    return serve((chf_fujinet_t *)base->priv, offset & 0x0fff, peek);   /* $0000-$0FFF: block 1 */
+    chf_fujinet_t *c = base->priv;
+    const uint16_t a = (uint16_t)(offset + FN_ROM_BASE);
+
+    (void)peek;
+    if (c->async)
+        drain_pokes(c);
+    /* The cart paints the tick from a timer; here it is emulated time. */
+    if (c->mem.mailbox && (a == FN_ARENA_BASE + FN_R_TICK_LO || a == FN_ARENA_BASE + FN_R_TICK_HI)) {
+        const uint16_t t = tick_now(c);
+
+        return a == FN_ARENA_BASE + FN_R_TICK_LO ? (uint8_t)t : (uint8_t)(t >> 8);
+    }
+    return chf_read(&c->mem, a);
 }
 
-static uint8_t fj_extra_rom(chf_cart_t *base, uint16_t offset, int peek)
+static void record(chf_fujinet_t *c, uint8_t kind, uint8_t reg, uint8_t value)
 {
-    /* installed over console $2000-$7FFF; the offset is relative to $2000, so
-     * rebuild the console address and let the decode sort it out */
-    return serve((chf_fujinet_t *)base->priv, (offset + 0x2000) & 0x3fff, peek);
+    chf_fj_event_t *e = &c->ev[c->evn & (EV_RING - 1)];
+
+    e->cycle = c->cycles ? *c->cycles : 0;
+    e->pc = c->pc0 ? (uint16_t)(*c->pc0 - 1) : 0;
+    e->kind = kind;
+    e->reg = reg;
+    e->value = value;
+    c->evn++;
 }
 
-static const chf_cart_ops_t fujinet_ops = { fj_read_rom, fj_extra_rom };
+/* write_ram(): every store at $0800-$FFFF (ROMC 05). */
+static void fj_write_ram(chf_cart_t *base, uint16_t offset, uint8_t data)
+{
+    chf_fujinet_t *c = base->priv;
+    uint8_t reg = 0, val = 0;
+    chf_ev_t ev;
+
+    if (c->async)
+        drain_pokes(c);
+    ev = chf_write(&c->mem, (uint16_t)(offset + FN_ROM_BASE), data, &reg, &val);
+
+    switch (ev) {
+    case CHF_EV_REG:
+        /* expand into the REGSEL/REGDATA pair fujimail decodes */
+        record(c, 1, reg, val);
+        queue_hotspot(c, (unsigned)(FN_H_REGSEL + reg));
+        queue_hotspot(c, (unsigned)(FN_H_REGDATA + val));
+        break;
+
+    case CHF_EV_TX:
+        record(c, 2, 0, val);
+        queue_hotspot(c, (unsigned)(FN_H_DATA + val));
+        break;
+
+    case CHF_EV_SWAP:
+        /* The client wrote BOOTLOCK a few cycles ago; on the cartridge core0
+         * has long since seen it. Here the worker may not have yet, so give it
+         * the moment it needs rather than let the swap be missed. */
+        if (!atomic_load(&c->swap_armed) && c->async)
+            wait_worker_idle(c, 50);
+        record(c, 4, 0, atomic_load(&c->swap_armed) ? 1 : 0);
+        if (atomic_load(&c->swap_armed))
+            do_swap(c);
+        break;
+
+    case CHF_EV_BANK:
+        /* chf_write already switched the page */
+        record(c, 3, 0, val);
+        if (c->debug)
+            fprintf(stderr, "fujinet: page %u\n", (unsigned)val);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static const chf_cart_ops_t fujinet_ops = { .read_rom = fj_read_rom, .write_ram = fj_write_ram };
 
 /*-------------------------------------------------
     the worker
@@ -527,8 +594,9 @@ static void *worker_main(void *arg)
         atomic_store(&c->busy, true);
         pthread_mutex_unlock(&c->qlock);
 
-        /* reads queued before a swap are the old image's */
-        if (atomic_load(&c->mailbox_live))
+        if (img == HQ_PAINT)
+            fujimail_paint();
+        else if (c->mem.mailbox)        /* events queued before a swap are the old image's */
             fujimail_read_hotspot(img);
         atomic_store(&c->busy, false);
     }
@@ -585,21 +653,29 @@ chf_fujinet_t *chf_fujinet_create(void)
         return NULL;
     c->slot[0] = malloc(CHFMAP_STORE);
     c->slot[1] = malloc(CHFMAP_STORE);
-    if (!c->slot[0] || !c->slot[1]) {
+    c->arena = calloc(1, FN_ARENA_SIZE);
+    if (!c->slot[0] || !c->slot[1] || !c->arena) {
         free(c->slot[0]);
         free(c->slot[1]);
+        free(c->arena);
         free(c);
         return NULL;
     }
     memset(c->slot[0], 0xff, CHFMAP_STORE);
     memset(c->slot[1], 0xff, CHFMAP_STORE);
-    memset(c->ffpage, 0xff, sizeof c->ffpage);
+
+    /* the slot: $0800-$FFFF is the cartridge's; reads come from read_rom,
+     * every store from write_ram */
     c->base.ops = &fujinet_ops;
     c->base.type = CHF_CART_FUJINET;
-    c->base.extra_lo = 0x2000;
-    c->base.extra_hi = 0x7fff;
+    c->base.ram_lo = FN_ROM_BASE;
+    c->base.ram_hi = 0xffff;
+    c->base.bank_lo = 1;
+    c->base.bank_hi = 0;
+    c->base.io_lo = 1;
+    c->base.io_hi = 0;
     c->base.priv = c;
-    atomic_init(&c->mailbox_live, true);
+
     atomic_init(&c->swap_armed, false);
     atomic_init(&c->stop, false);
     atomic_init(&c->poked, false);
@@ -608,7 +684,8 @@ chf_fujinet_t *chf_fujinet_create(void)
     pthread_mutex_init(&c->qlock, NULL);
     pthread_cond_init(&c->qcv, NULL);
     pthread_mutex_init(&c->pklock, NULL);
-    arcapp_reset(&c->app, c->slot[0], 0, c->ffpage);
+    set_image(c);
+    set_mailbox(c, false);          /* until an image claims it */
     s_cart = c;
     return c;
 }
@@ -622,6 +699,7 @@ void chf_fujinet_destroy(chf_fujinet_t *c)
         s_cart = NULL;
     free(c->slot[0]);
     free(c->slot[1]);
+    free(c->arena);
     free(c->rx[0]);
     free(c->rx[1]);
     pthread_mutex_destroy(&c->loadlock);
@@ -641,7 +719,13 @@ void chf_fujinet_set_clock(chf_fujinet_t *c, const uint64_t *cycles, double cycl
     if (!c)
         return;
     c->cycles = cycles;
-    c->cycle_hz = cycle_hz;
+    c->cycle_as = cycle_hz > 0.0 ? UINT64_C(1000000000000000000) / (uint64_t)(cycle_hz + 0.5) : 0;
+}
+
+void chf_fujinet_set_pc(chf_fujinet_t *c, const uint16_t *pc0)
+{
+    if (c)
+        c->pc0 = pc0;
 }
 
 static void set_why(char *why, int whysz, const char *text)
@@ -654,9 +738,9 @@ static const char *plan_error(chfmap_err_t err)
 {
     switch (err) {
     case CHFMAP_EEMPTY:    return "the cartridge image is empty";
-    case CHFMAP_ETOOBIG:   return "the image is larger than the cartridge can hold (70 KB)";
-    case CHFMAP_ENOMAP:    return "the image is over 8 KB but not 8 KB + k x 2 KB";
-    case CHFMAP_ENOCLAIM:  return "an image over 8 KB must carry the FujiNet claim";
+    case CHFMAP_ETOOBIG:   return "the image is larger than the cartridge can hold (a 16 KB window and up to six 8 KB pages)";
+    case CHFMAP_ENOSIG:    return "the image has no $55 at $0800, so the console's BIOS would not start it";
+    case CHFMAP_ENOCLAIM:  return "an image with APPBANK pages must carry the FujiNet claim";
     default:               return "the image is not a cartridge this FujiNet cart can map";
     }
 }
@@ -699,15 +783,18 @@ int chf_fujinet_power_on(chf_fujinet_t *c, const uint8_t *image, uint32_t len,
     c->pace_ms = env ? (unsigned)atoi(env) : 0;
     memset(c->slot[0], 0xff, CHFMAP_STORE);
     memset(c->slot[1], 0xff, CHFMAP_STORE);
+    memset(c->arena, 0x00, FN_ARENA_SIZE);
     c->npages[0] = c->npages[1] = 0;
     c->live = 0;
-    c->have_staged = c->staged_claims = c->staged_app = false;
+    c->have_staged = c->staged_claims = false;
+    memset(&c->staged_plan, 0, sizeof c->staged_plan);
     atomic_store(&c->swap_armed, false);
     c->swaps = 0;
     c->served_other = false;
     c->staged_size = c->staged_crc = 0;
     c->rx_len[0] = c->rx_len[1] = 0;
     c->npokes = 0;
+    c->evn = 0;
     atomic_store(&c->poked, false);
 
     if (!image) {
@@ -725,13 +812,14 @@ int chf_fujinet_power_on(chf_fujinet_t *c, const uint8_t *image, uint32_t len,
         return -1;
     }
     chfmap_apply(image, &plan, c->slot[0]);
-    atomic_store(&c->mailbox_live, plan.mailbox_ok);
     c->npages[0] = plan.npages;
-    arcapp_reset(&c->app, c->slot[0], plan.npages, c->ffpage);
+    set_image(c);
+    set_mailbox(c, plan.mailbox_ok);
     if (plan.npages)
-        fprintf(stderr, "fujinet: APPBANK image, %u pages; mailbox kept\n", plan.npages);
-    else if (!plan.mailbox_ok)
-        fprintf(stderr, "fujinet: image carries no claim signature; running with the mailbox dead\n");
+        fprintf(stderr, "fujinet: APPBANK image, %u pages; mailbox kept\n", (unsigned)plan.npages);
+    else
+        fprintf(stderr, "fujinet: %u-byte image loaded, mailbox %s\n", (unsigned)len,
+                plan.mailbox_ok ? "live" : "dead");
 
     /* the link: "" = FujiNet switched off */
     c->have_boip = boip && boip[0];
@@ -750,6 +838,8 @@ int chf_fujinet_power_on(chf_fujinet_t *c, const uint8_t *image, uint32_t len,
         if (!c->link_off)
             fujitcp_init(c->boip);      /* a miss is retried by the transaction */
         fujimail_paint();
+    } else {
+        fprintf(stderr, "fujinet: no claim signature at $47FC; running with the mailbox dead\n");
     }
     c->powered = true;
     if (plan.mailbox_ok)
@@ -781,28 +871,28 @@ void chf_fujinet_status(chf_fujinet_t *c, chf_cart_status_t *out)
     const uint8_t *mb;
 
     memset(out, 0, sizeof *out);
+    out->page = -1;
     if (!c)
         return;
     out->powered = c->powered;
-    out->mailbox = atomic_load(&c->mailbox_live);
+    out->mailbox = c->mem.mailbox;
     out->link_up = fujitcp_active();
     out->link_off = c->link_off;
     out->app_live = c->npages[c->live] != 0;
     out->booted_game = c->served_other;
     out->armed = atomic_load(&c->swap_armed);
-    out->staged_app = c->have_staged && c->staged_app;
+    out->staged_app = c->have_staged && c->staged_plan.npages != 0;
     out->staged_mailbox = c->have_staged && c->staged_claims;
     out->live_size = c->live_size;
     out->live_crc = c->live_crc;
     out->staged_size = c->staged_size;
     out->staged_crc = c->staged_crc;
     out->swaps = c->swaps;
-    out->nbanks = c->npages[c->live];
-    if (c->npages[c->live])
-        out->bank = c->app.win == c->app.base
-                        ? 0
-                        : (unsigned)(1 + (c->app.win + FN_APP_WIN - (c->app.base + CHFMAP_WINDOW)) / FN_APP_PAGE);
-    mb = c->slot[c->live];
+    out->npages = c->npages[c->live];
+    if (c->mem.pages && c->mem.bank)
+        out->page = (int)((c->mem.bank - c->mem.pages) / FN_APP_PAGE);
+    out->tick = c->mem.mailbox ? tick_now(c) : 0;
+    mb = c->arena;
     out->ackseq = mb[FN_R_ACKSEQ];
     out->status = mb[FN_R_STATUS];
     out->err = mb[FN_R_ERR];
@@ -816,29 +906,49 @@ void chf_fujinet_status(chf_fujinet_t *c, chf_cart_status_t *out)
     pthread_mutex_unlock(&c->qlock);
 }
 
+uint8_t chf_fujinet_peek(chf_fujinet_t *c, uint16_t addr)
+{
+    if (!c)
+        return 0xff;
+    if (c->mem.mailbox && (addr == FN_ARENA_BASE + FN_R_TICK_LO || addr == FN_ARENA_BASE + FN_R_TICK_HI)) {
+        const uint16_t t = tick_now(c);
+
+        return addr == FN_ARENA_BASE + FN_R_TICK_LO ? (uint8_t)t : (uint8_t)(t >> 8);
+    }
+    return chf_read(&c->mem, addr);
+}
+
+void chf_fujinet_poke(chf_fujinet_t *c, uint16_t addr, uint8_t data)
+{
+    if (!c || addr < FN_ROM_BASE)
+        return;
+    if (addr >= FN_ARENA_BASE) {
+        /* an edit never fires a hotspot */
+        if (!c->mem.mailbox || addr - FN_ARENA_BASE < FN_H_REGSEL)
+            c->arena[addr - FN_ARENA_BASE] = data;
+        return;
+    }
+    if ((uint32_t)(addr - FN_ROM_BASE) < c->mem.rom_size) {
+        c->slot[c->live][addr - FN_ROM_BASE] = data;
+    } else if (c->mem.bank && (uint16_t)(addr - FN_APP_WIN) < FN_APP_PAGE) {
+        ((uint8_t *)c->mem.bank)[addr - FN_APP_WIN] = data;
+    }
+}
+
 void chf_fujinet_mailbox(chf_fujinet_t *c, uint8_t out[CHF_FJ_MAILBOX_BYTES])
 {
     if (!c) {
         memset(out, 0xff, CHF_FJ_MAILBOX_BYTES);
         return;
     }
-    memcpy(out, &c->slot[c->live][FN_R_DATA], CHF_FJ_MAILBOX_BYTES);
-    if (atomic_load(&c->mailbox_live)) {
-        const uint16_t tick = tick_now(c);
-
-        out[FN_R_TICK_LO - FN_R_DATA] = (uint8_t)tick;
-        out[FN_R_TICK_HI - FN_R_DATA] = (uint8_t)(tick >> 8);
-    }
+    for (unsigned i = 0; i < CHF_FJ_MAILBOX_BYTES; i++)
+        out[i] = chf_fujinet_peek(c, (uint16_t)(FN_ARENA_BASE + FN_R_DATA + i));
 }
 
 uint8_t chf_fujinet_image_byte(chf_fujinet_t *c, uint32_t offset)
 {
     if (!c || offset >= CHFMAP_STORE)
         return 0xff;
-    if (offset == FN_R_TICK_LO || offset == FN_R_TICK_HI) {
-        if (atomic_load(&c->mailbox_live))
-            return offset == FN_R_TICK_LO ? (uint8_t)tick_now(c) : (uint8_t)(tick_now(c) >> 8);
-    }
     return c->slot[c->live][offset];
 }
 
@@ -848,14 +958,46 @@ void chf_fujinet_image_poke(chf_fujinet_t *c, uint32_t offset, uint8_t data)
         c->slot[c->live][offset] = data;
 }
 
+uint8_t chf_fujinet_arena(chf_fujinet_t *c, uint32_t offset)
+{
+    if (!c || offset >= FN_ARENA_SIZE)
+        return 0xff;
+    if (c->mem.mailbox && (offset == FN_R_TICK_LO || offset == FN_R_TICK_HI)) {
+        const uint16_t t = tick_now(c);
+
+        return offset == FN_R_TICK_LO ? (uint8_t)t : (uint8_t)(t >> 8);
+    }
+    return c->arena[offset];
+}
+
+void chf_fujinet_arena_poke(chf_fujinet_t *c, uint32_t offset, uint8_t data)
+{
+    if (c && offset < FN_ARENA_SIZE)
+        c->arena[offset] = data;
+}
+
+int chf_fujinet_events(chf_fujinet_t *c, uint64_t *cursor, chf_fj_event_t *out, int max)
+{
+    int n = 0;
+
+    if (!c || !cursor)
+        return 0;
+    if (c->evn > EV_RING && *cursor < c->evn - EV_RING)
+        *cursor = c->evn - EV_RING;     /* fell behind the ring */
+    if (*cursor > c->evn)
+        *cursor = c->evn;
+    while (*cursor < c->evn && n < max)
+        out[n++] = c->ev[(*cursor)++ & (EV_RING - 1)];
+    return n;
+}
+
 uint32_t chf_fujinet_copy_image(chf_fujinet_t *c, uint8_t *dst, uint32_t max)
 {
     uint32_t n;
 
     if (!c || !dst)
         return 0;
-    n = c->npages[c->live] ? (uint32_t)CHFMAP_WINDOW + (uint32_t)(c->npages[c->live] - 1) * CHFMAP_PAGE
-                           : (uint32_t)CHFMAP_WINDOW;
+    n = c->live_size < CHFMAP_STORE ? c->live_size : CHFMAP_STORE;
     if (n > max)
         n = max;
     memcpy(dst, c->slot[c->live], n);

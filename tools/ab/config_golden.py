@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """config_golden.py -- regenerate core/tests/config_golden.h from MAME.
 
-    config_golden.py [--frames N] [--at 0,1,2,...] > core/tests/config_golden.h
+    config_golden.py [--frames N] [--at 0,1,2,...] [--stub-rompath DIR] > core/tests/config_golden.h
 
-Runs MAME (`channelf -cartslot fujinet`, the link down) on the baked CONFIG
-client, dumps every frame through tools/ab/chf_frames.lua and prints the
-FNV-1a-style hash of the colour words of the chosen frames. The test
-core/tests/config_frames_test.c boots the same machine in our core and must
-reproduce every hash: CONFIG exercises the 2650, the UVI's per-line
-rendering, the palette and UDC writes and the cartridge's flat-image serving
-and mailbox, all against MAME. The Channel F needs no ROM, so the goldens can be
-committed and the test needs neither MAME nor a ROM.
+Runs MAME (`-cartslot fujinet`, FUJINET_TCP=127.0.0.1:9 so the link is down) on
+the baked CONFIG client (extracted from the staged core/chf/fuji-generated/
+fujiconfigrom.h), NTSC (`channelf`) and PAL (`sabavdpl`), dumps every frame
+through tools/ab/chf_frames.lua and prints the FNV-1a-style hash of the colour
+words of the chosen frames (our 204 x 232 shape: a PAL frame's rows are 5 lines
+tall in MAME and are collapsed to the first line of each).
 
-Needs MAME with the FujiNet Channel F cartridge device (fujinet-firmware's
-pico/channelf/emu/apply.sh) and the staged firmware headers
-(core/chf/fuji-generated/fujiconfigrom.h: configure the project first).
-MAME's frame notifier runs before the screen's update, so what it dumps at
-notifier n is frame n-1 (the first dump is the blank power-on bitmap): ours[i]
-is MAME's dump i+1.
+Two sets of goldens come out, one per BIOS the machine can run:
+  real   MAME with its own BIOS (sl31253, the user's ROMs from MAME's rompath):
+         core/tests/config_frames_test.c reproduces them when CHF_BIOS_DIR holds the
+         same BIOS;
+  stub   MAME with the app's stand-in BIOS (core/chf/stub.c) installed under the
+         BIOS names in a private rompath (--stub-rompath DIR holds channelf/
+         sl31253.rom, sl31254.rom and sl90025.rom made from it: MAME warns of the
+         checksums and runs). This is the one the CI runs, with no ROM: the stub
+         must put CONFIG on the screen exactly as MAME does with it. Without
+         --stub-rompath the stub tables are empty and the test skips that half.
+
+The test needs neither MAME nor a ROM to RUN (the goldens are committed); this
+script needs MAME with the FujiNet graft (fujinet-firmware's pico/channelf/emu/
+apply.sh) and the staged firmware headers (configure the project first). MAME's
+frame notifier runs before the screen's update, so what it dumps at notifier n is
+frame n - 1 (the first dump is the blank power-on bitmap): ours[i] is MAME's
+dump i + 1.
 """
 import argparse
 import os
@@ -28,6 +37,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import chfab  # noqa: E402
 
+SETS = [("ntsc", "channelf"), ("pal", "sabavdpl")]
+
 
 def c_array(path):
     text = open(path).read()
@@ -35,34 +46,54 @@ def c_array(path):
     return bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", body))
 
 
+def golden(machine, cfg, frames, at, work, rompath):
+    mname, pal, hz, first = chfab.MACHINES[machine]
+    raw = os.path.join(work, "frames-%s.raw" % machine)
+    if os.path.exists(raw):
+        os.unlink(raw)
+    extra = ["-rompath", rompath] if rompath else []
+    chfab.run_mame(cfg, os.path.join(HERE, "chf_frames.lua"),
+                   {"CHF_FRAMES": raw, "CHF_FRAMES_N": frames + 2}, frames / 49 + 4, machine=machine,
+                   slot="fujinet", timeout=300, extra=extra)
+    dumps = chfab.load_mame_frames(raw, pal)[chfab.LEAD:]
+    if len(dumps) < max(at) + 1:
+        raise SystemExit("MAME produced only %d frames for %s" % (len(dumps), machine))
+    return [(f, chfab.fnv_frame(dumps[f])) for f in at]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--frames", type=int, default=420)
-    ap.add_argument("--at", default="0,1,2,3,5,10,20,40,100,200,300,400")
+    ap.add_argument("--frames", type=int, default=900)
+    # every frame while CONFIG paints (and a little after), then a sample of the settled screen
+    ap.add_argument("--at", default=",".join(map(str, list(range(0, 240)) + list(range(240, 900, 30)) + [899])))
+    ap.add_argument("--stub-rompath", default="")
     args = ap.parse_args()
     at = [int(x) for x in args.at.split(",")]
 
     work = chfab.work_dir()
     cfg = os.path.join(work, "config.bin")
-    open(cfg, "wb").write(
-        c_array(os.path.join(chfab.ROOT, "core/chf/fuji-generated/fujiconfigrom.h")))
-    raw = os.path.join(work, "frames.raw")
-    chfab.run_mame(cfg, os.path.join(HERE, "chf_frames.lua"),
-                   {"CHF_FRAMES": raw, "CHF_FRAMES_N": args.frames + 1,
-                    "FUJINET_TCP": "127.0.0.1:9"},
-                   args.frames / 59 + 3, cartslot="fujinet", timeout=180)
-    data = open(raw, "rb").read()[chfab.FRAME:]
-    n = len(data) // chfab.FRAME
-    if n < max(at) + 1:
-        raise SystemExit("MAME produced only %d frames" % n)
-    print("/* config_golden.h -- GENERATED by tools/ab/config_golden.py from MAME;")
-    print(" * the FNV-1a (64-bit) hash of the 0x00RRGGBB words of CONFIG's frames on the")
-    print(" * FujiNet cartridge, link down. Do not edit. */")
+    open(cfg, "wb").write(c_array(os.path.join(chfab.ROOT, "core/chf/fuji-generated/fujiconfigrom.h")))
+    print("/* config_golden.h -- GENERATED by tools/ab/config_golden.py from MAME; do not edit.")
+    print(" * The FNV-1a (64-bit) hash of the 0x00RRGGBB words of CONFIG's frames on the FujiNet")
+    print(" * cartridge, link down, frame for frame from frame 0: NTSC (channelf) and PAL (sabavdpl),")
+    print(" * with MAME's own BIOS (sl31253) and with the app's stand-in BIOS (the stub tables are")
+    print(" * empty until the stub's goldens are generated: --stub-rompath). */")
     print("")
-    print("static const struct { int frame; unsigned long long hash; } k_config_golden[] = {")
-    for f in at:
-        print("    { %d, 0x%016xull }," % (f, chfab.fnv_frame(data[f * chfab.FRAME:(f + 1) * chfab.FRAME])))
-    print("};")
+    print("typedef struct { int frame; unsigned long long hash; } config_golden_t;")
+    print("")
+    for bios, rompath in (("real", ""), ("stub", args.stub_rompath)):
+        for tag, machine in SETS:
+            print("static const config_golden_t k_config_%s_%s[] = {" % (bios, tag))
+            if bios == "stub" and not rompath:
+                print("    { -1, 0 },                       /* none yet */")
+            else:
+                for f, h in golden(machine, cfg, args.frames, at, work, rompath):
+                    print("    { %d, 0x%016xull }," % (f, h))
+            print("};")
+            print("static const int k_config_%s_%s_n = %s;" % (
+                bios, tag, "0" if bios == "stub" and not rompath else
+                "(int)(sizeof k_config_%s_%s / sizeof k_config_%s_%s[0])" % (bios, tag, bios, tag)))
+            print("")
 
 
 if __name__ == "__main__":

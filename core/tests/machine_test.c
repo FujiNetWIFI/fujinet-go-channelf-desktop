@@ -1,260 +1,431 @@
 /*
- * machine_test -- the console without a host thread (core/chf/machine.c): the
- * CPU's memory map as MAME's arcadia_mem and the cartridge slot lay it out, the
- * keypads, the panel and the fire wire as the CPU reads them, the pots from
- * digital and analog stick values, SENSE and the line timer against MAME's
- * scheduler arithmetic, the beeper, and the 2650's RESET key. The machine runs
- * a cartridge of this test's own (a 2650 loop), so only what the test pokes
- * through the CPU's bus callbacks happens.
+ * machine_test -- the whole console, with no host thread and no ROM: the memory
+ * map, the four ports and their latches, the pads, the VRAM strobe, the vertical
+ * blank's exact timing, the tone, RESET, the stand-in's rule, the FujiNet
+ * cartridge's tick, and the debugger's spaces and bookkeeping.
+ *
+ * The programs are F8 machine code written out by hand in test_chf.h's style, on
+ * the tests' own BIOS (a jump to the cartridge's entry); the expected values are
+ * worked out from MAME's driver (channelf.cpp) and its screen's timing, not read
+ * back from the code under test. The real BIOS and MAME are the A/B tools' business
+ * (tools/ab/).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "chf_internal.h"
+#include "test_chf.h"
 
 static int failures;
 static void check(int ok, const char *what)
 {
     printf("%s: %s\n", ok ? "ok" : "FAIL", what);
-    if (!ok) failures++;
+    if (!ok)
+        failures++;
 }
 
-#define K1(n) (1ull << (CHF_KEY_PAD_BASE(0) + (n)))
-#define K2(n) (1ull << (CHF_KEY_PAD_BASE(1) + (n)))
-#define KSTART  (1ull << CHF_KEY_START)
-#define KOPTION (1ull << CHF_KEY_OPTION)
-#define KSELECT (1ull << CHF_KEY_SELECT)
+static test_rig rig;
+static uint8_t img[0x40000];
 
-static chf_machine_t m;
-static uint8_t rom[8192];
-static chf_cart_t cart;
-
-/* the CPU's bus, as its callbacks see it */
-static uint8_t rd(uint16_t a) { return m.cpu.read(m.cpu.ctx, a); }
-static void wr(uint16_t a, uint8_t v) { m.cpu.write(m.cpu.ctx, a, v); }
-
-static void power_on(int machine, const uint8_t *image, uint32_t len)
+static void boot(int machine, int type, const uint8_t *code, size_t n, uint32_t size)
 {
+    test_cart(img, size, code, n, 0);
+    if (test_rig_init(&rig, machine, type, img, size) != 0) {
+        printf("FAIL: cannot build the rig\n");
+        exit(1);
+    }
+}
+
+static void frames(int n)
+{
+    for (int i = 0; i < n; i++)
+        chf_machine_run_frame(&rig.m);
+}
+
+/* ---- the clocks: MAME's integer attoseconds ---- */
+static void timing(void)
+{
+    static const uint8_t spin[] = { T_SPIN };
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, spin, sizeof spin, 0x800);
+    check(rig.m.cycle_as == 558730385769ull, "NTSC: a CPU clock is 1e18 / 1789772 attoseconds");
+    check(rig.m.frame_as == 16520537738766336ull,
+          "NTSC: the frame is 264 lines of 256 pixels at 4090908 Hz (1e18/px truncated, as MAME)");
+    check(rig.m.lines == 264 && rig.m.vbstart == 248 && rig.m.y_rpt == 4, "NTSC: 264 lines, blank at 248, rows 4 lines tall");
+    frames(600);
+    {
+        const uint64_t due = (uint64_t)(((unsigned __int128)600 * rig.m.frame_as) / rig.m.cycle_as);
+
+        check(rig.m.frames_done == 600, "600 frames fired");
+        check(rig.m.cpu.cycles >= due && rig.m.cpu.cycles < due + 24,
+              "the 600th blank fires on the first instruction boundary at or after floor(600 * frame / clock)");
+        printf("  NTSC: %.6f clocks a frame, %.5f Hz\n", (double)rig.m.cpu.cycles / 600.0, chf_machine_frame_hz(&rig.m));
+        check(chf_machine_frame_hz(&rig.m) > 60.5307 && chf_machine_frame_hz(&rig.m) < 60.5308, "60.5307 Hz");
+    }
+    boot(CHF_MACHINE_VIDEOPLAY, CHF_CART_STD, spin, sizeof spin, 0x800);
+    check(rig.m.cycle_as == 500000000000ull && rig.m.frame_as == 19968000000000000ull,
+          "PAL: 2 MHz CPU, 4 MHz pixel clock, 312 lines: exactly 39936 clocks a frame");
+    frames(100);
+    check(rig.m.cpu.cycles >= 100 * 39936ull && rig.m.cpu.cycles < 100 * 39936ull + 24, "PAL: 100 frames of 39936 clocks");
+    check(rig.m.lines == 312 && rig.m.vbstart == 310 && rig.m.y_rpt == 5 && chf_machine_is_pal(CHF_MACHINE_VIDEOPLAY2),
+          "PAL: 312 lines, blank at 310, rows 5 lines tall");
+    check(chf_machine_name(CHF_MACHINE_CHANNELF2) != NULL && !chf_machine_is_pal(CHF_MACHINE_CHANNELF2),
+          "the System II is NTSC and has a name");
+}
+
+/* ---- the ports and the VRAM strobe ---- */
+static void ports(void)
+{
+    /* value 2 at row 10, column 20, the BIOS's own sequence: colour, column, row, strobe $60 then $50 */
+    static const uint8_t pixel[] = { 0x20, 0x7f, 0xb1, 0x20, 0xeb, 0xb4, 0x20, 0x35, 0xb5, 0x20, 0x60, 0xb0,
+                                     0x20, 0x50, 0xb0, T_SPIN };
+    /* the same without a strobe: bit 5 never set */
+    static const uint8_t nostrobe[] = { 0x20, 0x7f, 0xb1, 0x20, 0xeb, 0xb4, 0x20, 0x35, 0xb5, 0x20, 0x50, 0xb0,
+                                        0x20, 0xdf, 0xb0, 0x20, 0x00, 0xb0, T_SPIN };
+    /* a held strobe re-stores: $20, then another colour with bit 5 still the last thing written, then port 0 again */
+    static const uint8_t level[] = { 0x20, 0x7f, 0xb1, 0x20, 0xeb, 0xb4, 0x20, 0x35, 0xb5, 0x20, 0x20, 0xb0,
+                                     0x20, 0x3f, 0xb1, 0x20, 0x20, 0xb0, T_SPIN };
+    const uint8_t *vram;
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, pixel, sizeof pixel, 0x800);
+    vram = rig.m.vid.vram;
+    frames(1);
+    check(vram[10 * 128 + 20] == 2, "the strobe stores colour 2 at row 10, column 20");
+    {
+        unsigned n = 0;
+
+        for (int i = 0; i < CF_VRAM_SIZE; i++)
+            n += vram[i] != 0;
+        check(n == 1, "and nothing else");
+    }
+    check(rig.m.vid.latch[0] == 0x50 && rig.m.vid.latch[1] == 0x7f && rig.m.vid.latch[2] == 0xeb && rig.m.vid.latch[3] == 0x35,
+          "the latches hold what the CPU wrote to ports 0, 1, 4 and 5");
+    check(rig.m.vid.val_reg == 2 && rig.m.vid.col_reg == 20 && rig.m.vid.row_reg == 10,
+          "the registers are the complements: value (~p1 >> 6) & 3, column ~p4 & $7F, row ~p5 & $3F");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_VRAM, 10 * 128 + 20) == 2, "the debugger reads it");
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, nostrobe, sizeof nostrobe, 0x800);
+    frames(1);
+    {
+        unsigned n = 0;
+
+        for (int i = 0; i < CF_VRAM_SIZE; i++)
+            n += rig.m.vid.vram[i] != 0;
+        check(n == 0, "port 0 writes without bit 5 store nothing ($50, $DF and $00)");
+    }
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, level, sizeof level, 0x800);
+    frames(1);
+    check(rig.m.vid.vram[10 * 128 + 20] == 3,
+          "bit 5 alone is a strobe (level-triggered): a second port 0 write stores the new colour (~$3F >> 6 = 3) again");
+}
+
+/* ---- the panel and the hand controllers ---- */
+static void pads(void)
+{
+    /* INS 0, INS 1, INS 4 into the RAM at $2800 (a chess cart), then the controller gate on (port 0 bit 6) and INS 1, INS 4 again */
+    static const uint8_t read[] = { 0x2a, 0x28, 0x00, 0xa0, 0x17, 0xa1, 0x17, 0xa4, 0x17, 0x20, 0x40, 0xb0,
+                                    0xa1, 0x17, 0xa4, 0x17, T_SPIN };
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_CHESS, read, sizeof read, 0x800);
+    rig.m.panel_live = 0x05;                 /* TIME and HOLD held: port 0 bits 0 and 2 */
+    rig.m.ctl_live[0] = 0x81;                /* player 1 = the right controller, port 1: right and push */
+    rig.m.ctl_live[1] = 0x42;                /* player 2 = the left controller, port 4: left and pull */
+    frames(2);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2800) == 0x0a,
+          "port 0 reads the console buttons complemented, bits 7-4 clear (~$F5 & $FF -> $0A)");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2801) == 0x7e, "port 1 reads the RIGHT controller, active low ($7E)");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2802) == 0xbd, "port 4 reads the LEFT controller, active low ($BD)");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2803) == 0x3e,
+          "with port 0 bit 6 set port 1 loses bits 7-6 ($3E: the contacts below bit 6 still read)");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2804) == 0x00, "and port 4 reads nothing at all ($00)");
+
+    /* inputs are latched at the frame boundary: a change mid-stream is seen from the next frame */
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_CHESS, read, sizeof read, 0x800);
+    frames(1);
+    rig.m.ctl_live[0] = 0xff;
+    /* the program left port 0 at $40 (the gate set), so port 1 reads ~($C0 | contacts) */
+    check(chf_machine_port_read(&rig.m, 1) == 0x3f, "a live change does not reach the port before the frame boundary");
+    chf_machine_latch_inputs(&rig.m);
+    check(chf_machine_port_read(&rig.m, 1) == 0x00, "and does at it");
+    check(chf_machine_port_read(&rig.m, 2) == 0 && chf_machine_port_read(&rig.m, 3) == 0 && chf_machine_port_read(&rig.m, 7) == 0,
+          "ports nothing answers read 0");
+}
+
+/* ---- the memory map ---- */
+static void memory(void)
+{
+    static const uint8_t spin[] = { T_SPIN };
+    /* store $A5 at $0900 (ROM: nothing), $2800 (RAM on a chess cart) and $3000 */
+    static const uint8_t st[] = { 0x2a, 0x09, 0x00, 0x20, 0xa5, 0x17, 0x2a, 0x28, 0x00, 0x20, 0xa5, 0x17,
+                                  0x2a, 0x30, 0x00, 0x20, 0xa5, 0x17, T_SPIN };
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, spin, sizeof spin, 0x800);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x0000) == 0x29 && chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x0802) == 0x90,
+          "$0000 is the BIOS, $0800 the cartridge");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x1000) == 0xff && chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2800) == 0xff &&
+              chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0xffff) == 0xff,
+          "a 2K standard cart reads $FF past its ROM, and has no RAM at $2800");
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_CHESS, st, sizeof st, 0x800);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2800) == 0x00, "a chess cart's RAM reads 0 until written");
+    frames(1);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x0900) == 0xff, "a store to the BIOS/ROM area changes nothing");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2800) == 0xa5, "a store at $2800 lands in a chess cart's RAM");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x3000) == 0xff, "and one at $3000 does not");
+    chf_machine_poke(&rig.m, CHF_PEEK_PROG, 0x2801, 0x11);
+    chf_machine_poke(&rig.m, CHF_PEEK_PROG, 0x0003, 0x77);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2801) == 0x11 && chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x0003) != 0x77,
+          "the debugger's poke writes the RAM, never the BIOS");
+    check(chf_machine_space_size(&rig.m, CHF_PEEK_PROG) == 0x10000 && chf_machine_space_size(&rig.m, CHF_PEEK_SCRATCH) == 64 &&
+              chf_machine_space_size(&rig.m, CHF_PEEK_VRAM) == 8192 && chf_machine_space_size(&rig.m, CHF_PEEK_IO) == 256 &&
+              chf_machine_space_size(&rig.m, CHF_PEEK_CART) == 0x800 + 0x800,
+          "the five spaces' sizes (a chess cart's CART space is its ROM and its 2K of RAM)");
+    chf_machine_poke(&rig.m, CHF_PEEK_SCRATCH, 5, 0x5a);
+    check(rig.m.cpu.r[5] == 0x5a && chf_machine_peek(&rig.m, CHF_PEEK_SCRATCH, 5) == 0x5a, "SCRATCH is the register file");
+    chf_machine_poke(&rig.m, CHF_PEEK_CART, 0x800 + 3, 0x33);
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2803) == 0x33 && chf_machine_peek(&rig.m, CHF_PEEK_CART, 0x800 + 3) == 0x33,
+          "CART space puts the RAM after the ROM image");
+}
+
+/* ---- the tone ---- */
+static void tone(void)
+{
+    /* port 5 = $40 | row bits: mode 1; later $C0: mode 3; the mode is data >> 6 */
+    static const uint8_t t1[] = { 0x20, 0x7f, 0xb5, T_SPIN };
+    static const uint8_t t3[] = { 0x20, 0xff, 0xb5, T_SPIN };
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, t1, sizeof t1, 0x800);
+    frames(2);
+    check(rig.m.snd.mode == 1 && rig.m.snd.changes == 1, "port 5 bits 7-6 = 1 selects the 1 kHz tone");
+    check(rig.m.audio_samples >= 1500 && rig.m.audio_samples <= 1600, "two frames made ~1586 samples at 48 kHz");
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, t3, sizeof t3, 0x800);
+    frames(1);
+    check(rig.m.snd.mode == 3, "and 3 the low tone");
+    {
+        float peak = 0;
+
+        for (int i = 0; i < rig.m.out_frames; i++)
+            if (rig.m.out[2 * i] > peak)
+                peak = rig.m.out[2 * i];
+        check(peak > 0.9f && rig.m.out[0] == rig.m.out[1], "the frame's audio is full scale mono, mirrored to both channels");
+    }
+    boot(CHF_MACHINE_VIDEOPLAY2, CHF_CART_STD, t1, sizeof t1, 0x800);
+    check(rig.m.audio_gain == 0.5f, "the Videoplay 2 group's speaker gain is 0.5");
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, t1, sizeof t1, 0x800);
+    check(rig.m.audio_gain == 1.0f, "every other machine's is 1");
+}
+
+/* ---- RESET ---- */
+static void reset(void)
+{
+    /* r2 = r2 + 1, then spin: each run of the cartridge adds one */
+    static const uint8_t inc[] = { 0x42, 0x24, 0x01, 0x52, T_SPIN };
+    static const uint8_t pix[] = { 0x20, 0x7f, 0xb1, 0x20, 0xeb, 0xb4, 0x20, 0x35, 0xb5, 0x20, 0x60, 0xb0,
+                                   0x42, 0x24, 0x01, 0x52, T_SPIN };
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_STD, inc, sizeof inc, 0x800);
+    frames(2);
+    check(rig.m.cpu.r[2] == 1, "the program ran once");
+    rig.m.reset_live = true;
+    frames(1);
+    check(rig.m.reset_held, "pressing RESET holds the CPU");
+    {
+        const uint64_t c = rig.m.cpu.cycles;
+        const uint64_t i = rig.m.cpu.instructions;
+
+        frames(1);
+        check(rig.m.cpu.cycles > c && rig.m.cpu.instructions == i, "time passes, the CPU does not run");
+    }
+    rig.m.reset_live = false;
+    frames(2);
+    check(rig.m.cpu.r[2] == 2, "releasing it runs the BIOS again and the cartridge again; the scratchpad was NOT cleared");
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_CHESS, pix, sizeof pix, 0x800);
+    frames(1);
+    chf_machine_poke(&rig.m, CHF_PEEK_PROG, 0x2900, 0x42);
+    chf_machine_reset(&rig.m);
+    check(rig.m.cpu.pc0 == 1 && f8_pc(&rig.m.cpu) == 0, "chf_machine_reset: PC back at $0000 (ROMC 08)");
+    check(rig.m.vid.vram[10 * 128 + 20] == 2 && rig.m.vid.latch[3] == 0x35, "the VRAM and the port latches survive");
+    check(chf_machine_peek(&rig.m, CHF_PEEK_PROG, 0x2900) == 0x42, "and a cartridge's RAM");
+}
+
+/* ---- the stand-in's rule ---- */
+static void standin(void)
+{
+    static const uint8_t spin[] = { T_SPIN };
     chf_machine_opts_t mo;
-    const char *err = NULL;
+    chf_cart_t cart;
+    static chf_machine_t m;
+    char why[100];
 
-    chf_cart_init(&cart, CHF_CART_STD, image, len, &err);
+    test_cart(img, 0x800, spin, sizeof spin, 0);
+    chf_cart_init(&cart, CHF_CART_STD, img, 0x800, NULL);
     memset(&mo, 0, sizeof mo);
-    mo.machine = machine;
+    mo.machine = CHF_MACHINE_CHANNELF;
     mo.cart = &cart;
+    mo.bios_id = -1;
     chf_machine_init(&m, &mo);
+    check(!m.have_bios && m.bios_id == -1, "no BIOS halves: the app's stand-in");
+    check(chf_machine_missing(&m, why, sizeof why) == CHF_MISSING_BIOS && why[0] != '\0',
+          "a Videocart under the stand-in parks the console and says why");
+    chf_machine_run_frame(&m);
+    check(m.cpu.instructions == 0 && m.frames_done == 1, "parked: no instruction runs, the frames still do");
+    if (chf_stub_rom[0] == 0xff) {
+        /* the placeholder (no stub.c yet) is all illegal opcodes: a FujiNet app parks at $0000 with the BIOS call named */
+        static uint8_t app[16384];
+        chf_fujinet_t *fj = chf_fujinet_create();
+
+        test_counter_image(app, 1);
+        chf_fujinet_power_on(fj, app, sizeof app, "", true, why, sizeof why);
+        mo.cart = chf_fujinet_cart(fj);
+        mo.fujinet = fj;
+        chf_machine_init(&m, &mo);
+        chf_machine_check_cart(&m);
+        chf_machine_run_frame(&m);
+        check(chf_machine_missing(&m, why, sizeof why) == CHF_MISSING_BIOS && strstr(why, "$0000"),
+              "an illegal opcode executed below $0800 under the stand-in parks it and names the address");
+        chf_fujinet_destroy(fj);
+    }
+    check(chf_machine_peek(&m, CHF_PEEK_PROG, 0x0000) == chf_stub_rom[0], "and $0000 is the stand-in's image");
+    printf("  (%s)\n", why);
 }
 
-static void press(uint64_t keys, uint8_t joy0, uint8_t joy1)
+/* ---- the debugger's views ---- */
+static unsigned hooked_mem, hooked_io, hooked_vram, hooked_instr;
+static void on_bus(chf_machine_t *m, void *u, int kind, uint16_t a, uint8_t d)
 {
-    m.keys_live = keys;
-    m.joy_live[0] = joy0;
-    m.joy_live[1] = joy1;
-    chf_machine_latch_inputs(&m);
+    (void)m;
+    (void)u;
+    (void)a;
+    (void)d;
+    hooked_mem += kind == CHF_BUS_MEMW || kind == CHF_BUS_MEMR;
+    hooked_io += kind == CHF_BUS_IOW || kind == CHF_BUS_IOR;
+    hooked_vram += kind == CHF_BUS_VRAM;
+}
+static void on_instr(chf_machine_t *m, void *u)
+{
+    (void)m;
+    (void)u;
+    hooked_instr++;
+}
+
+static void debugger(void)
+{
+    /* plot (row 10, column 20, colour 2) and (row 11, column 21, colour 1), reading a byte and writing one on the way */
+    static const uint8_t prog[] = {
+        0x20, 0x7f, 0xb1, 0x20, 0xeb, 0xb4, 0x20, 0x35, 0xb5, 0x20, 0x60, 0xb0, 0x20, 0x50, 0xb0,
+        0x20, 0xbf, 0xb1, 0x20, 0xea, 0xb4, 0x20, 0x34, 0xb5, 0x20, 0x60, 0xb0, 0x20, 0x50, 0xb0,
+        0x2a, 0x28, 0x10, 0x16, 0x17, T_SPIN };
+    chf_vwrite_t w[8];
+    int n;
+
+    boot(CHF_MACHINE_CHANNELF, CHF_CART_CHESS, prog, sizeof prog, 0x800);
+    check(chf_machine_track(&rig.m, true) == 0 && rig.m.track != NULL, "the video bookkeeping starts on demand");
+    rig.m.bus_hook = on_bus;
+    rig.m.watch = CHF_WATCH_MEMR | CHF_WATCH_MEMW | CHF_WATCH_IOR | CHF_WATCH_IOW | CHF_WATCH_VRAM;
+    rig.m.instr_hook = on_instr;
+    frames(1);
+    check(hooked_vram == 2, "the bus hook told of both VRAM stores");
+    check(hooked_io == 10 && hooked_mem == 2, "and of the ten port writes and the one read and one write");
+    check(hooked_instr > 20, "the instruction hook ran before each instruction");
+    n = chf_machine_vwrites(&rig.m, w, 8);
+    check(n == 2 && w[0].row == 10 && w[0].col == 20 && w[0].value == 2 && w[0].old == 0 && w[1].row == 11 && w[1].col == 21 &&
+              w[1].value == 1,
+          "the write log has both strobes, oldest first, with row, column, value and the old value");
+    check(w[0].pc >= 0x0800 && w[1].cycle > w[0].cycle && w[1].frame == 0, "with the PC of the OUT, the clock and the frame");
+    check(rig.m.track->cell[10 * 128 + 20].writes == 1 && rig.m.track->cell[10 * 128 + 20].pc == w[0].pc &&
+              rig.m.track->heat[11 * 128 + 21] == 0 && rig.m.track->heat_last[11 * 128 + 21] == 1,
+          "per cell: write count and last writer; the heat of the frame just ended moved to heat_last");
+    check(rig.m.track->strobes_last == 2 && rig.m.track->changes_last == 2, "two strobes, both changed a cell");
+    check(rig.m.track->beam_rows == 0 && rig.m.track->frame_vram[10 * 128 + 20] == 2,
+          "at the blank the beam starts over, and frame_vram is what the display shows");
+    {
+        int line, cyc;
+
+        chf_machine_beam(&rig.m, &line, &cyc);
+        check(line >= 248 && line < 264 && cyc >= 0 && cyc < 130, "the beam is just past the vertical blank (line 248 on)");
+    }
+    chf_machine_poke(&rig.m, CHF_PEEK_IO, 0, 0x60);          /* a debugger strobe draws the registers' cell */
+    check(rig.m.vid.vram[11 * 128 + 21] == 1, "poking port 0 strobes like the CPU");
+    chf_machine_poke(&rig.m, CHF_PEEK_IO, 5, 0x40 | 0x3f);
+    check(chf_machine_sound_mode(&rig.m) == 1, "poking port 5 changes the tone");
+    check(chf_machine_track(&rig.m, false) == 0 && rig.m.track == NULL, "and it stops again");
+    rig.m.watch = 0;
+    rig.m.bus_hook = NULL;
+    rig.m.instr_hook = NULL;
+}
+
+/* ---- the FujiNet cartridge's tick and mailbox, with the machine ---- */
+static void fujinet(void)
+{
+    static test_rig r2;
+    static uint8_t app[16384];
+    chf_fujinet_t *fj = chf_fujinet_create();
+    chf_machine_opts_t mo;
+    char why[160];
+    chf_cart_status_t st;
+
+    test_counter_image(app, 1);
+    check(fj != NULL && chf_fujinet_power_on(fj, app, sizeof app, "", true, why, sizeof why) == 0,
+          "the FujiNet cartridge powers on with a counter app (link off, mailbox inline)");
+    memset(&r2, 0, sizeof r2);
+    test_bios(r2.lo, r2.hi);
+    memset(&mo, 0, sizeof mo);
+    mo.machine = CHF_MACHINE_CHANNELF;
+    mo.bios_lo = r2.lo;
+    mo.bios_hi = r2.hi;
+    mo.cart = chf_fujinet_cart(fj);
+    mo.fujinet = fj;
+    chf_machine_init(&r2.m, &mo);
+    chf_machine_check_cart(&r2.m);
+    check(!r2.m.parked, "an app that claims the mailbox is no problem for the stand-in's rule");
+    check(chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc09) == 'F' && chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc0a) == 'N' &&
+              chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc0b) == FN_PROTO_VER,
+          "the status page carries the magic and protocol 2");
+    for (int i = 0; i < 600; i++)
+        chf_machine_run_frame(&r2.m);
+    check(chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0x8000) != 0, "the app counts in the cartridge's RAM at $8000");
+    {
+        /* the tick the console reads: floor(seconds * 60) at the CPU's own time (a few clocks past the blank) */
+        const unsigned t = (unsigned)chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc0e) |
+                           (unsigned)chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc0f) << 8;
+
+        printf("  600 frames -> tick %u\n", t);
+        check(t == 594, "600 frames of 60.53 Hz are 9.912 s: tick 594");
+    }
+    {
+        const uint8_t c1 = chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0x8000);
+
+        chf_machine_reset(&r2.m);
+        for (int i = 0; i < 2; i++)
+            chf_machine_run_frame(&r2.m);
+        check(chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0x8000) != c1 && chf_machine_peek(&r2.m, CHF_PEEK_PROG, 0xfc0b) == FN_PROTO_VER,
+              "RESET does not reach the cartridge: the app restarts on its RAM, the mailbox stays painted");
+    }
+    chf_fujinet_status(fj, &st);
+    check(st.powered && st.mailbox && st.link_off && !st.link_up && st.page == -1 && st.npages == 0,
+          "status: powered, mailbox live, no link, a flat image");
+    check(chf_machine_space_size(&r2.m, CHF_PEEK_CART) == 0x18000, "the FujiNet CART space is the 64K image store then the 32K arena");
+    check(chf_machine_peek(&r2.m, CHF_PEEK_CART, 0) == 0x55 && chf_machine_peek(&r2.m, CHF_PEEK_CART, 0x10000 + 0x7c09) == 'F',
+          "its first byte is the signature and its arena holds the status page");
+    chf_machine_poke(&r2.m, CHF_PEEK_PROG, 0xfd00, 0x99);
+    check(chf_fujinet_arena(fj, 0x7d00) == 0, "a debugger edit of the register page does not touch it (and fires nothing)");
+    chf_fujinet_destroy(fj);
 }
 
 int main(void)
 {
-    /* a recognisable image; the first bytes are BCTA,UN $0000 (a loop) */
-    for (unsigned i = 0; i < sizeof rom; i++)
-        rom[i] = (uint8_t)(i * 13 + (i >> 8) * 7);
-    rom[0] = 0x1f; rom[1] = 0x00; rom[2] = 0x00;
-    power_on(CHF_MACHINE_ARCADIA, rom, sizeof rom);
-
-    /* ---- the memory map (arcadia_mem and the slot) ---- */
-    check(rd(0x0000) == 0x1f && rd(0x0fff) == rom[0xfff], "$0000-$0FFF is the cartridge's first 4K");
-    check(rd(0x2000) == rom[0x1000] && rd(0x2fff) == rom[0x1fff], "$2000-$2FFF is its second 4K");
-    check(rd(0x3000) == 0xff && rd(0x7fff) == 0xff, "$3000 and up read $FF past an 8K image (not mirrors)");
-    check(rd(0x1000) == 0 && rd(0x17ff) == 0 && rd(0x1b00) == 0 && rd(0x1c00) == 0 && rd(0x1fff) == 0,
-          "the holes around the UVI ($1000-$17FF, $1B00-$1FFF) are unmapped and read 0");
-    wr(0x0010, 0x55);
-    check(rd(0x0010) == rom[0x10], "the cartridge is ROM: writes are ignored");
-    wr(0x18d0, 0xa5);
-    wr(0x1a05, 0x5a);
-    check(rd(0x18d0) == 0xa5 && rd(0x1a05) == 0x5a, "the UVI's RAM at $18D0 and $1A00 holds what is written");
-    check(rd(0x7ffff & 0x7fff) == 0xff && m.cpu.read(m.cpu.ctx, 0x9800) == rd(0x1800), "addresses are 15 bits");
-    wr(0x1b00, 1);
-    check(rd(0x1b00) == 0, "a write to the unmapped $1B00 goes nowhere");
-    check(m.cpu.io_read(m.cpu.ctx, S2650_CTRL_PORT) == 0 && m.cpu.io_read(m.cpu.ctx, 3) == 0,
-          "the CPU's I/O ports are wired to nothing and read 0");
-
-    /* ---- keypads, panel, fire ---- */
-    press(0, 0, 0);
-    check(rd(0x1900) == 0xf0 && rd(0x1901) == 0xf0 && rd(0x1902) == 0xf0 && rd(0x1903) == 0xf0 &&
-          rd(0x1904) == 0xf0 && rd(0x1908) == 0, "nothing pressed: the keypad bytes read $F0, the panel 0");
-    press(K1(CHF_K_1), 0, 0);       /* key 1: column 1, bit 3 */
-    check(rd(0x1900) == 0xf8 && rd(0x1901) == 0xf0 && rd(0x1904) == 0xf0, "player 1's 1 is $1900 bit 3");
-    press(K1(CHF_K_CLEAR) | K1(CHF_K_ENTER) | K1(CHF_K_5), 0, 0);
-    check(rd(0x1900) == 0xf1 && rd(0x1902) == 0xf1 && rd(0x1901) == 0xf4, "CLEAR is column 1 bit 0, ENTER column 3 bit 0, 5 column 2 bit 2");
-    press(K2(CHF_K_9) | K2(CHF_K_7) | K2(CHF_K_0), 0, 0);
-    check(rd(0x1904) == 0xf2 && rd(0x1905) == 0xf1 && rd(0x1906) == 0xf2, "player 2 reads at $1904-$1906 (7 and 0 and 9)");
-    press(0, CHF_STICK_FIRE, 0);
-    check(rd(0x1901) == 0xf8 && rd(0x1905) == 0xf0, "FIRE is wired to keypad 2: $1901 bit 3");
-    press(K1(CHF_K_2), CHF_STICK_FIRE, CHF_STICK_FIRE);
-    check(rd(0x1901) == 0xf8 && rd(0x1905) == 0xf8, "and ORed with the key, and for player 2 at $1905");
-    press(KSTART | KSELECT, 0, 0);
-    check(rd(0x1908) == 5, "the panel: START bit 0, OPTION bit 1, SELECT bit 2");
-    press(KOPTION, 0, 0);
-    check(rd(0x1908) == 2, "OPTION is bit 1");
-    press(0xffffffffffffffffull, 0, 0);
-    check(rd(0x1908) == 7 && rd(0x1900) == 0xff && rd(0x1903) == 0xf0, "bits past the 27 console keys are ignored");
-
-    /* ---- the pots ---- */
-    press(0, 0, 0);
-    wr(0x19f9, 0x00);       /* pot mux low: y axes; wait out the settle delay */
-    for (int i = 0; i < 12; i++)
-        uvi_line(&m.uvi);
-    check(rd(0x19ff) == 0x6f && rd(0x19fe) == 0x80, "centred: player 1 reads $6F, player 2 $80 (MAME's values)");
-    press(0, CHF_STICK_UP, CHF_STICK_UP);
-    check(rd(0x19ff) == 0x00 && rd(0x19fe) == 0x00, "UP drives the y pot to 0");
-    press(0, CHF_STICK_DOWN, CHF_STICK_DOWN);
-    check(rd(0x19ff) == 0xff && rd(0x19fe) == 0xff, "DOWN drives it to $FF");
-    press(0, CHF_STICK_UP | CHF_STICK_DOWN, 0);
-    check(rd(0x19ff) == 0x00, "both: up wins, as in MAME's video_r");
-    wr(0x19f9, 0x40);       /* x axes */
-    for (int i = 0; i < 12; i++)
-        uvi_line(&m.uvi);
-    press(0, CHF_STICK_LEFT, CHF_STICK_RIGHT);
-    check(rd(0x19ff) == 0x00 && rd(0x19fe) == 0xff, "mux high: LEFT is 0, RIGHT $FF");
-    press(0, CHF_STICK_LEFT | CHF_STICK_RIGHT, 0);
-    check(rd(0x19ff) == 0xff, "both: right wins");
-    m.disc_live[0][0] = 127; m.disc_live[0][1] = -128;
-    m.disc_live[1][0] = -128; m.disc_live[1][1] = 127;
-    m.joy_live[0] = CHF_STICK_UP;           /* the digital bits are ignored while the disc is off-centre */
-    chf_machine_latch_inputs(&m);
-    check(rd(0x19ff) == 0xff && rd(0x19fe) == 0x00, "the analog disc overrides the digital bits: full right = $FF, full left = 0");
-    m.disc_live[0][0] = 0; m.disc_live[0][1] = 0;
-    m.disc_live[1][0] = 64; m.disc_live[1][1] = 0;
-    m.joy_live[0] = 0;
-    chf_machine_latch_inputs(&m);
-    check(rd(0x19ff) == 0x6f, "a centred disc is the centre value");
-    check(rd(0x19fe) > 0x80 + 0x30 && rd(0x19fe) < 0x80 + 0x50, "half deflection is about half way");
-    m.disc_live[0][0] = m.disc_live[0][1] = m.disc_live[1][0] = m.disc_live[1][1] = 0;
-    press(0, 0, 0);
-
-    /* ---- the line timer and SENSE (MAME's scheduler arithmetic) ---- */
-    power_on(CHF_MACHINE_ARCADIA, rom, sizeof rom);
-    check(m.line_as == 63613231552162ull && m.cycle_as == 1117318435754ull,
-          "the line period is attotime::from_hz(262 * 60) and the CPU's HZ_TO_ATTOSECONDS(895000)");
-    check(m.next_limit == 56, "the first tick waits for CPU cycle 56");
-    chf_machine_run_frame(&m);
-    check(m.uvi.line_count == 262 && m.uvi.line == 0, "a frame is 262 line ticks and wraps to line 0");
-    check(m.cpu.cycles >= 14916 && m.cpu.cycles < 14916 + 12, "the first frame ends at the CPU cycle MAME's does (14916)");
-    for (int i = 0; i < 2; i++)
-        chf_machine_run_frame(&m);
-    check(m.cpu.cycles >= 44749 && m.cpu.cycles < 44749 + 12, "three frames end at cycle 44749-44750 (895000 / 60 each)");
-    {
-        uint64_t before = m.frames_done;
-        int sense_low = 0, sense_high = 0, steps = 0;
-
-        while (m.frames_done == before && steps++ < 200000) {
-            chf_machine_step(&m);
-            if (m.uvi.line >= 216)
-                sense_high += m.cpu.sense(m.cpu.ctx) == 1;
-            else
-                sense_low += m.cpu.sense(m.cpu.ctx) == 0;
-        }
-        check(sense_low > 0 && sense_high > 0 && steps < 200000, "SENSE follows the line: low above 216, high from 216");
-        check(sense_high == 0 || (double)sense_high / (steps) > 0.1, "about 46 of 262 lines are vertical blank");
-    }
-    check(m.fb[0] != 0 || m.fb[100] == 0xffffff, "the frame buffer is the bitmap as it stood after the last tick");
-
-    /* ---- PAL ---- */
-    power_on(CHF_MACHINE_ARCADIA_PAL, rom, sizeof rom);
-    chf_machine_run_frame(&m);
-    check(m.uvi.lines == 312 && m.uvi.line_count == 312, "the PAL row has 312 lines");
-    check(m.cpu.cycles > 886724 / 50 - 20 && m.cpu.cycles < 886724 / 50 + 20, "and 50 frames a second at 4.433619 MHz / 5");
-
-    /* ---- the beeper ---- */
-    power_on(CHF_MACHINE_ARCADIA, rom, sizeof rom);
-    m.audio_gain = 1.0f;
-    chf_machine_run_frame(&m);
-    check(m.out_frames > 700 && m.out_frames < 900, "a frame makes about 800 audio samples");
-    {
-        double peak = 0;
-        for (int i = 0; i < m.out_frames; i++)
-            peak = fmax(peak, fabs(m.out[2 * i]));
-        check(peak == 0.0, "silent until the pitch and volume are written");
-    }
-    wr(0x18fd, 20);         /* pitch */
-    wr(0x18fe, 0x08 | 7);   /* tone on, volume 7 */
-    chf_machine_run_frame(&m);
-    chf_machine_run_frame(&m);
-    {
-        double peak = 0, lo = 1e9;
-        int trans = 0;
-
-        for (int i = 0; i < m.out_frames; i++) {
-            peak = fmax(peak, fabs(m.out[2 * i]));
-            lo = fmin(lo, m.out[2 * i]);
-            if (i && fabs(m.out[2 * i] - m.out[2 * i - 2]) > 0.2)
-                trans++;
-            if (m.out[2 * i] != m.out[2 * i + 1])
-                trans = -1000;
-        }
-        check(peak > 0.3 && peak < 0.5, "a tone at volume 7 reaches 0.4375 of full scale (7 * $800 / 32768)");
-        check(trans > 5 && trans < 40, "and is a square wave: pitch 20 flips every 20 samples of 15625 Hz");
-        (void)lo;
-    }
-    wr(0x18fe, 0x00);
-    chf_machine_run_frame(&m);
-    chf_machine_run_frame(&m);
-    {
-        double peak = 0;
-        for (int i = 0; i < m.out_frames; i++)
-            peak = fmax(peak, fabs(m.out[2 * i]));
-        check(peak == 0.0, "mode 0 is silence again");
-    }
-
-    /* ---- RESET: the 2650 only ---- */
-    power_on(CHF_MACHINE_ARCADIA, rom, sizeof rom);
-    wr(0x18d0, 0x77);
-    chf_machine_run_frame(&m);
-    m.cpu.page = 0x2000;
-    m.cpu.iar = 0x123;
-    m.reset_live = true;
-    chf_machine_latch_inputs(&m);
-    check(s2650_pc(&m.cpu) == 0, "pressing RESET resets the CPU");
-    {
-        uint64_t c0 = m.cpu.cycles, n0 = m.cpu.instructions;
-
-        chf_machine_run_frame(&m);
-        check(m.cpu.instructions == n0 && m.cpu.cycles > c0, "while it is held the CPU does not run, but time passes");
-    }
-    check(rd(0x18d0) == 0x77, "the UVI keeps its registers");
-    m.reset_live = false;
-    chf_machine_run_frame(&m);
-    check(m.cpu.instructions > 0, "released, it runs from $0000 again");
-
-    /* ---- the debugger's access ---- */
-    check(chf_machine_peek(&m, CHF_PEEK_PROG, 0x1800 + 0xd0) == 0x77 && chf_machine_peek(&m, CHF_PEEK_UVI, 0xd0) == 0x77,
-          "peek reads the program space and the UVI's registers");
-    chf_machine_poke(&m, CHF_PEEK_UVI, 0xd1, 0x42);
-    check(rd(0x18d1) == 0x42, "poke writes the UVI");
-    chf_machine_poke(&m, CHF_PEEK_UVI, 0xfd, 0x80);
-    check(m.uvi.multicolor == 0x80, "and with the register's effects");
-
-    /* ---- determinism ---- */
-    {
-        static chf_machine_t a, b;
-        chf_machine_opts_t mo;
-
-        memset(&mo, 0, sizeof mo);
-        mo.cart = &cart;
-        chf_machine_init(&a, &mo);
-        chf_machine_init(&b, &mo);
-        for (int i = 0; i < 5; i++) {
-            chf_machine_run_frame(&a);
-            chf_machine_run_frame(&b);
-        }
-        check(memcmp(a.fb, b.fb, sizeof a.fb) == 0 && a.cpu.cycles == b.cpu.cycles, "two machines run alike");
-    }
-
+    timing();
+    ports();
+    pads();
+    memory();
+    tone();
+    reset();
+    standin();
+    debugger();
+    fujinet();
     printf("%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

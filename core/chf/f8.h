@@ -59,19 +59,26 @@ struct f8 {
     int illegal_pc;          /* the last one's address, -1 if none */
 
     /* The bus. Every callback sees `cycles` as it was at the START of the bus
-     * cycle making the access. `romc` is the ROMC state doing it, so a reader
-     * can tell a data read (ROMC 02, through DC0) from the instruction stream
-     * (00 01 03 0C 0E 11, through PC0). */
+     * cycle making the access (MAME spends a state's clocks after its access).
+     * The one exception is INS/OUTS 0 and 1, which MAME does as ROMC 1C and
+     * then a direct port access with no 1A/1B cycle of its own: those two see
+     * `cycles` after the 1C's four clocks. `romc` is the ROMC state doing the
+     * read, so a reader can tell a data read (02, through DC0) from the
+     * instruction stream (00 01 03 0C 0E 11, through PC0). A NULL callback is
+     * an undriven bus: reads $FF, writes vanish. */
     void *ctx;
     uint8_t (*read)(void *ctx, uint16_t addr, uint8_t romc);
     void    (*write)(void *ctx, uint16_t addr, uint8_t data);        /* ROMC 05 */
-    uint8_t (*in)(void *ctx, uint8_t port);     /* INS 0/1, IN/INS 4+ (ROMC 1B) */
-    void    (*out)(void *ctx, uint8_t port, uint8_t data);    /* OUTS 0/1, OUT/OUTS 4+ (ROMC 1A) */
-    /* The interrupt vector a peripheral puts on the bus (ROMC 10/13); NULL =
-     * irq_vector. */
+    uint8_t (*in)(void *ctx, uint8_t port);     /* INS 0/1 direct; IN, INS 4+ (ROMC 1B) */
+    void    (*out)(void *ctx, uint8_t port, uint8_t data);    /* OUTS 0/1 direct; OUT, OUTS 4+ (ROMC 1A) */
+    /* The interrupt vector the interrupting device puts on the bus, asked for
+     * in ROMC 0F (MAME's int_cycle callback); NULL = irq_vector as it stands
+     * (MAME's unwired callback reads 0). */
     uint16_t (*int_vector)(void *ctx);
-    /* After each ROMC state, with the bus as that state left it: NULL normally
-     * (tests and traces). */
+    /* After each ROMC state (including f8_reset's two), with the registers and
+     * dbus as that state left them and `cycles` not yet advanced: the stream
+     * MAME's ROMC trace graft prints. NULL normally (tests and traces).
+     * f8_set_pc does not call it. */
     void    (*romc_hook)(void *ctx, const f8_t *cpu, uint8_t romc, uint8_t dbus);
 };
 
@@ -93,20 +100,26 @@ static inline uint16_t f8_pc(const f8_t *c)
     return (uint16_t)(c->pc0 - 1);
 }
 /* A debugger's PC change: PC0 = pc + 1 with the opcode at pc fetched (through
- * read, ROMC 00, no cycles charged). */
+ * read, ROMC 00; no cycles charged, no romc_hook call). */
 void f8_set_pc(f8_t *c, uint16_t pc);
 
 /* ---- the disassembler (dasmf8.c, from MAME's f8dasm.cpp) ---- */
-#define F8_DASM_CALL    0x1  /* PI, PK: a call (step over runs past it) */
+#define F8_DASM_CALL    0x1  /* PI, PK: a call (step over runs past it; MAME flags PK as a step out) */
 #define F8_DASM_RETURN  0x2  /* POP: a return */
-#define F8_DASM_BRANCH  0x4  /* a jump or branch (target in *target) */
-#define F8_DASM_COND    0x8  /* ... a conditional one */
+#define F8_DASM_BRANCH  0x4  /* JMP or a branch, BR and the BT/BF/BR7 family (target in *target) */
+#define F8_DASM_COND    0x8  /* ... a conditional one (all but JMP and BR) */
 /* Disassemble the instruction at `pc` whose bytes are op[0..2] (op[1], op[2]
- * may be past its end). Writes MAME's text ("JMP   $0802", "LR    A,KU") into
- * buf; returns its length in bytes (1-3). *flags gets F8_DASM_*, *target the
- * branch/jump/call target when it has one (else -1). Either may be NULL. */
+ * may be past its end). Writes MAME's text ("JMP  H'0802'", "LR   A,KU") into
+ * buf, always terminated; returns the length in bytes (1-3; an illegal opcode
+ * is "DC   H'2D' (?)", length 1). *flags gets F8_DASM_*; *target gets the
+ * address of a PI, JMP or branch (16-bit: MAME's text goes past $FFFF or below
+ * 0 for a branch near the ends, this wraps), else -1 (PK and POP take theirs
+ * from registers). Either may be NULL. */
 int dasmf8(char *buf, size_t bufsz, uint16_t pc, const uint8_t op[3], unsigned *flags,
            int *target);
+/* The length (1-3) and the F8_DASM_* flags of an opcode on its own. */
+int dasmf8_length(uint8_t opcode);
+unsigned dasmf8_op_flags(uint8_t opcode);
 
 #ifdef __cplusplus
 }

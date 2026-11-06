@@ -524,9 +524,9 @@ int main(void)
         /* a wheel notch is held six frames: a program polling once a frame sees it */
         poke(s, RAM_STICKY1, 0xFF);
         chfsession_twist_pulse(s, 0, 1);
-        sleep_ms(400);
-        check(ram(s, RAM_STICKY1) == LOW(B(CHF_ACT_TWIST_CW)), "a wheel notch reaches the program, and only that bit");
-        check(ram(s, RAM_P1) == 0xFF, "and is gone again");
+        check(wait_ram(s, RAM_STICKY1, LOW(B(CHF_ACT_TWIST_CW)), 5000),
+              "a wheel notch reaches the program, and only that bit");
+        check(wait_port(s, RAM_P1, 0xFF, 5000), "and is gone again");
     }
     chfsession_key(s, '2', 1);
     check(wait_panel(s, 0x0F & ~(1u << CHF_KEY_MODE), 3000), "button 2 (MODE) clears bit 1 of port 0");

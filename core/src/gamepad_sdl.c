@@ -425,7 +425,18 @@ static int slot_hat_dir(const pad_slot *slot)
     return dir;
 }
 
-static void poll_one(gamepad_state *g, pad_slot *slot, int port)
+/* A trigger crossing its threshold. Dispatched by poll_sticks once it has
+ * let go of the lock: dispatch_button takes it too, and it is not recursive. */
+typedef struct {
+    SDL_JoystickID id;
+    int button;
+    int down;
+} trigger_edge;
+
+#define MAX_EDGES (MAX_PADS * 2)
+
+static void poll_one(gamepad_state *g, pad_slot *slot, int port,
+                     trigger_edge *edges, int *nedges)
 {
     const struct chfsession *s = g->session;
     uint8_t want[CHF_ACT_PER_PORT];
@@ -479,10 +490,12 @@ static void poll_one(gamepad_state *g, pad_slot *slot, int port)
             int down = v >= TRIGGER_ON;
             if (down != slot->trigger_down[t]) {
                 slot->trigger_down[t] = down;
-                /* dispatch_button takes the lock poll_sticks holds */
-                pthread_mutex_unlock(&g->lock);
-                dispatch_button(g, slot->id, t ? CHF_PAD_BTN_RIGHT_TRIGGER : CHF_PAD_BTN_LEFT_TRIGGER, down);
-                pthread_mutex_lock(&g->lock);
+                if (*nedges < MAX_EDGES) {
+                    edges[*nedges].id = slot->id;
+                    edges[*nedges].button = t ? CHF_PAD_BTN_RIGHT_TRIGGER : CHF_PAD_BTN_LEFT_TRIGGER;
+                    edges[*nedges].down = down;
+                    (*nedges)++;
+                }
             }
         }
     }
@@ -490,11 +503,14 @@ static void poll_one(gamepad_state *g, pad_slot *slot, int port)
 
 static void poll_sticks(gamepad_state *g)
 {
-    int i;
+    int i, nedges = 0;
+    trigger_edge edges[MAX_EDGES];
     pthread_mutex_lock(&g->lock);
     for (i = 0; i < g->npads; i++)
-        poll_one(g, &g->pads[i], effective_port_locked(g, i));
+        poll_one(g, &g->pads[i], effective_port_locked(g, i), edges, &nedges);
     pthread_mutex_unlock(&g->lock);
+    for (i = 0; i < nedges; i++)
+        dispatch_button(g, edges[i].id, edges[i].button, edges[i].down);
 }
 
 /* ---- the thread ------------------------------------------------------------- */

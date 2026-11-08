@@ -78,7 +78,12 @@
     <!-- The CURRENT release templates its version from @PROJECT_VERSION@, so
          it cannot disagree with the tree; past releases are literal. The
          release job checks that this first entry is still a template. -->
-    <release version="@PROJECT_VERSION@" date="2026-11-06">
+    <release version="@PROJECT_VERSION@" date="2026-11-07">
+      <description>
+        <p>Fixed a freeze when a gamepad trigger was pressed with the Controllers window open.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-11-06">
       <description>
         <p>
           First release: the Fairchild Channel F transposed from MAME, with

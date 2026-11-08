@@ -256,6 +256,29 @@ int main(void)
     expect(s, 0, 0, 0, "released");
     chfsession_bindings_reset(s);
 
+    /* A trigger past half travel once risked the gamepad thread taking its
+     * own lock twice; a hang here is a ctest timeout. */
+    chfsession_binding_set_button(s, CHF_TARGET_KEY(CHF_KEY_TIME), CHF_PAD_BTN_LEFT_TRIGGER, NULL, 0);
+    SDL_SetJoystickVirtualAxis(vj, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 32767);
+    expect(s, 0, 1, 0, "left trigger presses its binding");
+    (void)chfsession_gamepad_generation(s);
+    (void)chfsession_gamepad_effective_port(s, 0);
+    check(1, "session lock still free with a trigger held");
+    SDL_SetJoystickVirtualAxis(vj, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0);
+    expect(s, 0, 0, 0, "left trigger released");
+    chfsession_gamepad_capture_begin(s);
+    SDL_SetJoystickVirtualAxis(vj, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 32767);
+    {
+        int btn = -1, got = 0, n;
+        for (n = 0; n < 100 && !got; n++) {
+            got = chfsession_gamepad_capture_poll(s, &btn);
+            if (!got) sleep_ms(20);
+        }
+        check(got && btn == CHF_PAD_BTN_RIGHT_TRIGGER, "map mode captures a trigger");
+    }
+    SDL_SetJoystickVirtualAxis(vj, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+    chfsession_bindings_reset(s);
+
     /* hot-unplug while held: the stick, the knob, a button and RESET are
      * released, not left holding forever */
     chfsession_binding_set_button(s, CHF_TARGET_KEY(CHF_KEY_TIME), CHF_PAD_BTN_EAST, NULL, 0);

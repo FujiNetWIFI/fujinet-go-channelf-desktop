@@ -18,6 +18,12 @@ endfunction()
 chf_test(no_sdl_link_test no_sdl_link_test.c)
 add_test(NAME no_sdl_link COMMAND no_sdl_link_test)
 
+# The remembered pad -> port table (the "pad_assign" setting's text form):
+# encode, decode, lookup by GUID then name, the cap, malformed input. Pure.
+chf_test(pad_assign_test pad_assign_test.c)
+target_include_directories(pad_assign_test PRIVATE "${CMAKE_SOURCE_DIR}/core/src")
+add_test(NAME pad_assign COMMAND pad_assign_test)
+
 # Module tests live in <name>.test.cmake fragments beside their sources, each
 # registering its own tests with chf_test() / add_test(); they are picked up
 # here so a module can land with its tests without touching this file.
@@ -113,8 +119,9 @@ add_test(NAME gamepad COMMAND gamepad_test)
 # The gamepad layer end to end with an SDL3 virtual gamepad: hot-plug, the
 # default mapping onto the hand controller (D-pad and left stick, shoulders,
 # East, South, the right stick), buttons rebound to a console button and to
-# RESET, the sources kept apart, unplug releasing what was held. SKIPs (77)
-# where SDL has no virtual joysticks.
+# RESET, the sources kept apart, unplug releasing what was held, and a pad's
+# port assignment written to the settings, restored by a new session and
+# dropped by Automatic. SKIPs (77) where SDL has no virtual joysticks.
 chf_session_test(gamepad_map_test gamepad_map_test.c)
 add_test(NAME gamepad_map COMMAND gamepad_map_test)
 set_tests_properties(gamepad_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)

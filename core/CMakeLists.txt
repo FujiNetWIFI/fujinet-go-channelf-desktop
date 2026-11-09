@@ -73,8 +73,13 @@ if(NOT CHF_CORE_ONLY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/machine.c"
   endforeach()
 endif()
 
+# src/pad_assign.c is the session's remembered pad -> port table, kept here
+# (pure, no SDL) so its test links the core alone.
+set(CHF_PAD_ASSIGN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/pad_assign.c")
+
 add_library(chf_core STATIC
-  ${CHF_EMU_SOURCES} ${CHF_FUJI_SOURCES} ${CHF_DEBUGGER_SOURCES})
+  ${CHF_EMU_SOURCES} ${CHF_FUJI_SOURCES} ${CHF_DEBUGGER_SOURCES}
+  ${CHF_PAD_ASSIGN_SOURCE})
 # Development only: a stand-in for the debugger engine while it is written,
 # so the session and the frontends link. Never set when debugger/ builds.
 set(CHF_DEBUG_SHIM "" CACHE FILEPATH "A debugger stand-in source (development only)")
@@ -106,7 +111,7 @@ endif()
 
 # Our own modules are warning-clean; the staged tree is built with whatever
 # warnings upstream is comfortable with.
-set(CHF_WARN_SOURCES ${CHF_EMU_SOURCES} ${CHF_DEBUGGER_SOURCES})
+set(CHF_WARN_SOURCES ${CHF_EMU_SOURCES} ${CHF_DEBUGGER_SOURCES} ${CHF_PAD_ASSIGN_SOURCE})
 list(REMOVE_ITEM CHF_WARN_SOURCES debugger/symbols_builtin.c)
 set_property(SOURCE ${CHF_WARN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
   "$<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra>")

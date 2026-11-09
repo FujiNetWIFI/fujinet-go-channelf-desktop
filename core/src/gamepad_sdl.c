@@ -25,9 +25,11 @@
  * never releases another. Ported from the O2 sibling's gamepad_sdl.c.
  *
  * Pads are assigned to ports in connection order unless assigned explicitly.
- * A pad that is unplugged and plugged back in (matched by its SDL GUID and
- * name) gets its explicit assignment back, and every connect/disconnect is
- * reported to the session for the frontend's toast.
+ * An explicit assignment is remembered (settings key "pad_assign", see
+ * pad_assign.h): a pad that is unplugged and plugged back in, or is there on
+ * the next run, gets it back -- matched by its SDL GUID, else by its name.
+ * Two identical pads share one entry; the first to connect gets it. Every
+ * connect/disconnect is reported to the session for the frontend's toast.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -42,6 +44,7 @@
 #include <SDL3/SDL.h>
 
 #include "gamepad_sdl.h"
+#include "pad_assign.h"
 #include "session_internal.h"
 
 #define MAX_PADS CHF_MAX_PADS
@@ -56,6 +59,9 @@ typedef struct {
     SDL_Gamepad *handle;      /* mapped gamepad, or NULL */
     SDL_Joystick *joy;        /* raw joystick when not a gamepad */
     int assign;               /* explicit port, -1 = automatic */
+    int by_name;              /* assign was restored from a name-only match
+                               * (the entry's GUID differs): an exact-GUID
+                               * pad may take it over */
     int port;                 /* the port it drove on the last poll, or -1 */
     int stick_dir;            /* left stick's four-way state (hysteresis) */
     int knob_dir;             /* right stick's */
@@ -65,7 +71,8 @@ typedef struct {
      * and a pad that goes away drops what it held. */
     int16_t btn_target[256];
     SDL_GUID guid;
-    char name[64];
+    char guidstr[CHF_PAD_GUID_MAX];   /* guid as hex, for the pad_assign table */
+    char name[CHF_PAD_NAME_MAX];
     int trigger_down[2];
     Uint8 last_hat[MAX_HATS];
 } pad_slot;
@@ -81,9 +88,9 @@ typedef struct {
     unsigned generation;
     /* Map-mode capture */
     int cap_active, cap_have, cap_result;
-    /* explicit assignments of pads that went away, for when they come back */
-    struct { SDL_GUID guid; char name[64]; int assign; int used; } gone[MAX_PADS];
-    int gone_next;
+    /* the remembered explicit assignments (the "pad_assign" setting), for
+     * pads that are away as well as those here; guarded by lock */
+    chf_pad_table table;
 } gamepad_state;
 
 static gamepad_state *g_state;   /* one per process: SDL's subsystem is */
@@ -225,6 +232,33 @@ static void slot_close(gamepad_state *g, pad_slot *slot)
 
 static int effective_port_locked(gamepad_state *g, int idx);
 
+/* Gives the pad in slot idx its remembered port. An entry with the pad's own
+ * GUID is the pad's: it takes it from a pad that got it only through the name
+ * fallback. A pad known only by name takes the entry if no other pad carries
+ * it (two identical pads, or one pad known under two GUIDs): then this one
+ * stays automatic. Locked by the caller; only reads settings' copy in
+ * g->table, never writes. */
+static void restore_assignment(gamepad_state *g, int idx)
+{
+    pad_slot *slot = &g->pads[idx];
+    int ent = chf_pad_table_find(&g->table, slot->guidstr, slot->name), k;
+    int exact;
+
+    if (ent < 0 || g->table.entry[ent].port >= CHF_PLAYERS) return;
+    exact = !strcmp(g->table.entry[ent].guid, slot->guidstr);
+    for (k = 0; k < g->npads; k++) {
+        pad_slot *other = &g->pads[k];
+        if (k == idx || other->assign < 0 ||
+            chf_pad_table_find(&g->table, other->guidstr, other->name) != ent)
+            continue;
+        if (!exact || !other->by_name) return;
+        other->assign = -1;          /* the entry's owner is here: it wins */
+        other->by_name = 0;
+    }
+    slot->assign = g->table.entry[ent].port;
+    slot->by_name = !exact;
+}
+
 /* Idempotent, and the single place the gamepad/joystick decision is made:
  * both SDL_EVENT_JOYSTICK_ADDED and SDL_EVENT_GAMEPAD_ADDED land here (SDL
  * posts both for a mapped device) and the slot_for_id guard makes the second
@@ -254,14 +288,8 @@ static void open_pad(gamepad_state *g, SDL_JoystickID id)
             for (h = 0; h < MAX_HATS; h++) slot->last_hat[h] = SDL_HAT_CENTERED;
             slot->guid = SDL_GetJoystickGUIDForID(id);
             snprintf(slot->name, sizeof slot->name, "%s", slot_name(slot));
-            for (h = 0; h < MAX_PADS; h++) {
-                if (g->gone[h].used && !memcmp(&g->gone[h].guid, &slot->guid, sizeof slot->guid)
-                    && !strcmp(g->gone[h].name, slot->name)) {
-                    slot->assign = g->gone[h].assign;
-                    g->gone[h].used = 0;
-                    break;
-                }
-            }
+            SDL_GUIDToString(slot->guid, slot->guidstr, sizeof slot->guidstr);
+            restore_assignment(g, g->npads - 1);
             g->generation++;
             fprintf(stderr, "chf gamepad: %s connected (%s)\n", slot->name,
                     gp ? "gamepad" : "raw joystick");
@@ -289,13 +317,6 @@ static void close_pad(gamepad_state *g, SDL_JoystickID id)
         char msg[128];
         fprintf(stderr, "chf gamepad: %s disconnected\n", slot->name);
         snprintf(msg, sizeof msg, "Disconnected: %s", slot->name);
-        if (slot->assign >= 0) {
-            int k = g->gone_next++ % MAX_PADS;
-            g->gone[k].guid = slot->guid;
-            memcpy(g->gone[k].name, slot->name, sizeof g->gone[k].name);
-            g->gone[k].assign = slot->assign;
-            g->gone[k].used = 1;
-        }
         slot_close(g, slot);
         session_gamepad_event(g->session, msg);
         for (i = idx; i < g->npads - 1; i++) g->pads[i] = g->pads[i + 1];
@@ -598,6 +619,8 @@ int gamepad_start(struct chfsession *s)
     g = calloc(1, sizeof *g);
     if (!g) { SDL_QuitSubSystem(SDL_INIT_GAMEPAD); return -1; }
     g->session = s;
+    /* the remembered assignments, once: garbage or no key is an empty table */
+    chf_pad_table_decode(&g->table, chfsession_get_str(s, "pad_assign", ""), CHF_PLAYERS);
     pthread_mutex_init(&g->lock, NULL);
     /* An explicit stack: the platform default is 512 KB on macOS, and SDL's
      * HID enumeration runs on this thread. */
@@ -662,11 +685,37 @@ int chfsession_gamepad_name(chfsession *s, int idx, char *dst, int dstsz)
 void chfsession_gamepad_assign(chfsession *s, int idx, int port)
 {
     gamepad_state *g = s->gamepad;
+    char text[CHF_PAD_ASSIGN_TEXT_MAX];
+    int changed = 0;
     if (!g) return;
     pthread_mutex_lock(&g->lock);
-    if (idx >= 0 && idx < g->npads)
-        g->pads[idx].assign = (port >= 0 && port < 2) ? port : -1;
+    if (idx >= 0 && idx < g->npads) {
+        pad_slot *slot = &g->pads[idx];
+        if (port >= 0 && port < CHF_PLAYERS) {
+            slot->assign = port;
+            slot->by_name = 0;
+            changed = chf_pad_table_set(&g->table, slot->guidstr, slot->name, port) > 0;
+        } else {
+            const char *kguid[MAX_PADS], *kname[MAX_PADS];
+            int k, nkeep = 0;
+            slot->assign = -1;
+            slot->by_name = 0;
+            for (k = 0; k < g->npads; k++)
+                if (k != idx && g->pads[k].assign >= 0) {
+                    kguid[nkeep] = g->pads[k].guidstr;
+                    kname[nkeep++] = g->pads[k].name;
+                }
+            changed = chf_pad_table_remove(&g->table, slot->guidstr, slot->name,
+                                           nkeep, kguid, kname);
+        }
+        if (changed && chf_pad_table_encode(&g->table, text, sizeof text) < 0)
+            changed = 0;
+    }
     pthread_mutex_unlock(&g->lock);
+    /* the settings file is written here, on the caller's thread, with the
+     * pad lock let go: the pad thread must never wait on a file write */
+    if (changed)
+        chfsession_set_str(s, "pad_assign", text);
 }
 
 int chfsession_gamepad_assignment(chfsession *s, int idx)

@@ -46,7 +46,7 @@ static void set_locked(struct chfsession *s, const char *key, const char *val)
 void settings_init(struct chfsession *s)
 {
     FILE *fp;
-    char line[1024];
+    char line[16384];   /* pad_assign alone can run to several KB */
 
     pthread_mutex_init(&s->settings_mtx, NULL);
     fp = fopen(s->settings_file, "r");
@@ -54,6 +54,13 @@ void settings_init(struct chfsession *s)
     while (fgets(line, sizeof(line), fp)) {
         char *eq, *end;
         char *p = line;
+        if (!strchr(line, '\n') && !feof(fp)) {
+            /* longer than any value we write: drop the line whole rather
+             * than parse its tail as another setting */
+            int ch;
+            while ((ch = fgetc(fp)) != EOF && ch != '\n') {}
+            continue;
+        }
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
         eq = strchr(p, '=');

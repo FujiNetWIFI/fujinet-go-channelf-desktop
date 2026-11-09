@@ -14,10 +14,10 @@
 #include "pad_assign.h"
 
 static int failures;
-static void check(int ok, const char *what)
+static void check(int pass, const char *what)
 {
-    printf("%s: %s\n", ok ? "ok" : "FAIL", what);
-    if (!ok) failures++;
+    printf("%s: %s\n", pass ? "ok" : "FAIL", what);
+    if (!pass) failures++;
 }
 
 #define GUID_A "030000005e040000ea02000000000000"

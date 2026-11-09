@@ -57,8 +57,8 @@ void settings_init(struct chfsession *s)
         if (!strchr(line, '\n') && !feof(fp)) {
             /* longer than any value we write: drop the line whole rather
              * than parse its tail as another setting */
-            int ch;
-            while ((ch = fgetc(fp)) != EOF && ch != '\n') {}
+            int chr;
+            while ((chr = fgetc(fp)) != EOF && chr != '\n') {}
             continue;
         }
         while (*p == ' ' || *p == '\t') p++;

@@ -68,31 +68,31 @@ static void expect(chfsession *s, unsigned want, int key, int reset, const char 
 
 #define B(a) (1u << (a))
 
-/* A session on p's directories with only the gamepad thread. */
-static chfsession *session_up(chfsession_paths *p)
+/* A session on paths' directories with only the gamepad thread. */
+static chfsession *session_up(chfsession_paths *paths)
 {
-    chfsession *s = chfsession_new(p);
-    chfsession_start_opts o;
-    if (!s)
+    chfsession *ses = chfsession_new(paths);
+    chfsession_start_opts opts;
+    if (!ses)
         return NULL;
-    chfsession_default_opts(s, &o);
-    o.enable_fujinet = 0;
-    o.enable_audio = 0;
-    o.enable_gamepad = 1;
-    if (chfsession_start(s, &o) != 0) {
-        printf("FAIL: start: %s\n", chfsession_last_error(s));
-        chfsession_free(s);
+    chfsession_default_opts(ses, &opts);
+    opts.enable_fujinet = 0;
+    opts.enable_audio = 0;
+    opts.enable_gamepad = 1;
+    if (chfsession_start(ses, &opts) != 0) {
+        printf("FAIL: start: %s\n", chfsession_last_error(ses));
+        chfsession_free(ses);
         return NULL;
     }
-    return s;
+    return ses;
 }
 
 /* The virtual pad's slot now, or -1. */
-static int pad_slot_now(chfsession *s)
+static int pad_slot_now(chfsession *ses)
 {
-    for (int idx = 0; idx < chfsession_gamepad_count(s); idx++) {
+    for (int idx = 0; idx < chfsession_gamepad_count(ses); idx++) {
         char name[64];
-        chfsession_gamepad_name(s, idx, name, sizeof name);
+        chfsession_gamepad_name(ses, idx, name, sizeof name);
         if (strcmp(name, PAD_NAME) == 0)
             return idx;
     }
@@ -101,31 +101,31 @@ static int pad_slot_now(chfsession *s)
 
 /* The virtual pad's slot once the pad thread has found it (polled, up to
  * five seconds: a slow runner is slow to enumerate), or -1. */
-static int wait_for_pad(chfsession *s)
+static int wait_for_pad(chfsession *ses)
 {
-    int idx = pad_slot_now(s);
+    int idx = pad_slot_now(ses);
     for (int tries = 0; tries < 250 && idx < 0; tries++) {
         sleep_ms(20);
-        idx = pad_slot_now(s);
+        idx = pad_slot_now(ses);
     }
     return idx;
 }
 
 /* The pad_assign setting with the pad's entry in it? */
-static int has_entry(chfsession *s, const char *guid, int port)
+static int has_entry(chfsession *ses, const char *guid, int port)
 {
     char want[160];
     snprintf(want, sizeof want, "%s|%s=%d", guid, PAD_NAME, port);
-    return strstr(chfsession_get_str(s, "pad_assign", ""), want) != NULL;
+    return strstr(chfsession_get_str(ses, "pad_assign", ""), want) != NULL;
 }
 
 /* A pad's port assignment survives a restart. The virtual pad stays attached
  * across the sessions (SDL is held open by the caller). */
-static void persistence(chfsession_paths *p)
+static void persistence(chfsession_paths *paths)
 {
     SDL_VirtualJoystickDesc desc;
     SDL_JoystickID vid;
-    chfsession *s;
+    chfsession *ses;
     char guid[64];
     int idx, want, auto_port;
 
@@ -142,46 +142,46 @@ static void persistence(chfsession_paths *p)
     }
     SDL_GUIDToString(SDL_GetJoystickGUIDForID(vid), guid, sizeof guid);
 
-    s = session_up(p);
-    if (!s) { failures++; SDL_DetachVirtualJoystick(vid); return; }
-    idx = wait_for_pad(s);
+    ses = session_up(paths);
+    if (!ses) { failures++; SDL_DetachVirtualJoystick(vid); return; }
+    idx = wait_for_pad(ses);
     check(idx >= 0, "persistence: the pad is picked up");
-    if (idx < 0) { chfsession_free(s); SDL_DetachVirtualJoystick(vid); return; }
-    check(chfsession_gamepad_assignment(s, idx) == -1, "a pad nobody assigned is automatic");
-    check(strstr(chfsession_get_str(s, "pad_assign", ""), guid) == NULL, "and has no entry");
-    auto_port = chfsession_gamepad_effective_port(s, idx);
+    if (idx < 0) { chfsession_free(ses); SDL_DetachVirtualJoystick(vid); return; }
+    check(chfsession_gamepad_assignment(ses, idx) == -1, "a pad nobody assigned is automatic");
+    check(strstr(chfsession_get_str(ses, "pad_assign", ""), guid) == NULL, "and has no entry");
+    auto_port = chfsession_gamepad_effective_port(ses, idx);
     want = auto_port == 0 ? 1 : 0;
 
-    chfsession_gamepad_assign(s, idx, want);
-    check(chfsession_gamepad_assignment(s, idx) == want
-          && chfsession_gamepad_effective_port(s, idx) == want, "assigning drives the other port");
-    check(has_entry(s, guid, want), "and writes <guid>|<name>=<port> to pad_assign");
+    chfsession_gamepad_assign(ses, idx, want);
+    check(chfsession_gamepad_assignment(ses, idx) == want
+          && chfsession_gamepad_effective_port(ses, idx) == want, "assigning drives the other port");
+    check(has_entry(ses, guid, want), "and writes <guid>|<name>=<port> to pad_assign");
 
     /* the file itself, not just the in-memory store */
     {
         char path[600], line[2048];
         int found = 0;
-        FILE *fp;
-        snprintf(path, sizeof path, "%s/settings.ini", p->config_dir);
-        fp = fopen(path, "r");
-        if (fp) {
-            while (fgets(line, sizeof line, fp))
+        FILE *fil;
+        snprintf(path, sizeof path, "%s/settings.ini", paths->config_dir);
+        fil = fopen(path, "r");
+        if (fil) {
+            while (fgets(line, sizeof line, fil))
                 if (!strncmp(line, "pad_assign=", 11) && strstr(line, guid))
                     found = 1;
-            fclose(fp);
+            fclose(fil);
         }
         check(found, "the settings file on disk holds it");
     }
 
     /* restart: a new session on the same settings */
-    chfsession_free(s);
-    s = session_up(p);
-    if (!s) { failures++; SDL_DetachVirtualJoystick(vid); return; }
-    idx = wait_for_pad(s);
+    chfsession_free(ses);
+    ses = session_up(paths);
+    if (!ses) { failures++; SDL_DetachVirtualJoystick(vid); return; }
+    idx = wait_for_pad(ses);
     check(idx >= 0, "restart: the pad is picked up again");
     if (idx >= 0) {
-        check(chfsession_gamepad_assignment(s, idx) == want, "the assignment is restored on device add");
-        check(chfsession_gamepad_effective_port(s, idx) == want, "and the pad drives that port");
+        check(chfsession_gamepad_assignment(ses, idx) == want, "the assignment is restored on device add");
+        check(chfsession_gamepad_effective_port(ses, idx) == want, "and the pad drives that port");
     }
 
     /* a stale GUID (another USB port): the name finds the entry. Rewrite the
@@ -189,53 +189,53 @@ static void persistence(chfsession_paths *p)
     {
         char text[300];
         snprintf(text, sizeof text, "ffffffffffffffffffffffffffffffff|%s=%d", PAD_NAME, want);
-        chfsession_set_str(s, "pad_assign", text);
+        chfsession_set_str(ses, "pad_assign", text);
     }
-    chfsession_free(s);
-    s = session_up(p);
-    if (!s) { failures++; SDL_DetachVirtualJoystick(vid); return; }
-    idx = wait_for_pad(s);
-    check(idx >= 0 && chfsession_gamepad_assignment(s, idx) == want,
+    chfsession_free(ses);
+    ses = session_up(paths);
+    if (!ses) { failures++; SDL_DetachVirtualJoystick(vid); return; }
+    idx = wait_for_pad(ses);
+    check(idx >= 0 && chfsession_gamepad_assignment(ses, idx) == want,
           "a different GUID with the same name gets the assignment too");
 
     /* Automatic removes the entry, and the next run starts automatic */
-    chfsession_gamepad_assign(s, idx, want);   /* back under its own GUID */
-    check(has_entry(s, guid, want), "assigned under the pad's own GUID again");
-    chfsession_gamepad_assign(s, idx, -1);
-    check(chfsession_gamepad_assignment(s, idx) == -1, "Automatic: no explicit port");
-    check(strstr(chfsession_get_str(s, "pad_assign", ""), PAD_NAME) == NULL,
+    chfsession_gamepad_assign(ses, idx, want);   /* back under its own GUID */
+    check(has_entry(ses, guid, want), "assigned under the pad's own GUID again");
+    chfsession_gamepad_assign(ses, idx, -1);
+    check(chfsession_gamepad_assignment(ses, idx) == -1, "Automatic: no explicit port");
+    check(strstr(chfsession_get_str(ses, "pad_assign", ""), PAD_NAME) == NULL,
           "and the entry is gone from pad_assign");
-    chfsession_free(s);
-    s = session_up(p);
-    if (!s) { failures++; SDL_DetachVirtualJoystick(vid); return; }
-    idx = wait_for_pad(s);
-    check(idx >= 0 && chfsession_gamepad_assignment(s, idx) == -1
-          && chfsession_gamepad_effective_port(s, idx) == auto_port, "after a restart it is automatic again");
+    chfsession_free(ses);
+    ses = session_up(paths);
+    if (!ses) { failures++; SDL_DetachVirtualJoystick(vid); return; }
+    idx = wait_for_pad(ses);
+    check(idx >= 0 && chfsession_gamepad_assignment(ses, idx) == -1
+          && chfsession_gamepad_effective_port(ses, idx) == auto_port, "after a restart it is automatic again");
 
     /* garbage in the setting is ignored, silently */
-    chfsession_set_str(s, "pad_assign", ";;|=;zz|x=9;%%%;" "00000000000000000000000000000000|" PAD_NAME "=7");
-    chfsession_free(s);
-    s = session_up(p);
-    if (!s) { failures++; SDL_DetachVirtualJoystick(vid); return; }
-    idx = wait_for_pad(s);
-    check(idx >= 0 && chfsession_gamepad_assignment(s, idx) == -1,
+    chfsession_set_str(ses, "pad_assign", ";;|=;zz|x=9;%%%;" "00000000000000000000000000000000|" PAD_NAME "=7");
+    chfsession_free(ses);
+    ses = session_up(paths);
+    if (!ses) { failures++; SDL_DetachVirtualJoystick(vid); return; }
+    idx = wait_for_pad(ses);
+    check(idx >= 0 && chfsession_gamepad_assignment(ses, idx) == -1,
           "a malformed or out-of-range pad_assign leaves the pad automatic");
-    chfsession_gamepad_assign(s, idx, want);
-    check(has_entry(s, guid, want), "and a new assignment still writes");
-    chfsession_gamepad_assign(s, idx, -1);
+    chfsession_gamepad_assign(ses, idx, want);
+    check(has_entry(ses, guid, want), "and a new assignment still writes");
+    chfsession_gamepad_assign(ses, idx, -1);
 
     /* a hot replug within a run restores it too */
-    chfsession_gamepad_assign(s, idx, want);
+    chfsession_gamepad_assign(ses, idx, want);
     SDL_DetachVirtualJoystick(vid);
-    for (int tries = 0; tries < 250 && pad_slot_now(s) >= 0; tries++)
+    for (int tries = 0; tries < 250 && pad_slot_now(ses) >= 0; tries++)
         sleep_ms(20);
-    check(pad_slot_now(s) < 0, "unplugged: the pad is gone");
+    check(pad_slot_now(ses) < 0, "unplugged: the pad is gone");
     vid = SDL_AttachVirtualJoystick(&desc);
-    idx = vid ? wait_for_pad(s) : -1;
-    check(idx >= 0 && chfsession_gamepad_assignment(s, idx) == want, "unplugged and plugged back in: the port comes back");
-    chfsession_gamepad_assign(s, idx, -1);
+    idx = vid ? wait_for_pad(ses) : -1;
+    check(idx >= 0 && chfsession_gamepad_assignment(ses, idx) == want, "unplugged and plugged back in: the port comes back");
+    chfsession_gamepad_assign(ses, idx, -1);
 
-    chfsession_free(s);
+    chfsession_free(ses);
     if (vid)
         SDL_DetachVirtualJoystick(vid);
 }

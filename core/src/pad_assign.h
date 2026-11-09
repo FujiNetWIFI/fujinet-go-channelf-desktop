@@ -69,7 +69,7 @@ int chf_pad_table_set(chf_pad_table *tab, const char *guid, const char *name, in
 
 /* Forgets a device: every entry find() would match for it (its own, and a
  * stale one under another GUID with the same name), so none is left to apply
- * the next run. The nkeep devices (keepguid[i], keepname[i]) are the other
+ * the next run. The nkeep devices (keepguid[idx], keepname[idx]) are the other
  * pads that still hold an explicit assignment: an entry find() matches for
  * one of them stays, so two same-name pads with different GUIDs never erase
  * each other. Returns 1 if the table changed, else 0. */

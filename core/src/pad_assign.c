@@ -10,11 +10,11 @@
 
 #include "pad_assign.h"
 
-static int hex_value(int ch)
+static int hex_value(int chr)
 {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    if (chr >= '0' && chr <= '9') return chr - '0';
+    if (chr >= 'a' && chr <= 'f') return chr - 'a' + 10;
+    if (chr >= 'A' && chr <= 'F') return chr - 'A' + 10;
     return -1;
 }
 
@@ -31,9 +31,9 @@ static int guid_norm(char *dst, const char *src, size_t len)
     return 1;
 }
 
-static int needs_escape(unsigned char ch)
+static int needs_escape(unsigned char chr)
 {
-    return ch < 0x20 || ch == 0x7F || ch == ';' || ch == '|' || ch == '=' || ch == '%';
+    return chr < 0x20 || chr == 0x7F || chr == ';' || chr == '|' || chr == '=' || chr == '%';
 }
 
 /* The exact entry for a normalised GUID and a name, or -1. */
@@ -98,14 +98,14 @@ int chf_pad_table_set(chf_pad_table *tab, const char *guid, const char *name, in
 int chf_pad_table_remove(chf_pad_table *tab, const char *guid, const char *name,
                          int nkeep, const char *const *keepguid, const char *const *keepname)
 {
-    int removed = 0, idx, k;
+    int removed = 0, idx, kix;
     if (!tab || !name) return 0;
     /* every entry that find() would hand this device, so that none is left
      * to apply it on the next run (a stale GUID of the same pad included) --
      * but never one that find() also hands a pad that keeps its assignment */
     while ((idx = chf_pad_table_find(tab, guid, name)) >= 0) {
-        for (k = 0; k < nkeep; k++)
-            if (chf_pad_table_find(tab, keepguid[k], keepname[k]) == idx) return removed;
+        for (kix = 0; kix < nkeep; kix++)
+            if (chf_pad_table_find(tab, keepguid[kix], keepname[kix]) == idx) return removed;
         erase_at(tab, idx);
         removed = 1;
     }
@@ -120,28 +120,28 @@ int chf_pad_table_encode(const chf_pad_table *tab, char *dst, size_t dstsz)
     char tail[16];
 
     if (!tab || !dst || dstsz == 0) return -1;
-#define PUT(ch) do { if (len + 1 >= dstsz) { dst[0] = '\0'; return -1; } dst[len++] = (char)(ch); } while (0)
+#define PUT(chr) do { if (len + 1 >= dstsz) { dst[0] = '\0'; return -1; } dst[len++] = (char)(chr); } while (0)
     for (idx = 0; idx < tab->count; idx++) {
         const chf_pad_entry *ent = &tab->entry[idx];
         const char *src;
-        int num = ent->port, nd = 0;
+        int num = ent->port, ndig = 0;
 
         if (idx) PUT(';');
         for (src = ent->guid; *src; src++) PUT(*src);
         PUT('|');
         for (src = ent->name; *src; src++) {
-            unsigned char ch = (unsigned char)*src;
-            if (needs_escape(ch)) {
+            unsigned char chr = (unsigned char)*src;
+            if (needs_escape(chr)) {
                 PUT('%');
-                PUT(digits[ch >> 4]);
-                PUT(digits[ch & 15]);
+                PUT(digits[chr >> 4]);
+                PUT(digits[chr & 15]);
             } else {
-                PUT(ch);
+                PUT(chr);
             }
         }
         PUT('=');
-        do { tail[nd++] = (char)('0' + num % 10); num /= 10; } while (num && nd < (int)sizeof tail);
-        while (nd) PUT(tail[--nd]);
+        do { tail[ndig++] = (char)('0' + num % 10); num /= 10; } while (num && ndig < (int)sizeof tail);
+        while (ndig) PUT(tail[--ndig]);
     }
 #undef PUT
     dst[len] = '\0';
@@ -151,35 +151,35 @@ int chf_pad_table_encode(const chf_pad_table *tab, char *dst, size_t dstsz)
 /* One "<guid>|<name>=<port>" entry; 1 if it parsed. */
 static int parse_entry(chf_pad_entry *ent, const char *beg, const char *end, int nports)
 {
-    const char *bar, *eq, *src;
+    const char *bar, *eqpos, *src;
     size_t nlen = 0;
     long port = 0;
 
     for (bar = beg; bar < end && *bar != '|'; bar++) {}
     if (bar >= end) return 0;
-    for (eq = bar + 1; eq < end && *eq != '='; eq++) {}
-    if (eq >= end) return 0;
+    for (eqpos = bar + 1; eqpos < end && *eqpos != '='; eqpos++) {}
+    if (eqpos >= end) return 0;
     if (!guid_norm(ent->guid, beg, (size_t)(bar - beg))) return 0;
 
-    for (src = bar + 1; src < eq; src++) {
-        unsigned char ch = (unsigned char)*src;
-        if (nlen + 1 >= CHF_PAD_NAME_MAX || ch == '|') return 0;
-        if (ch == '%') {
-            int hi, lo;
-            if (src + 2 >= eq) return 0;
-            hi = hex_value((unsigned char)src[1]);
-            lo = hex_value((unsigned char)src[2]);
-            if (hi < 0 || lo < 0) return 0;
-            ch = (unsigned char)(hi * 16 + lo);
-            if (ch == 0) return 0;
+    for (src = bar + 1; src < eqpos; src++) {
+        unsigned char chr = (unsigned char)*src;
+        if (nlen + 1 >= CHF_PAD_NAME_MAX || chr == '|') return 0;
+        if (chr == '%') {
+            int high, low;
+            if (src + 2 >= eqpos) return 0;
+            high = hex_value((unsigned char)src[1]);
+            low = hex_value((unsigned char)src[2]);
+            if (high < 0 || low < 0) return 0;
+            chr = (unsigned char)(high * 16 + low);
+            if (chr == 0) return 0;
             src += 2;
         }
-        ent->name[nlen++] = (char)ch;
+        ent->name[nlen++] = (char)chr;
     }
     ent->name[nlen] = '\0';
 
-    if (eq + 1 >= end || end - (eq + 1) > 3) return 0;
-    for (src = eq + 1; src < end; src++) {
+    if (eqpos + 1 >= end || end - (eqpos + 1) > 3) return 0;
+    for (src = eqpos + 1; src < end; src++) {
         if (*src < '0' || *src > '9') return 0;
         port = port * 10 + (*src - '0');
     }

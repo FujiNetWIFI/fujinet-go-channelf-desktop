@@ -51,6 +51,7 @@ West, Back, North, Start); RESET is **F1** and Reset to CONFIG **Escape**.
 RESET resets the F8 only, as the console's button does, so a running FujiNet
 app restarts from the cartridge's current image with its RAM; **Reset to
 CONFIG** is the power cycle. Every control can be given another key or button.
+A gamepad's player (Automatic, Player 1 or Player 2) is remembered between runs.
 
 ## Debugger (F12)
 

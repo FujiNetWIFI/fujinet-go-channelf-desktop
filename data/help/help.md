@@ -210,7 +210,8 @@ Key combinations with the Super (Windows) key are the desktop's.
 
 Gamepads are picked up as they are plugged in, and can come and go at any
 time. The first is Player 1, the second Player 2; Preferences ▸ Input can
-fix which is which, and a pad plugged back in gets its player back.
+fix which is which. A pad's player is remembered between runs: plug it
+back in, or start the app again, and it gets its player back.
 
 | Gamepad | Does |
 |---|---|
@@ -547,7 +548,9 @@ pages are tabs.
   pushes (setting `right_stick`).
 - **Gamepads**: each one plugged in, and which player it drives. A new
   gamepad drives Player 1, the next Player 2; choose *Player 1* or
-  *Player 2* to fix it, or *Automatic*.
+  *Player 2* to fix it, or *Automatic*. The choice is remembered between
+  runs (setting `pad_assign`), by the gamepad's id and name; two identical
+  gamepads cannot be told apart, so the first to connect gets it.
 - **Controls**: every control with its key and gamepad button (see
   [Changing the controls](#changing-the-controls)).
 
@@ -575,6 +578,7 @@ The keys the Preferences pages set:
 | `fujinet_external_addr` | `host:port` |
 | `enable_audio` | 1 or 0 |
 | `enable_gamepad` | 1 or 0 |
+| `pad_assign` | the gamepads fixed to a player, remembered between runs; written by the app |
 | `volume` | 0 to 100 |
 | `aspect` | 0 the television's 4:3, 1 square pixels |
 | `smooth` | 1 blends the pixels when stretched, 0 keeps them sharp |

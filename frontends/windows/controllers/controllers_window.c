@@ -1196,6 +1196,7 @@ static void mouse_down(HWND hwnd, POINT p, int button)
             return;
         case SB_SHOW:
             g_show_bindings = !g_show_bindings;
+            chfsession_set_int(g_session, "controllers_show_bindings", g_show_bindings);
             InvalidateRect(hwnd, NULL, FALSE);
             return;
         case SB_HELP: chf_help_show(hwnd, "controllers"); return;
@@ -1464,6 +1465,14 @@ static int create_panel(void)
     static int registered;
     HINSTANCE inst = GetModuleHandleA(NULL);
     RECT want;
+
+    {   /* "controllers_show_bindings"; the older spellings are read when it is absent */
+        int saved = chfsession_get_int(g_session, "controllers_show_bindings", -1);
+        if (saved < 0) saved = chfsession_get_int(g_session, "controllers_bindings", -1);
+        if (saved < 0) saved = chfsession_get_int(g_session, "controllers_key_names", -1);
+        if (saved < 0) saved = chfsession_get_int(g_session, "show_bindings", -1);
+        g_show_bindings = saved > 0;
+    }
 
     if (!registered) {
         WNDCLASSEXA wc;

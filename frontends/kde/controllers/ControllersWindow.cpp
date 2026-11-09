@@ -963,9 +963,14 @@ ControllersWindow::ControllersWindow(chfsession *session, QWidget *parent)
     auto *bindings = new QCheckBox(QStringLiteral("Show bindings"));
     bindings->setFocusPolicy(Qt::NoFocus);
     bindings->setToolTip(QStringLiteral("Show the key and gamepad button each part has"));
-    bindings->setChecked(chfsession_get_int(session, "controllers_bindings", 0) != 0);
+    /* "controllers_show_bindings"; the older spellings are read when it is absent */
+    int savedBindings = chfsession_get_int(session, "controllers_show_bindings", -1);
+    if (savedBindings < 0) savedBindings = chfsession_get_int(session, "controllers_bindings", -1);
+    if (savedBindings < 0) savedBindings = chfsession_get_int(session, "controllers_key_names", -1);
+    if (savedBindings < 0) savedBindings = chfsession_get_int(session, "show_bindings", -1);
+    bindings->setChecked(savedBindings > 0);
     connect(bindings, &QCheckBox::toggled, this, [this](bool on) {
-        chfsession_set_int(m_session, "controllers_bindings", on ? 1 : 0);
+        chfsession_set_int(m_session, "controllers_show_bindings", on ? 1 : 0);
         m_console->setShowBindings(on);
     });
     m_console->setShowBindings(bindings->isChecked());

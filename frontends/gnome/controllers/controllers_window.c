@@ -127,12 +127,31 @@ static int g_map_state = -2;
 static GtkWidget *g_map_button, *g_clear_button;
 static GtkWidget *g_map_hint;
 static GtkWidget *g_show_bindings;
-static GtkWidget *g_pads_label;
+#define MAX_PADS    8           /* pads listed (SDL opens few more) */
+#define PAD_ROWS    3           /* pad rows the window reserves; more scroll */
+#define PAD_ROW_H   36          /* one row's height, px */
+#define PAD_GAP     4
+static GtkWidget *g_pad_box;
+static GtkWidget *g_pad_eff[MAX_PADS];  /* each pad's "drives player N" */
+static int g_npad_rows;
+static unsigned g_pad_generation = (unsigned)-1;
 static guint g_capture_timer;
 static guint g_swallow_code;    /* the key Map took: its repeats and release too */
 static guint g_info_timer;
 
 static void refresh_all(void);
+
+/* "controllers_show_bindings"; the older spellings are read when it is absent. */
+static gboolean show_bindings_saved(void)
+{
+    static const char *const old[] = { "controllers_bindings", "controllers_key_names",
+                                       "show_bindings" };
+    int val = chfsession_get_int(g_session, "controllers_show_bindings", -1);
+    size_t i;
+    for (i = 0; val < 0 && i < G_N_ELEMENTS(old); i++)
+        val = chfsession_get_int(g_session, old[i], -1);
+    return val > 0;
+}
 
 /* ---- small helpers ---------------------------------------------------------- */
 
@@ -1240,33 +1259,102 @@ static gboolean frame_tick(GtkWidget *widget, GdkFrameClock *clock, gpointer d)
     return G_SOURCE_CONTINUE;
 }
 
-/* The gamepads as one line (assigning them is Preferences' job: this window
- * must not change size when a pad comes or goes), and the machine's name. */
+/* ---- gamepads ------------------------------------------------------------- */
+
+static void refresh_pad_ports(void)
+{
+    int i;
+    for (i = 0; i < g_npad_rows; i++) {
+        const int eff = chfsession_gamepad_effective_port(g_session, i);
+        char text[32];
+        if (eff >= 0) g_snprintf(text, sizeof text, "drives player %d", eff + 1);
+        else g_snprintf(text, sizeof text, "drives nothing");
+        if (strcmp(gtk_label_get_text(GTK_LABEL(g_pad_eff[i])), text) != 0)
+            gtk_label_set_text(GTK_LABEL(g_pad_eff[i]), text);
+    }
+}
+
+static void on_assign_changed(GObject *o, GParamSpec *ps, gpointer user_data)
+{
+    const int idx = GPOINTER_TO_INT(user_data);
+    const guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(o));
+    (void)ps;
+    /* 0 = automatic (connection order), 1-2 = that player */
+    chfsession_gamepad_assign(g_session, idx, sel == 0 ? -1 : (int)sel - 1);
+    refresh_pad_ports();
+}
+
+/* Rebuilt whenever a pad comes or goes (the session's generation counter):
+ * one row per pad, its name, the player it drives and the one it is set to.
+ * The area is PAD_ROWS rows tall whatever is plugged in (more pads scroll),
+ * so the window never changes size. */
+static void refresh_pads(void)
+{
+    static const char *const choices[] = { "Automatic", "Player 1", "Player 2", NULL };
+    GtkWidget *child;
+    int n, i;
+
+    while ((child = gtk_widget_get_first_child(g_pad_box)) != NULL)
+        gtk_box_remove(GTK_BOX(g_pad_box), child);
+    g_npad_rows = 0;
+
+    n = chfsession_gamepad_count(g_session);
+    if (n == 0) {
+        GtkWidget *none = gtk_label_new("No gamepads connected");
+        gtk_widget_add_css_class(none, "dim-label");
+        gtk_label_set_xalign(GTK_LABEL(none), 0);
+        gtk_widget_set_size_request(none, -1, PAD_ROW_H);
+        gtk_widget_set_tooltip_text(none, "Plug one in: it is picked up as it appears");
+        gtk_box_append(GTK_BOX(g_pad_box), none);
+        return;
+    }
+    for (i = 0; i < n && i < MAX_PADS; i++) {
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *name, *drop, *eff;
+        char text[128];
+        const int assign = chfsession_gamepad_assignment(g_session, i);
+
+        chfsession_gamepad_name(g_session, i, text, sizeof text);
+        gtk_widget_set_size_request(row, -1, PAD_ROW_H);
+        name = gtk_label_new(text);
+        gtk_widget_set_hexpand(name, TRUE);
+        gtk_label_set_xalign(GTK_LABEL(name), 0);
+        gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_END);
+        gtk_label_set_max_width_chars(GTK_LABEL(name), 1);
+        gtk_widget_set_tooltip_text(name, text);
+        eff = gtk_label_new("");
+        gtk_widget_add_css_class(eff, "dim-label");
+        drop = gtk_drop_down_new_from_strings(choices);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(drop),
+                                   assign < 0 || assign > 1 ? 0 : (guint)assign + 1);
+        gtk_widget_set_focus_on_click(drop, FALSE);
+        gtk_widget_set_valign(drop, GTK_ALIGN_CENTER);
+        g_signal_connect(drop, "notify::selected", G_CALLBACK(on_assign_changed),
+                         GINT_TO_POINTER(i));
+        gtk_box_append(GTK_BOX(row), name);
+        gtk_box_append(GTK_BOX(row), eff);
+        gtk_box_append(GTK_BOX(row), drop);
+        gtk_box_append(GTK_BOX(g_pad_box), row);
+        g_pad_eff[g_npad_rows++] = eff;
+    }
+    refresh_pad_ports();
+}
+
+/* The pad rows (hot plug, automatic assignment changes) and the machine's
+ * name. */
 static gboolean info_tick(gpointer d)
 {
-    GString *s;
-    char name[96];
-    int n, i;
+    unsigned gen;
     (void)d;
     if (!g_window || !gtk_widget_get_visible(g_window)) return G_SOURCE_CONTINUE;
 
-    s = g_string_new("Gamepads: ");
-    n = chfsession_gamepad_count(g_session);
-    if (n == 0)
-        g_string_append(s, "none connected");
-    for (i = 0; i < n; i++) {
-        const int eff = chfsession_gamepad_effective_port(g_session, i);
-        chfsession_gamepad_name(g_session, i, name, sizeof name);
-        g_string_append_printf(s, "%s%s (%s)", i ? ", " : "", name,
-                               eff >= 0 ? eff == 0 ? "Player 1" : "Player 2" : "unassigned");
+    gen = chfsession_gamepad_generation(g_session);
+    if (gen != g_pad_generation) {
+        g_pad_generation = gen;
+        refresh_pads();
+    } else {
+        refresh_pad_ports();
     }
-    if (strcmp(gtk_label_get_text(GTK_LABEL(g_pads_label)), s->str) != 0) {
-        gtk_label_set_text(GTK_LABEL(g_pads_label), s->str);
-        gtk_widget_set_tooltip_text(g_pads_label,
-                                    "Which gamepad drives which controller is set in "
-                                    "Preferences \xe2\x96\xb8 Input");
-    }
-    g_string_free(s, TRUE);
     if (machine_now() != g_machine) {
         g_machine = machine_now();
         adw_window_title_set_subtitle(g_title, chf_machine_name(g_machine));
@@ -1423,6 +1511,8 @@ static void on_destroy(GtkWidget *w, gpointer d)
     memset(&g_strip, 0, sizeof g_strip);
     g_console = NULL;
     g_window = NULL;
+    g_pad_box = NULL;
+    g_npad_rows = 0;
     g_machine = -1;
     g_map_state = -2;
     g_hover = g_pressed = -1;
@@ -1432,7 +1522,7 @@ static void on_destroy(GtkWidget *w, gpointer d)
 
 static void build_window(GtkWindow *parent)
 {
-    GtkWidget *root, *maprow, *toolbar, *header, *defaults;
+    GtkWidget *root, *maprow, *toolbar, *header, *defaults, *padscroll;
     GtkEventController *keys, *focus, *motion, *scroll;
     GtkGesture *drag;
 
@@ -1511,13 +1601,20 @@ static void build_window(GtkWindow *parent)
     gtk_box_append(GTK_BOX(root), g_console);
     gtk_box_append(GTK_BOX(root), g_strip.area);
 
-    g_pads_label = gtk_label_new("Gamepads: none connected");
-    gtk_widget_add_css_class(g_pads_label, "dim-label");
-    gtk_label_set_xalign(GTK_LABEL(g_pads_label), 0);
-    gtk_label_set_ellipsize(GTK_LABEL(g_pads_label), PANGO_ELLIPSIZE_END);
-    gtk_label_set_max_width_chars(GTK_LABEL(g_pads_label), 1);
-    gtk_widget_set_hexpand(g_pads_label, TRUE);
-    gtk_box_append(GTK_BOX(root), g_pads_label);
+    /* the pad rows: a fixed-height area, so the window never resizes */
+    g_pad_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, PAD_GAP);
+    padscroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(padscroll), GTK_POLICY_NEVER,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(padscroll), FALSE);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(padscroll),
+        PAD_ROWS * PAD_ROW_H + (PAD_ROWS - 1) * PAD_GAP);
+    gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(padscroll),
+        PAD_ROWS * PAD_ROW_H + (PAD_ROWS - 1) * PAD_GAP);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(padscroll), g_pad_box);
+    gtk_box_append(GTK_BOX(root), padscroll);
+    g_pad_generation = (unsigned)-1;
+    refresh_pads();
 
     maprow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     g_map_button = gtk_button_new_with_label("Map");
@@ -1533,7 +1630,7 @@ static void build_window(GtkWindow *parent)
     g_signal_connect(defaults, "clicked", G_CALLBACK(on_defaults_clicked), NULL);
     g_show_bindings = gtk_check_button_new_with_label("Show bindings");
     gtk_check_button_set_active(GTK_CHECK_BUTTON(g_show_bindings),
-        chfsession_get_int(g_session, "controllers_show_bindings", 0) != 0);
+        show_bindings_saved());
     gtk_widget_set_focus_on_click(g_show_bindings, FALSE);
     g_signal_connect(g_show_bindings, "toggled", G_CALLBACK(on_show_bindings), NULL);
     gtk_box_append(GTK_BOX(maprow), g_map_button);

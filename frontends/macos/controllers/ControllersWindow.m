@@ -962,7 +962,14 @@ static double ease(double cur, double target)
     _console.owner = self;
     _console.session = _session;
     _console.mapTarget = -1;
-    _console.showKeys = chfsession_get_int(_session, "controllers_show_bindings", 0) != 0;
+    {
+        /* the older spellings are read when the key is absent */
+        int saved = chfsession_get_int(_session, "controllers_show_bindings", -1);
+        if (saved < 0) saved = chfsession_get_int(_session, "controllers_bindings", -1);
+        if (saved < 0) saved = chfsession_get_int(_session, "controllers_key_names", -1);
+        if (saved < 0) saved = chfsession_get_int(_session, "show_bindings", -1);
+        _console.showKeys = saved > 0;
+    }
     [_content addSubview:_console];
 
     /* Gamepads: one row per pad, its name, the player it drives and the one it

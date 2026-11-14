@@ -587,7 +587,9 @@ The keys the Preferences pages set:
 # Debugger
 
 The Debugger (<kbd>F12</kbd>) stops the console and shows what it is doing.
-It has eight tabs; closing it lets the console go on as it was.
+It has twelve tabs; closing it lets the console go on as it was. The F8's
+registers sit in a strip under the tabs: A, W, ISAR, PC0, PC1, DC0 and DC1.
+Edit a value while stopped and press <kbd>Enter</kbd>.
 
 | Button | Does |
 |---|---|
@@ -598,9 +600,16 @@ It has eight tabs; closing it lets the console go on as it was.
 | Frame | On to the next frame |
 | Scanline | On to the next line of the picture |
 | Run to Cursor | On to the line selected in the Disassembly |
+| Clear Breakpoints | Removes every breakpoint |
+| Break at | A symbol name or hex address, then <kbd>Enter</kbd> |
+| Symbols | Loads a `.map` or listing from the AS assembler, or a plain list |
+| Pop Out | Moves the tab that shows into a window of its own; **Dock** in that window puts it back |
+| Help | Opens the topic of the tab that shows |
 
 Beside them, the Debugger says why the console stopped: a step, a
-breakpoint and its address, a VRAM write, a port write.
+breakpoint and its address, a VRAM write, a port write, or a memory write
+with what it wrote and what it replaced. Every stop brings the views back to
+where the machine is, even if you had scrolled away.
 
 The F8 has no address registers of its own. Each chip on the bus keeps its
 own program counter PC0, one return address PC1, and data counters DC0 and
@@ -608,10 +617,10 @@ DC1, and updates them from the ROMC code of each cycle. The CPU cannot read
 the video RAM: it draws a cell by putting the colour on port 1, the column on
 port 4 and the row on port 5, then strobing port 0.
 
-<!-- context: debugger/prompt -->
-## Prompt
+<!-- context: debugger/console -->
+## Console
 
-The Prompt takes commands, with completion on <kbd>Tab</kbd> for commands,
+The Console takes commands, with completion on <kbd>Tab</kbd> for commands,
 registers and labels. Numbers are `$0800`, `0x800`, `800h`, `2048`,
 `%1010` or `o17` (octal). `help` lists the commands.
 
@@ -623,7 +632,7 @@ registers and labels. Numbers are `$0800`, `0x800`, `800h`, `2048`,
 | `run`, `stop` | Run on, or stop |
 | `runto` | Runs to an address |
 | `break` | An execute breakpoint, `break addr[-end] [cond]` |
-| `bpr`, `bpw` | Data reads or writes of an address range |
+| `bpr`, `bpw`, `bpa` | Data reads, writes, or both, of an address range |
 | `bpi`, `bpo` | Port reads or writes, `bpi port[-end] [cond]` |
 | `bpv` | VRAM writes to a cell range, `bpv row,col[-row,col]` |
 | `bps` | Scratchpad writes, `bps reg[-end]` |
@@ -635,12 +644,15 @@ registers and labels. Numbers are `$0800`, `0x800`, `800h`, `2048`,
 | `poke` | Writes bytes to a space |
 | `scratch`, `isar` | The 64-byte scratchpad, and ISAR |
 | `kstack` | The BIOS's K stack |
-| `vram`, `pal`, `video` | The video RAM, palettes and ports |
+| `vram`, `pal` | The video RAM and the palettes |
+| `video` | The Video tab as text: `video lines`, `video timing` |
 | `ports`, `sound`, `input` | The ports, the beeper and the controllers |
 | `cart`, `mailbox` | The cartridge, and FujiNet's mailbox |
 | `bios` | Which BIOS is running |
 | `romc` | The ROMC trace: `romc [on\|off\|n]` |
 | `label`, `labels` | Name an address; load a symbol file |
+| `watch`, `unwatch` | The watch list: `watch score`, `unwatch 0` |
+| `find` | Searches a space for bytes (`find 90 07`) or text (`find text HELLO`) |
 | `disasm` | Disassembles `disasm [addr] [n]` |
 | `trace` | The instruction trace: `trace [on\|off\|clear\|n]` |
 | `save` | Saves `vram`, `scratch`, `screen` and more to a file |
@@ -650,77 +662,68 @@ The spaces are `prog` (the CPU's view of $0000 to $FFFF), `scratch`, `vram`,
 dc0 dc1 j h k q`, the flags `icb o z c s`, and `r0` to `r63`), the byte at
 `[addr]`, `p[addr]`, `s[reg]`, `v[cell]`, `c[off]` and `io[port]`, labels,
 and `vpos`, `hpos`, `frame` and `cycles`. In a breakpoint condition `value`
-and `addr` are the access (and `row` and `col` for `bpv`, `port` for `bpi`
-and `bpo`). The operators are C's.
-
-<!-- context: debugger/cpu -->
-## CPU and RAM
-
-The registers: A, W (the flags I C O Z S, with S set meaning the result was
-positive), ISAR in octal, PC0, PC1, DC0, DC1, and J, H, K and Q. Below
-them the 64-byte scratchpad as an 8 × 8 grid with the register names, the
-cell ISAR points at outlined and the cells that just changed in the accent
-colour. The K stack panel shows the BIOS's call stack. Click a value to
-edit it while stopped. The hex view reads any of the five spaces (PROG,
-scratchpad, VRAM, the cartridge and the I/O ports) and can edit them.
+and `addr` are the access, `old` is what was there before (`value != old`
+stops only when a write changes something), and `row` and `col` are for
+`bpv`, `port` for `bpi` and `bpo`. The operators are C's.
 
 <!-- context: debugger/disassembly -->
 ## Disassembly
 
-The F8 disassembled at the PC, with the opcode bytes, labels and the
-breakpoints in the margin. Double-click a line for an execute breakpoint.
-Follow PC keeps the current line in view. **Symbols** loads the labels of a
-`.map` or listing from the AS assembler, or a plain list of addresses and
-names. The BIOS, the cartridge header and FujiNet's mailbox registers have
-labels of their own. The APPBANK window ($4800 to $67FF) says which page
-it shows.
+The F8 disassembled at the PC, with the opcode bytes and labels. The current
+instruction is in the app's accent colour and a breakpoint is a red dot in
+the margin (a grey hollow one when it is disabled); click a line to toggle
+its breakpoint. **Follow PC** keeps the current line in view. The BIOS, the
+cartridge header and FujiNet's mailbox registers have labels of their own.
+The APPBANK window ($4800 to $67FF) says which page it shows.
 
-<!-- context: debugger/video -->
-## Video
+<!-- context: debugger/memory -->
+## Memory
 
-The picture is a 128 × 64 video RAM of two-bit values. Each row picks one of
-four palettes from the values in its columns 125 and 126. The TV shows
-columns 4 to 105 and rows 4 to 61; the rest is hidden, and programs keep data
-there. The frame is drawn from the whole RAM at the vertical blank.
+Any of the five spaces: PROG (what the CPU sees at $0000 to $FFFF, each row
+labelled with what answers there: the BIOS, the cartridge, its RAM, a bank
+window, FujiNet's mailbox), the scratchpad, the video RAM, the cartridge and
+the I/O ports. **Go To** takes an address, a label, an expression or a range
+(`$2800-$28FF`, `score..score+3`) and highlights what it found. **Poke**
+writes bytes. The search bar finds hex bytes or text (not case-sensitive)
+with **Find Next** and **Find Previous**, wrapping once; the machine has to be
+stopped.
 
-The views:
-
-- **Frame**: the last frame, as the window shows it.
-- **Live**: the video RAM as it is now.
-- **Beam**: what a TV would show, row by row as the beam passed it.
-- **VRAM**: all 128 × 64 cells, the hidden ones hatched.
-- **Values**: the raw values, in false colour.
-- **Palettes**: the four palettes.
-
-The overlays mark the visible area, the cell grid, the palette columns, the
-beam line, the cell the next write will hit, write heat, cells that changed,
-and rows whose palette changed. Hover a cell for its row, column, value,
-palette, and the last write (PC, frame and line); click to pin it;
-double-click to break on writes to it. The row strip lists all 64 rows'
-palettes, and a table has the palette colours and how many rows use each.
-The write log lists every write with its frame, line, cycle and PC.
-
-<!-- context: debugger/io -->
-## Sound and I/O
-
-The ports 0, 1, 4 and 5 as the CPU last wrote them (raw, complemented and
-decoded: the write strobe, the controllers' enable, the panel latch, the
-colour, column and row), and the value the CPU would read now. The
-controllers and the console buttons, decoded and active-low as the CPU sees
-them. The beeper's mode (off, 1 kHz, 500 Hz or 120 Hz), its level and a
-timeline of mode changes. The I/O log lists every port access. For a Maze or
-Hangman cartridge the 2102's address and bit.
+The scratchpad is shown as an 8 × 8 grid with the register names, the cell
+ISAR points at outlined, the cells that just changed in the accent colour and
+the BIOS's K stack shaded. Click a value to edit it while stopped. The K
+stack panel shows the BIOS's call stack.
 
 <!-- context: debugger/breakpoints -->
 ## Breakpoints
 
-The list of breakpoints with their ids, kinds, ranges, conditions and hit
-counts. A breakpoint can be an execute, a data read or write, a port read
-or write, a VRAM cell range, or a scratchpad range, each with an optional
-condition. **Add**, **Remove**, and the check box to turn one off.
+Every breakpoint and watchpoint. **Add** one with a kind, an address or range
+and, if you like, a condition:
+
+- **Execute** stops before an instruction runs.
+- **Read**, **Write** and **Access** (both) stop after the instruction that
+  touched memory, and the line at the top says what it did, for instance
+  `wrote $2800 = $41 (was $40)`.
+- **IN** and **OUT** take a port number.
+- **VRAM** takes a cell range (row, column) and **Scratchpad** a register
+  range; a scratchpad breakpoint fires when a register changes, not when the
+  same value is stored again.
+
+The box beside each entry turns it off, and the list shows how many times it
+fired. **Clear Hits** zeroes the counts and **Clear Breakpoints** removes
+them all.
+
+<!-- context: debugger/watches -->
+## Watches
+
+Things to keep an eye on: type an address, a symbol, an expression or a range
+and press <kbd>Enter</kbd>. Each shows its value while the machine is stopped
+(`-` while it runs, `?` if it means nothing yet, which a later **Symbols**
+load may fix). **Show in Memory** jumps to it in the Memory tab, **Break on
+Change** adds a Write breakpoint that fires when its value changes, and
+**Remove** drops it.
 
 <!-- context: debugger/cart -->
-## Cart
+## Cart and I/O
 
 The cartridge in the slot. For a Videocart: its type, its ROM size and
 checksum, its RAM, and the name MAME's software list gives it. For the
@@ -728,6 +731,76 @@ FujiNet cartridge: the live image and the one staged for the next swap
 (size and checksum), the page at $4800, the status page at $FC00 to $FC0F
 decoded (the tick, the boot state and the last error), the mailbox, and the
 events (register writes, bytes sent, page selects and swaps).
+
+Under it the ports 0, 1, 4 and 5 as the CPU last wrote them (raw,
+complemented and decoded) and the value the CPU would read now, the
+controllers and the console buttons, decoded and active-low as the CPU sees
+them, and the I/O log of every port access. For a Maze or Hangman
+cartridge the 2102's address and bit.
+
+<!-- context: debugger/trace -->
+## Trace
+
+Every instruction the F8 runs, live. **Record** turns it on (it slows the
+console a little, so it starts off), **Clear** empties it, **Branches only**
+shows just the jumps, branches, calls and returns, and **In range** only a
+range of addresses. Trace and History share one recording.
+
+<!-- context: debugger/history -->
+## History
+
+The same recording, read at a stop: the lead-up to a breakpoint or a pause,
+newest at the bottom, with the registers at each instruction. Turn **Record**
+on before you run to the place you want to look at.
+
+<!-- context: debugger/video -->
+## Video
+
+The picture is a 128 × 64 video RAM of two-bit values. Each row picks one of
+four palettes from the values in its columns 125 and 126. The TV shows
+columns 4 to 105 and rows 4 to 61; the rest is hidden, and programs keep data
+there. The frame is drawn from the whole RAM at the vertical blank, so the
+picture is on the left and five sections on the right.
+
+| View | Shows |
+|---|---|
+| Display | The last frame, as the window shows it |
+| Decoded | All 128 × 64 cells, coloured by their row's palette, the hidden ones hatched |
+| Beam | What a TV would show, row by row as the beam passed it, the last frame dimmed below |
+| Values | The raw two-bit values, in false colour |
+| Live | The video RAM as it is now |
+
+**Zoom** goes from 1 to 16 times, or **Fit**. **Overlays** switch on the
+visible area, the cell grid, the palette columns, the beam line, the cell the
+next write will hit, write heat, cells that changed, and rows whose palette
+changed.
+
+Point at a cell to see it in **Pixel**: its row, column, value, palette, and
+the last write (PC, frame and line, and what it replaced). Click to pin it,
+click again to let go. Double-click it, or press **Break on writes**, to stop
+the machine when anything writes that cell.
+
+**Registers** shows ports 0, 1, 4 and 5 as the CPU last wrote them, and the
+beeper; one that changed in the last few refreshes is highlighted.
+**Colours** shows the four palettes and how many rows use each. **Lines**
+lists all 64 rows with their palette, the writes this frame and the last
+writer. **Writes** lists every write with its frame, line, cycle and PC, and
+can be filtered. **Timing** shows the beam.
+
+<!-- context: debugger/sound -->
+## Sound
+
+The beeper's mode (off, 1 kHz, 500 Hz or 120 Hz), its level and a timeline of
+mode changes. The mode lives in the same port as the row, so every cell the
+CPU plots writes it again.
+
+<!-- context: debugger/symbols -->
+## Symbols
+
+Every known symbol, the built-ins and the ones you loaded. **Filter** narrows
+the list, and activating a row goes to that address in the Disassembly. The
+port names (PANEL, RIGHT_C, COLOR, LEFT_C, COLUMN, ROW_SOUND and the 2102's)
+work in expressions but never label a disassembly line.
 
 <!-- context: debugger/fujinet -->
 ## FujiNet packets

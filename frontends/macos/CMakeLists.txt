@@ -26,7 +26,6 @@ add_executable(fujinet-go-channelf-macos MACOSX_BUNDLE
   SettingsWindow.m
   controllers/ControllersWindow.m
   debugger/DebuggerWindow.m
-  debugger/DebugViews.m
   debugger/VideoTab.m
   help/HelpWindow.m
   "${CHF_ICNS}"

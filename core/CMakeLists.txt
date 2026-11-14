@@ -71,6 +71,10 @@ if(NOT CHF_CORE_ONLY AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/chf/machine.c"
       list(APPEND CHF_DEBUGGER_SOURCES debugger/${_f})
     endif()
   endforeach()
+  # The engine's memory tools (watches, search parsing, breakpoint text).
+  list(APPEND CHF_DEBUGGER_SOURCES debugger/memtools.c)
+  # The Video tab's controller (chfvidtab.h).
+  list(APPEND CHF_DEBUGGER_SOURCES debugger/vidtab.c)
 endif()
 
 # src/pad_assign.c is the session's remembered pad -> port table, kept here

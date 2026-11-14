@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -39,6 +40,7 @@
 #include "test_chf.h"
 #include "test_tmpdir.h"
 #include "chfmap.h"
+#include "chfmemtools.h"
 #include "debugger_internal.h"
 #include "fujitrace.h"
 
@@ -96,6 +98,15 @@ static int why(chfdebug *d)
     int addr = -1;
     chfdebug_stop_reason(d, reason, sizeof reason, &addr);
     return addr;
+}
+
+/* Does the last stop's reason read `base`, optionally followed by " at $xxxx"? */
+static int why_is(chfdebug *d, const char *base)
+{
+    const size_t n = strlen(base);
+
+    why(d);
+    return strncmp(reason, base, n) == 0 && (reason[n] == '\0' || strncmp(reason + n, " at $", 5) == 0);
 }
 
 static long file_size(const char *p)
@@ -463,10 +474,10 @@ static void test_program_run(chfdebug *d)
     c = cpu(d);
     check(c.a == 0 && c.zero == 0 && c.dc0 == 0x8000 && c.dbus == 0x17, "A is 0 from LIS, DC0 $8000, the opcode ST fetched");
     check(run_until_stop(d, 5000) && cpu(d).pc == 0x080B, "the read stops after the LM, at $080B");
-    check(strcmp((why(d), reason), "read prog $8000 = $00") == 0, "'read prog $8000 = $00'");
+    check(strcmp((why(d), reason), "read prog $8000 = $00 at $080A") == 0, "'read prog $8000 = $00'");
     show("reason '%s'", reason);
     check(run_until_stop(d, 5000) && cpu(d).pc == 0x0811, "the write stops after the ST, at $0811");
-    check(strcmp((why(d), reason), "write prog $8000 = $01") == 0, "'write prog $8000 = $01'");
+    check(strcmp((why(d), reason), "wrote $8000 = $01 (was $00) at $0810") == 0, "'write prog $8000 = $01'");
     show("reason '%s'", reason);
     n = chfdebug_breakpoint_list(d, bps, 16);
     check(n == 3 && bps[0].hits == 1 && bps[1].hits == 1 && bps[2].hits == 1, "each hit exactly once");
@@ -485,19 +496,20 @@ static void test_program_run(chfdebug *d)
     id = chfdebug_breakpoint_add(d, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, 10 * 128 + 20, 10 * 128 + 20, "value == 2");
     check(id > 0, "a VRAM breakpoint on row 10, column 20");
     check(run_until_stop(d, 5000) && cpu(d).pc == 0x081D, "stops after the strobe, at $081D");
-    check(strcmp((why(d), reason), "VRAM write row 10 col 20 = 2") == 0, "'VRAM write row 10 col 20 = 2'");
+    check(strcmp((why(d), reason), "VRAM write row 10 col 20 = 2 (was 0) at $081C") == 0, "'VRAM write row 10 col 20 = 2 (was 0) at $081C'");
     show("reason '%s'", reason);
     chfdebug_breakpoint_remove(d, id);
     id = chfdebug_breakpoint_add(d, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, 11 * 128 + 38, 13 * 128 + 44, "col == 40 && row == 12");
     check(id > 0, "a VRAM rectangle, rows 11-13, columns 38-44");
     check(run_until_stop(d, 5000) && cpu(d).pc == 0x0830, "stops after the OUT-form strobe, at $0830");
-    check(strcmp((why(d), reason), "VRAM write row 12 col 40 = 1") == 0, "'VRAM write row 12 col 40 = 1'");
+    check(strcmp((why(d), reason), "VRAM write row 12 col 40 = 1 (was 0) at $082E") == 0, "'VRAM write row 12 col 40 = 1'");
     chfdebug_breakpoint_remove(d, id);
 
     /* OUT and IN breakpoints */
     id = chfdebug_breakpoint_add(d, CHFDEBUG_BP_OUT, CHF_SPACE_IO, 5, 5, "value == $40 && port == 5");
     check(id > 0 && run_until_stop(d, 5000) && cpu(d).pc == 0x0837, "an OUT breakpoint stops after the OUTS 5 of $40");
-    check(strcmp((why(d), reason), "out port 5 = $40") == 0, "'out port 5 = $40'");
+    check(strcmp((why(d), reason), "out port 5 = $40 (was $33) at $0836") == 0, "'out port 5 = $40'");
+    show("reason '%s'", reason);
     chfdebug_breakpoint_remove(d, id);
     id = chfdebug_breakpoint_add(d, CHFDEBUG_BP_IN, CHF_SPACE_IO, 0, 1, "");
     check(id > 0 && run_until_stop(d, 5000) && cpu(d).pc == 0x083B, "an IN breakpoint on ports 0-1 stops after INS 0");
@@ -511,7 +523,7 @@ static void test_program_run(chfdebug *d)
     check(id > 0, "a scratchpad breakpoint on r20");
     check(run_until_stop(d, 5000), "runs into the idle loop and stops");
     c = cpu(d);
-    check(c.r[20] == 2 && c.pc == 0x0865 && strcmp((why(d), reason), "scratch write r20 = $02") == 0,
+    check(c.r[20] == 2 && c.pc == 0x0865 && strcmp((why(d), reason), "scratch write r20 = $02 (was $01) at $0864") == 0,
           "'scratch write r20 = $02', after the store");
     show("pc %04X r20 %02X reason '%s'", c.pc, c.r[20], reason);
     chfdebug_breakpoint_remove(d, id);
@@ -623,7 +635,7 @@ static void test_video(chfdebug *d)
     /* the first frame completes */
     c = cpu(d);
     chfdebug_frame(d, 1);
-    check(wait_stopped(d, 1, 3000) && cpu(d).frame == c.frame + 1 && strcmp((why(d), reason), "frame") == 0,
+    check(wait_stopped(d, 1, 3000) && cpu(d).frame == c.frame + 1 && why_is(d, "frame"),
           "frame+1");
     chfdebug_video_get(d, &v);
     check(v.strobes_last == 2 && v.changes_last == 2 && v.strobes_frame == 0, "the frame's strobes were counted at the blank");
@@ -1063,7 +1075,7 @@ static void test_stepping(chfdebug *d)
     check(wait_stopped(d, 1, 3000), "step into stops");
     c2 = cpu(d);
     check(c2.pc == 0x0900 && c2.pc1 == 0x0840 && c2.instructions == c.instructions + 1 && c2.a == 0x09 &&
-          strcmp((why(d), reason), "step") == 0, "a step into a PI is in the routine, PC1 = the return address");
+          why_is(d, "step"), "a step into a PI is in the routine, PC1 = the return address");
 
     /* step over the same PI: the routine and its nested call run, and it stops after */
     chfdebug_cpu_set(d, CHF_REG_PC, 0x083d);
@@ -1071,7 +1083,7 @@ static void test_stepping(chfdebug *d)
     chfdebug_step_over(d);
     check(wait_stopped(d, 1, 3000), "step over stops");
     c2 = cpu(d);
-    check(c2.pc == 0x0840 && c2.instructions == c.instructions + 7 && c2.a == 0x07 && strcmp((why(d), reason), "step over") == 0,
+    check(c2.pc == 0x0840 && c2.instructions == c.instructions + 7 && c2.a == 0x07 && why_is(d, "step over"),
           "step over a PI runs it and the call inside it (7 instructions) and stops at the next one");
     show("pc %04X instr +%llu a %02X reason '%s'", c2.pc, (unsigned long long)(c2.instructions - c.instructions), c2.a, reason);
 
@@ -1089,7 +1101,7 @@ static void test_stepping(chfdebug *d)
     c = cpu(d);
     chfdebug_step_over(d);
     check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0805 && cpu(d).instructions == c.instructions + 1 &&
-          strcmp((why(d), reason), "step") == 0, "step over a DCI is one step");
+          why_is(d, "step"), "step over a DCI is one step");
 
     /* step out: of a routine with a nested call, of the nested one, of a PK's */
     chfdebug_cpu_set(d, CHF_REG_PC, 0x0900);
@@ -1098,7 +1110,7 @@ static void test_stepping(chfdebug *d)
     chfdebug_step_out(d);
     check(wait_stopped(d, 1, 3000), "step out stops");
     c2 = cpu(d);
-    check(c2.pc == 0x0840 && c2.instructions == c.instructions + 6 && strcmp((why(d), reason), "step out") == 0,
+    check(c2.pc == 0x0840 && c2.instructions == c.instructions + 6 && why_is(d, "step out"),
           "step out of sub1 runs its nested call too (6 instructions) and stops at the caller's next one");
     chfdebug_cpu_set(d, CHF_REG_PC, 0x0910);
     chfdebug_cpu_set(d, CHF_REG_PC1, 0x0904);
@@ -1121,18 +1133,18 @@ static void test_stepping(chfdebug *d)
     chfdebug_cpu_set(d, CHF_REG_Q, A_IDLE);
     chfdebug_cpu_set(d, CHF_REG_PC, 0x8020);
     chfdebug_step_out(d);
-    check(wait_stopped(d, 1, 3000) && cpu(d).pc == A_IDLE && strcmp((why(d), reason), "step out") == 0,
+    check(wait_stopped(d, 1, 3000) && cpu(d).pc == A_IDLE && why_is(d, "step out"),
           "step out of a routine that returns with LR P0,Q");
 
     /* run to, step n, the prompt */
     chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
     chfdebug_run_to(d, 0x0864);
-    check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0864 && strcmp((why(d), reason), "run to") == 0, "run to $0864");
+    check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0864 && why_is(d, "run to"), "run to $0864");
     c = cpu(d);
     chfdebug_trace_clear(d);
     chfdebug_trace_enable(d, 1);
     chfdebug_command(d, "step 5", out, sizeof out);
-    check(wait_stopped(d, 1, 3000) && cpu(d).instructions == c.instructions + 5 && strcmp((why(d), reason), "step") == 0,
+    check(wait_stopped(d, 1, 3000) && cpu(d).instructions == c.instructions + 5 && why_is(d, "step"),
           "`step 5` runs five instructions");
     n = chfdebug_trace_read(d, tr, 16);
     check(n == 5 && tr[0].pc == cpu(d).pc && tr[4].pc == 0x0865 && tr[3].pc == 0x0860 && tr[4].bytes[0] == 0x90 &&
@@ -1149,7 +1161,7 @@ static void test_stepping(chfdebug *d)
     chfdebug_scanline(d, 1);
     check(wait_stopped(d, 1, 3000), "scanline stops");
     c2 = cpu(d);
-    check(c2.vpos == (c.vpos + 1) % 264 && strcmp((why(d), reason), "scanline") == 0, "scanline+1 advances the beam one line");
+    check(c2.vpos == (c.vpos + 1) % 264 && why_is(d, "scanline"), "scanline+1 advances the beam one line");
     c = c2;
     chfdebug_command(d, "scanline 7", out, sizeof out);
     check(wait_stopped(d, 1, 3000) && cpu(d).vpos == (c.vpos + 7) % 264, "scanline 7 advances seven lines");
@@ -1158,7 +1170,7 @@ static void test_stepping(chfdebug *d)
     check(wait_stopped(d, 1, 3000) && cpu(d).vpos == c.vpos && cpu(d).frame == c.frame + 1, "264 scanlines is one frame");
     c = cpu(d);
     chfdebug_frame(d, 1);
-    check(wait_stopped(d, 1, 3000) && cpu(d).frame == c.frame + 1 && strcmp((why(d), reason), "frame") == 0, "frame+1");
+    check(wait_stopped(d, 1, 3000) && cpu(d).frame == c.frame + 1 && why_is(d, "frame"), "frame+1");
     c = cpu(d);
     chfdebug_command(d, "frame 3", out, sizeof out);
     check(wait_stopped(d, 1, 5000) && cpu(d).frame == c.frame + 3, "frame 3 advances three");
@@ -1170,7 +1182,7 @@ static void test_stepping(chfdebug *d)
     test_sleep_ms(60);
     check(!chfdebug_is_stopped(d), "resume with nothing to stop it runs on");
     check(strcmp((why(d), reason), "running") == 0 && why(d) == -1, "the reason is 'running', with no address");
-    check(stop_now(d) && strcmp((why(d), reason), "stopped") == 0 && why(d) >= 0, "stop breaks at the next instruction");
+    check(stop_now(d) && why_is(d, "stopped") && why(d) >= 0, "stop breaks at the next instruction");
 }
 
 static int wait_ackseq(chfdebug *d, int want, int timeout_ms)
@@ -1572,7 +1584,11 @@ static void test_prompt(chfdebug *d, const char *tmp)
     chfdebug_command(d, "pal", out, sizeof out);
     check(strstr(out, "light blue") && strstr(out, "light green") && strstr(out, "#CED0FF") && strstr(out, "rows 64"), "pal");
     chfdebug_command(d, "video", out, sizeof out);
-    check(strstr(out, "beam: line") && strstr(out, "NTSC") && strstr(out, "VRAM strobes") && strstr(out, "next strobe"), "video");
+    check(strstr(out, "PORT 0") && strstr(out, "PORT 5"), "video: the Video tab's registers");
+    chfdebug_command(d, "video timing", out, sizeof out);
+    check(strstr(out, "NTSC") != NULL, "video timing");
+    chfdebug_command(d, "video bogus", out, sizeof out);
+    check(strstr(out, "pixel, registers") != NULL, "video: a bad section is explained");
     chfdebug_command(d, "ports", out, sizeof out);
     check(strstr(out, "PANEL") && strstr(out, "RIGHT_C") && strstr(out, "LEFT_C") && strstr(out, "ROW_SOUND") && strstr(out, "column 40"), "ports");
     chfdebug_command(d, "sound", out, sizeof out);
@@ -1628,11 +1644,11 @@ static void test_prompt(chfdebug *d, const char *tmp)
 
     /* running commands */
     chfdebug_command(d, "runto $0864", out, sizeof out);
-    check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0864 && strcmp((why(d), reason), "run to") == 0, "runto");
+    check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0864 && why_is(d, "run to"), "runto");
     chfdebug_command(d, "frame", out, sizeof out);
-    check(wait_stopped(d, 1, 3000) && strcmp((why(d), reason), "frame") == 0, "frame");
+    check(wait_stopped(d, 1, 3000) && why_is(d, "frame"), "frame");
     chfdebug_command(d, "scanline 3", out, sizeof out);
-    check(wait_stopped(d, 1, 3000) && strcmp((why(d), reason), "scanline") == 0, "scanline");
+    check(wait_stopped(d, 1, 3000) && why_is(d, "scanline"), "scanline");
     chfdebug_cpu_set(d, CHF_REG_PC, 0x083d);
     chfdebug_command(d, "over", out, sizeof out);
     check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0840, "over");
@@ -1675,8 +1691,8 @@ static void test_completions(chfdebug *d)
     n = chfdebug_completions(d, "st", out, sizeof out);
     check(n == 2 && has_line(out, "step") && has_line(out, "stop"), "commands complete: st -> step, stop");
     n = chfdebug_completions(d, "bp", out, sizeof out);
-    check(n == 6 && has_line(out, "bpi") && has_line(out, "bpo") && has_line(out, "bpr") && has_line(out, "bps") &&
-          has_line(out, "bpv") && has_line(out, "bpw"), "bp -> the six breakpoint commands");
+    check(n == 7 && has_line(out, "bpa") && has_line(out, "bpi") && has_line(out, "bpo") && has_line(out, "bpr") && has_line(out, "bps") &&
+          has_line(out, "bpv") && has_line(out, "bpw"), "bp -> the seven breakpoint commands");
     n = chfdebug_completions(d, "print CART_", out, sizeof out);
     check(n >= 3 && has_line(out, "CART_ENTRY") && has_line(out, "CART_RAM") && has_line(out, "CART_SIG"), "labels complete");
     n = chfdebug_completions(d, "set p", out, sizeof out);
@@ -1727,7 +1743,7 @@ static void test_detach_and_cycle(chfdebug *d, const chf_host_opts_t *ho)
     check(chfdebug_breakpoint_list(d, bps, 8) == 1, "the breakpoint is kept");
     chfdebug_stop(d);
     check(chfdebug_is_attached(d) && wait_stopped(d, 1, 3000), "stop on a detached engine attaches it and stops");
-    check(strcmp((why(d), reason), "stopped") == 0, "'stopped'");
+    check(why_is(d, "stopped"), "'stopped'");
 
     /* a power cycle with the engine attached */
     chfdebug_power_down(d);
@@ -1745,6 +1761,467 @@ static void test_detach_and_cycle(chfdebug *d, const chf_host_opts_t *ho)
     check(run_until_stop(d, 5000) && cpu(d).pc == A_ENTRY && strcmp((why(d), reason), "breakpoint: exec $0802") == 0,
           "which hits again at the cartridge's entry");
     chfdebug_breakpoint_clear(d);
+}
+
+/* ---- the family debugger's additions ------------------------------------------------ */
+
+/* the regions are ordered, gap-free and cover $0000-$FFFF */
+static int map_complete(const chfdebug_region *map, int count)
+{
+    if (count < 2 || map[0].low != 0x0000 || map[count - 1].high != 0xFFFF)
+        return 0;
+    for (int i = 0; i < count; i++) {
+        if (map[i].low > map[i].high || !map[i].name[0])
+            return 0;
+        if (i && map[i].low != map[i - 1].high + 1)
+            return 0;
+        if (i && !strcmp(map[i].name, map[i - 1].name))
+            return 0;                      /* neighbours with one name would be one region */
+    }
+    return 1;
+}
+
+static const chfdebug_region *map_at(const chfdebug_region *map, int count, unsigned addr)
+{
+    for (int i = 0; i < count; i++)
+        if (addr >= map[i].low && addr <= map[i].high)
+            return &map[i];
+    return NULL;
+}
+
+/* 100 alternating stops: the moment is_stopped flips, the reason and the serial
+ * are the new stop's (the reason is recorded before the flag) */
+static void test_stop_serial(chfdebug *d)
+{
+    int bad = 0, bad_why = 0;
+    uint64_t serial;
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
+    serial = chfdebug_stop_serial(d);
+    for (int i = 0; i < 100; i++) {
+        char text[128], expect[64];
+        int addr = -1, flipped = 0;
+
+        if (i & 1) {
+            chfdebug_run_to(d, 0x0864);
+            snprintf(expect, sizeof expect, "run to at $0864");
+        } else {
+            chfdebug_step(d);
+            expect[0] = '\0';
+        }
+        for (int spin = 0; spin < 5000000 && !flipped; spin++)
+            flipped = chfdebug_is_stopped(d);
+        if (!flipped) {
+            bad++;
+            break;
+        }
+        /* the very moment it flipped */
+        chfdebug_stop_reason(d, text, sizeof text, &addr);
+        if (chfdebug_stop_serial(d) != serial + 1)
+            bad++;
+        serial = chfdebug_stop_serial(d);
+        if (expect[0] ? strcmp(text, expect) != 0 : strncmp(text, "step at $", 9) != 0)
+            bad_why++;
+        else if (!expect[0]) {
+            unsigned where = 0;
+            if (sscanf(text + 9, "%x", &where) != 1 || (int)where != addr)
+                bad_why++;
+        }
+    }
+    check(bad == 0, "100 alternating step / run-to stops: the serial moves by exactly one each");
+    check(bad_why == 0, "and the reason read the moment is_stopped flips is that stop's (step at $.. / run to at $0864)");
+    check(cpu(d).pc >= A_IDLE && cpu(d).pc < A_IDLE + 8, "(still in the idle loop)");
+}
+
+static void test_old_values(chfdebug *d)
+{
+    char out[256];
+    unsigned val, old;
+    int bpid;
+
+    /* PROG: the arena byte the program overwrites */
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfdebug_write(d, CHF_SPACE_PROG, 0x8000, 0x77);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_ENTRY);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_WRITE, CHF_SPACE_PROG, 0x8000, 0x8000, "old == $77 && value == 0");
+    check(bpid > 0 && run_until_stop(d, 5000), "a write breakpoint on `old == $77`");
+    check(strcmp((why(d), reason), "wrote $8000 = $00 (was $77) at $0806") == 0, "stops 'wrote $8000 = $00 (was $77) at $0806'");
+    show("reason '%s'", reason);
+    chfdebug_breakpoint_remove(d, bpid);
+
+    /* VRAM: the cell's old value */
+    stop_now(d);
+    chfdebug_write(d, CHF_SPACE_VRAM, 12 * 128 + 40, 2);
+    chfdebug_cpu_set(d, CHF_REG_PC, 0x0820);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, 12 * 128 + 40, 12 * 128 + 40, "old == 2 && value == 1");
+    check(bpid > 0 && run_until_stop(d, 5000), "a VRAM breakpoint on `old == 2`");
+    check(strcmp((why(d), reason), "VRAM write row 12 col 40 = 1 (was 2) at $082E") == 0, "stops 'VRAM write row 12 col 40 = 1 (was 2) at $082E'");
+    show("reason '%s'", reason);
+    chfdebug_breakpoint_remove(d, bpid);
+
+    /* OUT: the port latch before the write */
+    stop_now(d);
+    chfdebug_write(d, CHF_SPACE_IO, 5, 0xCC);
+    chfdebug_cpu_set(d, CHF_REG_PC, 0x0834);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_OUT, CHF_SPACE_IO, 5, 5, "old == $CC && value == $40");
+    check(bpid > 0 && run_until_stop(d, 5000), "an OUT breakpoint on `old == $CC`");
+    check(strcmp((why(d), reason), "out port 5 = $40 (was $CC) at $0836") == 0, "stops 'out port 5 = $40 (was $CC) at $0836'");
+    show("reason '%s'", reason);
+    chfdebug_breakpoint_remove(d, bpid);
+
+    /* SCRATCH: the register before the change */
+    stop_now(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_SCRATCH, CHF_SPACE_SCRATCH, 20, 20, "value == old + 1");
+    check(bpid > 0 && run_until_stop(d, 5000), "a scratchpad breakpoint on `value == old + 1`");
+    check(sscanf((why(d), reason), "scratch write r20 = $%x (was $%x) at $", &val, &old) == 2 && val == ((old + 1) & 0xff),
+          "stops 'scratch write r20 = $nn (was $mm) at $..'");
+    show("reason '%s'", reason);
+    chfdebug_breakpoint_remove(d, bpid);
+
+    /* old in an exec / read condition is the value itself */
+    stop_now(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_ENTRY);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, 0x0807, 0x0807, "old == value && old == $2A");
+    check(bpid > 0 && run_until_stop(d, 5000) && cpu(d).pc == 0x0807, "`old` is the opcode in an execute condition");
+    chfdebug_breakpoint_remove(d, bpid);
+    chfdebug_command(d, "print old", out, sizeof out);
+    check(strncmp(out, "error", 5) == 0, "`old` outside a breakpoint condition is not a name");
+    chfdebug_completions(d, "print ol", out, sizeof out);
+    check(has_line(out, "old"), "and `old` completes");
+}
+
+static void test_access_and_hits(chfdebug *d)
+{
+    chfdebug_breakpoint bps[8];
+    chfdebug_line lines[4];
+    char out[1024];
+    int bpid, count, hits;
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfdebug_breakpoint_clear(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_ENTRY);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_ACCESS, CHF_SPACE_PROG, 0x8000, 0x8000, "");
+    count = chfdebug_breakpoint_list(d, bps, 8);
+    check(bpid > 0 && count == 1 && bps[0].type == CHFDEBUG_BP_ACCESS && bps[0].type == (CHFDEBUG_BP_READ | CHFDEBUG_BP_WRITE),
+          "an Access breakpoint is READ | WRITE as one entry");
+    check(run_until_stop(d, 5000) && strncmp((why(d), reason), "wrote $8000", 11) == 0, "Access stops on the write...");
+    check(run_until_stop(d, 5000) && strncmp((why(d), reason), "read prog $8000", 15) == 0, "...and on the read");
+    chfdebug_breakpoint_list(d, bps, 8);
+    check(bps[0].hits == 2, "two hits");
+    chfdebug_breakpoint_clear_hits(d);
+    chfdebug_breakpoint_list(d, bps, 8);
+    check(bps[0].hits == 0, "Clear Hits zeroes the counts");
+    chfdebug_breakpoint_remove(d, bpid);
+    chfdebug_command(d, "bpa $8000-$8001 value != 0", out, sizeof out);
+    check(strstr(out, "breakpoint #"), "the prompt's bpa");
+    count = chfdebug_breakpoint_list(d, bps, 8);
+    check(count == 1 && bps[0].type == CHFDEBUG_BP_ACCESS && bps[0].end == 0x8001, "...makes an Access breakpoint on the range");
+    chfdebug_command(d, "breaks", out, sizeof out);
+    check(strstr(out, " a ") != NULL, "`breaks` lists it as 'a'");
+    chfdebug_breakpoint_clear(d);
+
+    /* the grey dot: a disabled execute breakpoint is bp_disabled, not has_breakpoint */
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, A_IDLE, A_IDLE, "");
+    chfdebug_disassemble(d, A_IDLE, lines, 2, NULL);
+    check(lines[0].has_breakpoint && !lines[0].bp_disabled && !lines[1].has_breakpoint && !lines[1].bp_disabled, "an enabled breakpoint is a red dot");
+    chfdebug_breakpoint_enable(d, bpid, 0);
+    chfdebug_disassemble(d, A_IDLE, lines, 2, NULL);
+    check(!lines[0].has_breakpoint && lines[0].bp_disabled && !lines[1].bp_disabled, "a disabled one is bp_disabled (grey)");
+    chfdebug_breakpoint_enable(d, bpid, 1);
+    chfdebug_disassemble(d, A_IDLE, lines, 1, NULL);
+    check(lines[0].has_breakpoint && !lines[0].bp_disabled, "and enabling it makes it red again");
+    chfdebug_cpu_set(d, CHF_REG_PC, A_ENTRY);
+    chfdebug_breakpoint_remove(d, bpid);
+    bpid = chfdebug_breakpoint_add(d, CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, 0x0807, 0x0807, "");
+    hits = run_until_stop(d, 5000);
+    chfdebug_breakpoint_list(d, bps, 8);
+    check(hits && bps[0].hits == 1, "a hit is counted");
+    chfdebug_breakpoint_clear_hits(d);
+    chfdebug_breakpoint_list(d, bps, 8);
+    check(bps[0].hits == 0, "and cleared");
+    chfdebug_breakpoint_clear(d);
+}
+
+static void test_search_and_symbols(chfdebug *d)
+{
+    static const uint8_t dci[] = { 0x2a, 0x80, 0x00 };
+    uint32_t hit[16], where = 0;
+    uint8_t pat[1] = { 2 };
+    int found, nsyms, total, idx[64];
+    uint16_t addr = 0;
+    char name[64], out[512];
+    int bank = 0;
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
+
+    /* PROG: the DCI $8000 where $0802, $0807 and $080D; `to` bounds the START */
+    found = chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0, 0x47FF, hit, 16);
+    check(found >= 3 && hit[0] == 0x0802 && hit[1] == 0x0807 && hit[2] == 0x080D, "search PROG finds the three DCI $8000");
+    found = chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0x0803, 0x0807, hit, 16);
+    check(found == 1 && hit[0] == 0x0807, "from..to bounds the start");
+    found = chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0x0802, 0x0802, hit, 16);
+    check(found == 1 && hit[0] == 0x0802, "a match may run past `to`");
+    found = chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xf0, 0, 0x0800, 0x0801, hit, 16);
+    check(found == 0, "a mask applies (nothing before $0802)");
+    check(chfdebug_search_next(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0x0802, 0, &where) == 1 && where == 0x0807, "next after $0802 is $0807");
+    check(chfdebug_search_next(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0x0807, 1, &where) == 1 && where == 0x0802, "previous before $0807 is $0802");
+    check(chfdebug_search_next(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0x0802, 1, &where) == 1 && where > 0x0802, "previous before the first wraps to the last");
+    {
+        uint32_t last = 0;
+        int index = chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0, 0xFFFF, hit, 16);
+        last = index > 0 ? hit[index - 1] : 0;
+        check(chfdebug_search_next(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, last, 0, &where) == 1 && where == hit[0],
+              "next after the last wraps to the first");
+    }
+    check(chfdebug_search_next(d, CHF_SPACE_PROG, (const uint8_t *)"\x01\x02\x03\x04\x05", 5, 0xff, 0, 0, 0, &where) == 0,
+          "no match is 0");
+    found = chfdebug_search(d, CHF_SPACE_PROG, (const uint8_t *)"\xff", 1, 0xff, 0, 0xFFFF, 0xFFFF, hit, 16);
+    check(found == 1 && hit[0] == 0xFFFF, "a one-byte match on the very last byte is found");
+    found = chfdebug_search(d, CHF_SPACE_PROG, (const uint8_t *)"\xff\xff", 2, 0xff, 0, 0xFFFF, 0xFFFF, hit, 16);
+    check(found == 0, "a two-byte match cannot start on the last byte");
+
+    /* the other spaces */
+    chfdebug_write(d, CHF_SPACE_VRAM, 10 * 128 + 20, 2);
+    chfdebug_write(d, CHF_SPACE_VRAM, 30 * 128 + 7, 2);
+    found = chfdebug_search(d, CHF_SPACE_VRAM, pat, 1, 0xff, 0, 0, 0x1FFF, hit, 16);
+    check(found >= 2 && hit[0] == 10 * 128 + 20, "search VRAM");
+    chfdebug_write(d, CHF_SPACE_SCRATCH, 33, 0x5A);
+    pat[0] = 0x5A;
+    found = chfdebug_search(d, CHF_SPACE_SCRATCH, pat, 1, 0xff, 0, 0, 63, hit, 16);
+    {
+        int seen = 0;
+        for (int i = 0; i < found; i++)
+            if (hit[i] == 33)
+                seen = 1;
+        check(seen, "search SCRATCH");
+    }
+    pat[0] = 0xA1;
+    found = chfdebug_search(d, CHF_SPACE_CART, pat, 1, 0xff, 0, 0, 0x1FFFF, hit, 16);
+    check(found >= 1 && hit[0] == 0x6000, "search CART: the APPBANK page 1 fill");
+    pat[0] = 'f';
+    chfdebug_write(d, CHF_SPACE_PROG, 0x8100, 'F');
+    chfdebug_write(d, CHF_SPACE_PROG, 0x8101, 'u');
+    found = chfdebug_search(d, CHF_SPACE_PROG, (const uint8_t *)"fU", 2, 0xff, CHFDEBUG_SEARCH_NOCASE, 0x8000, 0x8FFF, hit, 16);
+    check(found == 1 && hit[0] == 0x8100, "case-insensitive text");
+    found = chfdebug_search(d, CHF_SPACE_PROG, (const uint8_t *)"fU", 2, 0xff, 0, 0x8000, 0x8FFF, hit, 16);
+    check(found == 0, "and case-sensitive when asked");
+    chfdebug_command(d, "find 2A 80 00", out, sizeof out);
+    check(strstr(out, "$0802") && strstr(out, "$0807"), "the prompt's find");
+    chfdebug_command(d, "find vram 02", out, sizeof out);
+    check(strstr(out, "vram $514"), "find in a named space");
+    chfdebug_command(d, "find text FU", out, sizeof out);
+    check(strstr(out, "$8100"), "find text");
+    chfdebug_resume(d);
+    check(chfdebug_search(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0, 0xFFFF, hit, 16) == -1 &&
+          chfdebug_search_next(d, CHF_SPACE_PROG, dci, 3, 0xff, 0, 0, 0, &where) == -1, "while running a search is -1");
+    check(stop_now(d), "stop");
+
+    /* symbols */
+    chfdebug_clear_symbols(d);                    /* earlier tests loaded labels */
+    nsyms = chfdebug_symbols_count(d);
+    check(nsyms > 40, "the built-in symbols are listed");
+    total = 0;
+    for (int i = 0; i < nsyms; i++) {
+        if (chfdebug_symbols_get(d, i, &addr, name, sizeof name, &bank) != 1 || !name[0])
+            total++;
+    }
+    check(total == 0 && chfdebug_symbols_get(d, nsyms, &addr, name, sizeof name, &bank) == 0 &&
+          chfdebug_symbols_get(d, -1, &addr, name, sizeof name, &bank) == 0, "every index 0..nsyms-1 yields one, past the end 0");
+    found = chfdebug_symbols_filter(d, "row_sound", idx, 64);
+    check(found == 1 && chfdebug_symbols_get(d, idx[0], &addr, name, sizeof name, &bank) == 1 && addr == 5 &&
+          bank == CHFDEBUG_SYM_PORT && !strcasecmp(name, "ROW_SOUND"), "a port name is listed as a port");
+    chfdebug_address_label(d, 5, name, sizeof name);
+    check(name[0] == '\0', "and still never labels a disassembly address");
+    found = chfdebug_symbols_filter(d, "", idx, 64);
+    check(found == 64 || found == nsyms, "an empty filter matches all (capped by max)");
+    {
+        int ordered = 1;
+        uint16_t prev = 0, cur = 0;
+        found = chfdebug_symbols_filter(d, "", idx, 64);
+        for (int i = 0; i < found; i++) {
+            chfdebug_symbols_get(d, idx[i], &cur, name, sizeof name, &bank);
+            if (i && cur < prev)
+                ordered = 0;
+            prev = cur;
+        }
+        check(ordered, "the filter orders by address");
+    }
+    chfdebug_set_label(d, 0x0900, "MYSUB");
+    check(chfdebug_symbols_count(d) == nsyms + 1, "a user label is listed");
+    found = chfdebug_symbols_filter(d, "mysu", idx, 64);
+    check(found == 1 && chfdebug_symbols_get(d, idx[0], &addr, name, sizeof name, &bank) == 1 && addr == 0x0900, "found by a case-insensitive substring");
+    chfdebug_clear_symbols(d);
+    check(chfdebug_symbols_count(d) == nsyms && chfdebug_symbols_filter(d, "mysub", idx, 64) == 0 &&
+          chfdebug_label_address(d, "CART_ENTRY") == 0x802, "Clear drops user labels; the built-ins stay");
+}
+
+static void test_memory_map(chfdebug *d)
+{
+    chfdebug_region map[40];
+    const chfdebug_region *region;
+    int count;
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    count = chfdebug_memory_map(d, map, 40);
+    check(count > 8 && count < 24 && map_complete(map, count), "FujiNet app: an ordered, gap-free, named map of $0000-$FFFF");
+    if (count) {
+        int index;
+        for (index = 0; index < count; index++)
+            printf("      $%04X-$%04X %c%c %s\n", map[index].low, map[index].high, map[index].readable ? 'r' : '-', map[index].writable ? 'w' : '-', map[index].name);
+    }
+    region = map_at(map, count, 0x0000);
+    check(region && region->high == 0x03FF && strstr(region->name, "sl31253") && region->readable && !region->writable, "the BIOS' first half");
+    region = map_at(map, count, 0x0400);
+    check(region && region->high == 0x07FF && strstr(region->name, "sl31254"), "and second");
+    region = map_at(map, count, 0x0800);
+    check(region && region->low == 0x0800 && region->high == 0x47FF && strstr(region->name, "FujiNet ROM") && !region->writable, "the FujiNet ROM window");
+    region = map_at(map, count, 0x4800);
+    check(region && region->low == 0x4800 && region->high == 0x67FF && strstr(region->name, "APPBANK page ") && strstr(region->name, "/2"), "the APPBANK window: page n/N");
+    region = map_at(map, count, 0x7000);
+    check(region && region->low == 0x6800 && region->high == 0x7FFF && !region->readable && !region->writable, "open bus above it");
+    region = map_at(map, count, 0x8000);
+    check(region && region->low == 0x8000 && region->high == 0xF7FF && region->readable && region->writable, "the arena RAM");
+    region = map_at(map, count, 0xF800);
+    check(region && region->low == 0xF800 && region->high == 0xFBFF && region->readable && !region->writable && strstr(region->name, "REPLY"), "the reply");
+    region = map_at(map, count, 0xFC00);
+    check(region && region->high == 0xFCFF && strstr(region->name, "status") && region->readable, "the status page");
+    region = map_at(map, count, 0xFD00);
+    check(region && region->high == 0xFD7F && strstr(region->name, "REGSEL") && !region->readable && region->writable, "REGSEL is write-only");
+    region = map_at(map, count, 0xFD80);
+    check(region && region->high == 0xFDEF && strstr(region->name, "APPBANK_SEL"), "APPBANK_SEL");
+    region = map_at(map, count, 0xFDFE);
+    check(region && strstr(region->name, "SWAP"), "SWAP");
+    region = map_at(map, count, 0xFE00);
+    check(region && region->high == 0xFEFF && strstr(region->name, "REGDATA"), "REGDATA");
+    region = map_at(map, count, 0xFF00);
+    check(region && region->high == 0xFFFF && strstr(region->name, "TXDATA"), "TXDATA");
+    check(chfdebug_memory_map(d, map, 3) == 3, "a short buffer is filled, not overrun");
+}
+
+/* trace: the 65536 ring, the new fields, the filters, nothing recorded in RESET */
+static void test_trace_ring(chfdebug *d)
+{
+    static chfdebug_trace big[70000];
+    chfdebug_trace ring[16];
+    char line[200];
+    int count, branches = 0, ranged = 0, good;
+    uint16_t start;
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfdebug_trace_enable(d, 0);
+    chfdebug_trace_clear(d);
+    check(chfdebug_trace_count(d) == 0 && chfdebug_trace_read(d, ring, 16) == 0, "an empty ring before the first enable");
+    chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
+    chfdebug_trace_enable(d, 1);
+    check(chfdebug_trace_enabled(d), "trace on");
+    chfdebug_frame(d, 20);
+    check(wait_stopped(d, 1, 10000), "twenty frames");
+    count = chfdebug_trace_count(d);
+    check(count == 65536, "the ring holds 65536 entries");
+    show("count %d", count);
+    count = chfdebug_trace_read(d, big, 70000);
+    check(count == 65536, "and reads them all (newest first)");
+    good = 1;
+    for (int i = 1; i < count; i++)
+        if (big[i].cycles >= big[i - 1].cycles || big[i].frame > big[i - 1].frame)
+            good = 0;
+    check(good, "in order: cycles fall and frames never rise going back");
+    check(big[0].frame > big[count - 1].frame, "the entries carry their frame");
+    for (int i = 0; i < count; i++) {
+        if (chfdebug_trace_match(&big[i], CHFDEBUG_TRACE_BRANCHES, 0, 0))
+            branches++;
+        if (chfdebug_trace_match(&big[i], CHFDEBUG_TRACE_RANGE, A_IDLE, A_IDLE + 3))
+            ranged++;
+    }
+    check(branches > 1000 && branches < count, "the BRANCHES filter keeps the idle loop's BR but not every entry");
+    check(ranged > 1000 && ranged < count, "and RANGE keeps the entries inside");
+    chfdebug_trace_format(&big[0], line, sizeof line);
+    check(strstr(line, "A=") && strstr(line, "PC1=") && strstr(line, "K=") && strncmp(line, "08", 2) == 0, "a formatted line");
+    chfdebug_trace_clear(d);
+    check(chfdebug_trace_count(d) == 0, "clear empties it");
+    chfdebug_trace_enable(d, 0);
+
+    /* r59, PC1 and DC1 as recorded: the K-stack program */
+    chfdebug_trace_clear(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_KBLK);
+    chfdebug_write(d, CHF_SPACE_SCRATCH, 59, 0x2a);
+    chfdebug_trace_enable(d, 1);
+    chfdebug_step_n(d, 6);
+    check(wait_stopped(d, 1, 3000), "six steps of the K-stack program");
+    count = chfdebug_trace_read(d, big, 100);
+    check(count == 6, "six entries");
+    /* the hook ran for the first instruction before the PC was set, so the ring starts where the second */
+    check(big[5].pc == A_KBLK + 2 && big[5].k == 0x2a, "an entry records r59");
+    check(big[1].pc == 0x0107 && big[1].pc1 == A_KBLK + 9, "PC1 holds the return address on entry to the subroutine");
+    show("pc %04X k %02X / %04X pc1 %04X", big[5].pc, big[5].k, big[1].pc, big[1].pc1);
+    chfdebug_trace_enable(d, 0);
+
+    /* the APPBANK page of an entry in the window */
+    chfdebug_trace_clear(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, 0x4800);
+    chfdebug_trace_enable(d, 1);
+    chfdebug_step_n(d, 3);
+    check(wait_stopped(d, 1, 3000), "three steps in the APPBANK window");
+    count = chfdebug_trace_read(d, ring, 4);
+    check(count == 3 && ring[0].pc >= 0x4800 && ring[0].page >= 0 && ring[0].page == ring[2].page, "entries in the window carry the page");
+    chfdebug_trace_format(&ring[0], line, sizeof line);
+    check(strstr(line, " page "), "and the line says so");
+    chfdebug_trace_clear(d);
+    chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
+    chfdebug_step_n(d, 2);
+    check(wait_stopped(d, 1, 3000) && chfdebug_trace_read(d, ring, 2) == 2 && ring[0].page == -1, "and outside it the page is -1");
+
+    /* RESET held: the hook refires every few clocks, nothing is recorded */
+    chfdebug_trace_clear(d);
+    start = (uint16_t)chfdebug_trace_count(d);
+    chf_host_reset_set(true);
+    chfdebug_resume(d);
+    test_sleep_ms(150);                 /* the reset is latched where a frame boundary */
+    chfdebug_trace_clear(d);
+    test_sleep_ms(250);
+    count = chfdebug_trace_count(d);
+    chf_host_reset_set(false);
+    check(start == 0 && count < 8, "nothing is recorded while RESET is held");
+    show("count %d", count);
+    chfdebug_trace_enable(d, 0);
+    check(stop_now(d), "stop after the reset");
+}
+
+static void test_watch_prompt(chfdebug *d)
+{
+    char out[1024];
+
+    if (!chfdebug_is_stopped(d))
+        stop_now(d);
+    chfwatch_clear();
+    chfdebug_command(d, "watch", out, sizeof out);
+    check(strstr(out, "no watches"), "watch: an empty list says so");
+    chfdebug_command(d, "watch 8100", out, sizeof out);
+    check(strstr(out, " 0  8100") && strstr(out, "$8100"), "watch <addr> adds to PROG");
+    chfdebug_command(d, "watch scratch r20", out, sizeof out);
+    check(strstr(out, " 1  r20") && strstr(out, "SCRATCH r20"), "watch <space> <reg> adds in that space");
+    chfdebug_command(d, "watch vram 10,20", out, sizeof out);
+    check(strstr(out, "VRAM") && strstr(out, "row 10 col 20") && strstr(out, "$02"), "watch vram row,col shows the cell");
+    chfdebug_command(d, "watch nonesuch", out, sizeof out);
+    check(strstr(out, "nonesuch") && strstr(out, "?"), "an unresolved watch shows '?'");
+    chfdebug_command(d, "unwatch 3", out, sizeof out);
+    chfdebug_command(d, "watch", out, sizeof out);
+    check(!strstr(out, "nonesuch") && strstr(out, "r20"), "unwatch <n> removes it");
+    chfdebug_command(d, "unwatch all", out, sizeof out);
+    check(chfwatch_count() == 0, "unwatch all");
+    chfdebug_resume(d);
+    chfdebug_command(d, "find 2A", out, sizeof out);
+    check(strstr(out, "stop the machine first"), "find while running says so");
+    stop_now(d);
 }
 
 /* ---- Videocarts: a game in the slot instead of the FujiNet cartridge ----------- */
@@ -1801,7 +2278,7 @@ static void test_videocarts(chfdebug *d, const char *tmp)
     check(cart.mailbox_page[0] == 0xff && cart.mailbox_page[0x7ff] == 0xff, "the 'mailbox' of a game reads $FF");
     id = chfdebug_breakpoint_add(d, CHFDEBUG_BP_WRITE, CHF_SPACE_PROG, 0x2800, 0x2fff, "value == 1");
     check(id > 0 && run_until_stop(d, 5000), "a write breakpoint on the cartridge's RAM");
-    check(strcmp((why(d), reason), "write prog $2801 = $01") == 0 && cpu(d).pc == 0x0811, "stops after the program's second store");
+    check(why_is(d, "wrote $2801 = $01 (was $00)") && cpu(d).pc == 0x0811, "stops after the program's second store");
     show("pc %04X '%s'", cpu(d).pc, reason);
     chfdebug_breakpoint_remove(d, id);
     chfdebug_read(d, CHF_SPACE_PROG, 0x2800, b, 2);
@@ -1823,6 +2300,21 @@ static void test_videocarts(chfdebug *d, const char *tmp)
     remove(path);
     chfdebug_command(d, "cart", out, sizeof out);
     check(strstr(out, "Chess") && strstr(out, "RAM 2048 bytes"), "the prompt's cart");
+    {
+        chfdebug_region map[24];
+        int nm = chfdebug_memory_map(d, map, 24);
+        const chfdebug_region *r;
+
+        check(nm == 6 && map_complete(map, nm), "chess: a six-region gap-free map");
+        r = map_at(map, nm, 0x0800);
+        check(r && r->high == 0x0FFF && strstr(r->name, "Cartridge ROM") && !r->writable, "chess: the 2K of ROM");
+        r = map_at(map, nm, 0x1800);
+        check(r && r->low == 0x1000 && r->high == 0x27FF && !r->readable && !r->writable, "chess: open bus up to the RAM");
+        r = map_at(map, nm, 0x2800);
+        check(r && r->high == 0x2FFF && r->readable && r->writable && strstr(r->name, "RAM"), "chess: 2K of RAM at $2800");
+        r = map_at(map, nm, 0xFFFF);
+        check(r && r->low == 0x3000 && !r->readable, "chess: open bus above");
+    }
 
     /* the multicart's bank latch at $3000 */
     check(boot_game(d, CHF_CART_MULTI, multi, sizeof multi, 0x4000), "a multicart boots");
@@ -1833,6 +2325,21 @@ static void test_videocarts(chfdebug *d, const char *tmp)
     chfdebug_command(d, "cart", out, sizeof out);
     check(strstr(out, "bank 3 half 1"), "and the prompt says so");
     check(chfdebug_label_address(d, "VCART_BANK") == 0x3000, "(VCART_BANK is the latch's address)");
+    {
+        chfdebug_region map[24];
+        int nm = chfdebug_memory_map(d, map, 24);
+        const chfdebug_region *r;
+
+        check(nm == 6 && map_complete(map, nm), "multicart: a six-region gap-free map");
+        r = map_at(map, nm, 0x0800);
+        check(r && r->high == 0x27FF && strstr(r->name, "bank 3/") && strstr(r->name, "half 1") && r->readable,
+              "multicart: the 8K bank window says which bank");
+        show("window '%s'", r ? r->name : "?");
+        r = map_at(map, nm, 0x2800);
+        check(r && r->high == 0x2FFF && r->writable && strstr(r->name, "RAM"), "multicart: RAM");
+        r = map_at(map, nm, 0x3000);
+        check(r && r->high == 0x3FFF && !r->readable && r->writable && strstr(r->name, "latch"), "multicart: the write-only bank latch");
+    }
 
     /* a 2102: Maze on ports $24/$25, Hangman on $20/$21 */
     for (int pass = 0; pass < 2; pass++) {
@@ -1844,6 +2351,12 @@ static void test_videocarts(chfdebug *d, const char *tmp)
         chfdebug_cart_get(d, &cart);
         check(io.has_2102 && io.ram_port == port && io.cart_type == type && cart.ram_size == 1024 && cart.type == type,
               "the 2102's ports and its 1024 bits");
+        {
+            chfdebug_region map[24];
+            int nm = chfdebug_memory_map(d, map, 24);
+            check(nm == 4 && map_complete(map, nm) && strstr(map[2].name, "Cartridge ROM") && !map[3].readable,
+                  "a 2102 cart: ROM then open bus (its RAM is on the ports)");
+        }
         check(chfdebug_space_size(d, CHF_SPACE_CART) == 0x800 + 128, "the CART space: the ROM and the RAM packed into 128 bytes");
         chfdebug_write(d, CHF_SPACE_CART, 0x800, 0x04);              /* bit 2 of byte 0: cell 2 */
         chfdebug_read(d, CHF_SPACE_CART, 0x800, &v, 1);
@@ -1884,6 +2397,13 @@ static void test_bios_services(chfdebug *d, const char *label, const uint8_t *lo
         return;
     }
     check(1, what);
+    {
+        chfdebug_region map[24];
+        int nm = chfdebug_memory_map(d, map, 24);
+        snprintf(what, sizeof what, "%s: the BIOS in the memory map", label);
+        check(bios_id < 0 ? (nm > 2 && map[0].high == 0x07FF && !strcmp(map[0].name, "BIOS stand-in"))
+                          : (nm > 3 && map[0].high == 0x03FF && map[1].high == 0x07FF && strstr(map[1].name, "sl31254")), what);
+    }
     if (chf_host_missing(out, sizeof out)) {
         printf("note: %s cannot run this app here (%s): skipped\n", label, out);
         return;
@@ -1909,7 +2429,7 @@ static void test_bios_services(chfdebug *d, const char *label, const uint8_t *lo
     {
         chfdebug_cpu c2 = cpu(d);
         check(c2.pc == A_KBLK + 9 && c2.k_depth == 1 && c2.k_stack[0] == 0x1234 && c2.r[59] == 0x2a &&
-              strcmp((why(d), reason), "step over") == 0, "step over a PUSHK stops after it, one entry deeper: [$1234]");
+              why_is(d, "step over"), "step over a PUSHK stops after it, one entry deeper: [$1234]");
         show("pc %04X depth %d r59 %02X reason '%s'", c2.pc, c2.k_depth, c2.r[59], reason);
         (void)c;
     }
@@ -1933,7 +2453,7 @@ static void test_bios_services(chfdebug *d, const char *label, const uint8_t *lo
     chfdebug_step(d);
     check(wait_stopped(d, 1, 3000) && cpu(d).pc == 0x0107 && cpu(d).pc1 == A_KBLK + 0x12, "a step into PI $0107 is in PUSHK, PC1 the return");
     chfdebug_step_out(d);
-    check(wait_stopped(d, 1, 5000) && cpu(d).pc == A_KBLK + 0x12 && strcmp((why(d), reason), "step out") == 0, "step out of PUSHK returns after the call");
+    check(wait_stopped(d, 1, 5000) && cpu(d).pc == A_KBLK + 0x12 && why_is(d, "step out"), "step out of PUSHK returns after the call");
 
     /* a routine that saves its return address on the K stack and leaves through K:
      * `PI POPK / PK` -- the PK is the return, not a call */
@@ -1949,7 +2469,7 @@ static void test_bios_services(chfdebug *d, const char *label, const uint8_t *lo
     show("pc %04X depth %d [%04X] r59 %02X K %04X pc1 %04X", cpu(d).pc, cpu(d).k_depth, cpu(d).k_stack[0], cpu(d).r[59],
          cpu(d).j_h_k_q[2], cpu(d).pc1);
     chfdebug_step_out(d);
-    check(wait_stopped(d, 1, 5000) && cpu(d).pc == 0x0a23 && cpu(d).k_depth == 0 && strcmp((why(d), reason), "step out") == 0,
+    check(wait_stopped(d, 1, 5000) && cpu(d).pc == 0x0a23 && cpu(d).k_depth == 0 && why_is(d, "step out"),
           "step out of it: the PK that goes home through K, with the K stack popped, is the return");
     show("pc %04X depth %d reason '%s'", cpu(d).pc, cpu(d).k_depth, reason);
     chfdebug_cpu_set(d, CHF_REG_PC, A_IDLE);
@@ -2081,6 +2601,13 @@ int main(void)
     test_symbols_and_save(d, tmp);
     test_prompt(d, tmp);
     test_completions(d);
+    test_stop_serial(d);
+    test_old_values(d);
+    test_access_and_hits(d);
+    test_search_and_symbols(d);
+    test_memory_map(d);
+    test_trace_ring(d);
+    test_watch_prompt(d);
     test_detach_and_cycle(d, &ho);
     test_videocarts(d, tmp);
     test_bios_services(d, "stand-in BIOS", NULL, NULL, -1);

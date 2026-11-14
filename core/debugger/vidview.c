@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "debugger_internal.h"
+#include "chfvidtab.h"
 
 /* ---- text out ------------------------------------------------------------- */
 
@@ -632,6 +633,29 @@ int chfdebug_video_hit(chfdebug *d, int view, int x, int y, int scale, int *row,
     if (col)
         *col = c;
     return r * CF_VRAM_COLS + c;
+}
+
+/* The beam geometry chfvidtab.h wants: lines per VRAM row and the blank's ends. */
+int chfdebug_video_geometry(chfdebug *d, int *lines_per_row, int *vbstart, int *vbend)
+{
+    chf_machine_t *m;
+    int ok = 0;
+
+    (void)d;
+    chf_host_lock();
+    m = chfdebug_machine();
+    if (m)
+    {
+        if (lines_per_row)
+            *lines_per_row = m->y_rpt;
+        if (vbstart)
+            *vbstart = m->vbstart;
+        if (vbend)
+            *vbend = m->vbend;
+        ok = 1;
+    }
+    chf_host_unlock();
+    return ok;
 }
 
 /* ---- inputs and the tone ---------------------------------------------------------------- */

@@ -64,11 +64,21 @@ int  chfdebug_is_attached(chfdebug *d);
 int  chfdebug_is_stopped(chfdebug *d);
 void chfdebug_stop(chfdebug *d);         /* break at the next instruction */
 void chfdebug_resume(chfdebug *d);       /* "run" */
-/* Why the machine last stopped ("stopped", "breakpoint: exec $0802",
- * "VRAM write row 12 col 40 = 2", "out port 5 = $C0", "step", "frame", ...)
- * and the PC, -1 if none or
- * running. Writes at most dstsz-1 bytes; returns the length. */
+/* Why the machine last stopped ("stopped at $0802", "breakpoint: exec $0802",
+ * "wrote $8010 = $12 (was $11) at $0A32", "VRAM write row 12 col 40 = 2 (was 0)
+ * at $082E", "out port 5 = $C0 (was $00) at $0837", "scratch write r20 = $02
+ * (was $01) at $0864", "step at $0803", "frame at $0860", ...) and the PC the
+ * machine stopped at, -1 if none or running. A write names its writer (the
+ * instruction before the stop) and the value it replaced; a reason without an
+ * address of its own ends " at $xxxx" (the PC). chfdebug_is_stopped() turns
+ * true only once the reason of that stop is recorded, so a poller that sees
+ * it stopped reads the right one. Writes at most dstsz-1 bytes; returns the
+ * length. */
 int  chfdebug_stop_reason(chfdebug *d, char *dst, int dstsz, int *address);
+/* Bumped by every stop (pause, breakpoint, step), after its reason is
+ * recorded and before chfdebug_is_stopped() turns true; frontends recentre
+ * their views on the PC when it changes. */
+uint64_t chfdebug_stop_serial(chfdebug *d);
 /* Bumped whenever a command ran or the machine stopped/resumed or something
  * was edited, so a window knows when to refresh. */
 unsigned chfdebug_generation(chfdebug *d);
@@ -77,20 +87,23 @@ unsigned chfdebug_generation(chfdebug *d);
 /* Run one command; "help" lists them: step [n], over, out, frame [n],
  * scanline [n], run, stop, runto <addr>, break <addr>[-<end>] [cond],
  * bpr/bpw <addr>[-<end>] [cond] (data reads/writes of PROG space), bpi/bpo
- * <port>[-<end>] [cond] (port reads/writes), bpv <row>,<col>[-<row>,<col>]
+ * <port>[-<end>] [cond] (port reads/writes), bpa <addr>[-<end>] [cond] (a
+ * PROG read or write: Access), bpv <row>,<col>[-<row>,<col>]
  * [cond] (VRAM writes to a cell range), bps <reg>[-<end>] [cond] (scratchpad
  * writes), delete <id|addr>, enable/disable <id>, clear, breaks, print
  * <expr>, regs, set <reg> <expr>, mem <space> <addr> [len] (prog, scratch,
  * vram, cart, io), poke <space> <addr> <val...>, scratch, isar, kstack, vram
  * [row], pal, video, ports, sound, input, cart, mailbox, bios, romc
  * [on|off|n], label <addr> <name>, labels [file], disasm [addr] [n], trace
- * [on|off|clear|n], save <kind> <file>.
+ * [on|off|clear|n], watch [[space] expr|low-high], unwatch <n|all>, find [space]
+ * [hex] <bytes> | find [space] text <string>, save <kind> <file>.
  * Expressions: numbers ($0800, 0x800, 800h, 2048, %1010, o17 octal),
  * registers (a w is isar pc pc0 pc1 dc0 dc1 j h k q hu hl ku kl qu ql, the
  * flags icb o z c s, r0-r63), [addr] a PROG byte, p[addr] s[reg] v[row*128+col]
  * c[off] io[port] the five spaces, labels, vpos hpos frame cycles, in a
- * breakpoint condition `value` and `addr` (and `row` `col` for bpv, `port`
- * for bpi/bpo); C operators with C precedence. Output text into dst; returns
+ * breakpoint condition `value`, `addr` and `old` (the value before a write;
+ * the same as `value` for a read, an IN or an execute) (and `row` `col` for
+ * bpv, `port` for bpi/bpo); C operators with C precedence. Output text into dst; returns
  * its length. */
 int  chfdebug_command(chfdebug *d, const char *command, char *dst, int dstsz);
 /* Completions for a prefix (commands, registers and labels), one per line.
@@ -186,7 +199,8 @@ void chfdebug_write(chfdebug *d, int space, uint32_t addr, uint8_t value);
 typedef struct {
     uint16_t address;
     int is_pc;
-    int has_breakpoint;
+    int has_breakpoint;      /* an enabled execute breakpoint covers it */
+    int bp_disabled;         /* only a disabled one does (the grey dot) */
     int length;              /* 1-3 */
     char bytes[16];          /* "29 08 02" */
     char label[48];
@@ -465,7 +479,9 @@ typedef enum {
     CHFDEBUG_BP_OUT = 16,    /* a port write; start/end are ports */
     CHFDEBUG_BP_VRAM = 32,   /* a VRAM write (a strobe); start/end are row * 128 + col,
                                 the cells of the rectangle between them */
-    CHFDEBUG_BP_SCRATCH = 64 /* a scratchpad write; start/end are registers 0-63 */
+    CHFDEBUG_BP_SCRATCH = 64,/* a scratchpad write; start/end are registers 0-63 */
+    /* Read and write of PROG space as one entry ("Access"): READ | WRITE */
+    CHFDEBUG_BP_ACCESS = 6
 } chfdebug_bp_type;
 typedef struct {
     int id;
@@ -489,6 +505,27 @@ void chfdebug_breakpoint_remove(chfdebug *d, int id);
 void chfdebug_breakpoint_enable(chfdebug *d, int id, int enabled);
 int  chfdebug_breakpoint_list(chfdebug *d, chfdebug_breakpoint *out, int max);
 void chfdebug_breakpoint_clear(chfdebug *d);
+/* Zero every hit count. */
+void chfdebug_breakpoint_clear_hits(chfdebug *d);
+
+/* ---- symbols (built-ins and loaded, for a Symbols tab) ------------------------- */
+/* The console's port names (SYM_BANK_PORT) are listed too, as ports: their
+ * bank is CHFDEBUG_SYM_PORT and addr is the port. They resolve by name and
+ * never label a disassembly line. */
+#define CHFDEBUG_SYM_ANY  (-1)
+#define CHFDEBUG_SYM_PORT (-2)
+int  chfdebug_symbols_count(chfdebug *d);
+/* Entry `index` (0 .. count-1): address (or port), name and the bank
+ * (CHFDEBUG_SYM_ANY, or CHFDEBUG_SYM_PORT for a port). Returns 1, or 0 past
+ * the end. The order is the table's; it can change when symbols are loaded,
+ * cleared or looked up. */
+int  chfdebug_symbols_get(chfdebug *d, int index, uint16_t *addr, char *name, int namesz,
+                          int *bank);
+/* Indices of the entries whose name contains `text` (case-insensitive; empty
+ * matches all), ordered by address then name. Returns the count written. */
+int  chfdebug_symbols_filter(chfdebug *d, const char *text, int *out, int max);
+/* Drop every loaded symbol and user label; the built-ins stay. */
+void chfdebug_clear_symbols(chfdebug *d);
 
 /* ---- the trace ring ----------------------------------------------------------- */
 typedef struct {
@@ -498,12 +535,57 @@ typedef struct {
     uint8_t len, bytes[3];
     uint64_t cycles;
     int16_t vpos, hpos;
+    uint16_t pc1, dc1;       /* the return address, and the alternate data counter */
+    uint8_t k;               /* r59, the BIOS K stack pointer */
+    int16_t page;            /* the FujiNet APPBANK page showing at $4800 when pc is in
+                                the window ($4800-$67FF), else -1 */
+    uint32_t frame;
 } chfdebug_trace;
+/* The ring keeps the newest 65536; it is allocated on the first enable, has
+ * its own lock (a reader never waits for a frame) and records nothing while
+ * the machine is parked or the console's RESET is held. */
 void chfdebug_trace_enable(chfdebug *d, int on);
 int  chfdebug_trace_enabled(chfdebug *d);
 /* Newest first; returns entries copied. */
 int  chfdebug_trace_read(chfdebug *d, chfdebug_trace *out, int max);
 void chfdebug_trace_clear(chfdebug *d);
+/* Entries held. */
+int  chfdebug_trace_count(chfdebug *d);
+/* "0802  JMP   $0A40   A=00 W=11 IS=o25 DC0=8000 DC1=0000 PC1=0000 K=40". Returns
+ * the length. */
+int  chfdebug_trace_format(const chfdebug_trace *t, char *dst, int dstsz);
+enum { CHFDEBUG_TRACE_ALL = 0, CHFDEBUG_TRACE_BRANCHES, CHFDEBUG_TRACE_RANGE };
+/* 1 if the entry passes the filter (BRANCHES: jumps, branches, calls, returns
+ * and LR P0,Q; RANGE: pc in low..high). */
+int  chfdebug_trace_match(const chfdebug_trace *t, int filter, uint16_t low, uint16_t high);
+
+/* ---- memory search and the memory map ----------------------------------------- */
+#define CHFDEBUG_SEARCH_NOCASE 1
+/* Stopped only (-1 while running). Finds up to max start addresses in
+ * from..to of one space (bounding the START address; the match may run past
+ * `to`, never past the space's end), where (mem & mask) == (pat & mask) for
+ * all patlen bytes. Returns the count. */
+int  chfdebug_search(chfdebug *d, int space, const uint8_t *pat, int patlen, uint8_t mask,
+                     int flags, uint32_t from, uint32_t to, uint32_t *out, int max);
+/* The next match after `from` (before it if backward), wrapping once.
+ * Returns 1 and *found, 0 for none, -1 while running. */
+int  chfdebug_search_next(chfdebug *d, int space, const uint8_t *pat, int patlen, uint8_t mask,
+                          int flags, uint32_t from, int backward, uint32_t *found);
+
+typedef struct {
+    uint16_t low, high;
+    int readable, writable;
+    char name[48];
+} chfdebug_region;
+/* Ordered, gap-free regions covering PROG $0000-$FFFF as mapped now: the
+ * BIOS ($0000-$07FF: its two halves, or one "BIOS stand-in"), the cartridge
+ * from $0800 by type (a Videocart's ROM then open bus, chess' 2K of RAM, a
+ * multicart's bank window "bank n/N" with its RAM and write-only bank latch;
+ * the FujiNet cartridge's ROM window, APPBANK "page n/N", open bus, RAM and
+ * the mailbox's REPLY / STATUS / REGSEL / APPBANK_SEL / SWAP / REGDATA /
+ * TXDATA pages; its arena is plain RAM when the mailbox is dead). Returns
+ * the count (under 24). */
+int  chfdebug_memory_map(chfdebug *d, chfdebug_region *out, int max);
 
 /* ---- files -------------------------------------------------------------------- */
 /* Save with the path a native file picker supplied. kind: "dis" (PROG space

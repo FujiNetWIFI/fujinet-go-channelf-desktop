@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "debugger_internal.h"
@@ -57,7 +58,7 @@
 #include "host.h"
 
 #define MAX_BP     128
-#define TRACE_N    4096
+#define TRACE_N    65536
 #define ROMC_N     4096
 #define IOEV_N     4096
 #define SNDEV_N    1024
@@ -71,6 +72,7 @@ typedef struct {
     int type;                    /* CHFDEBUG_BP_* */
     unsigned addr;               /* PROG address, port, VRAM offset or register */
     unsigned value;
+    unsigned old;                /* the value a write replaced; else the value */
     int row, col;                /* VRAM */
 } access_t;
 
@@ -95,11 +97,13 @@ struct chfdebug {
     char reason[128];
     int reason_addr;
     atomic_uint generation;
+    atomic_ullong stop_serial;   /* bumped by every park, once its reason is recorded */
 
     chfdebug_breakpoint bp[MAX_BP];
     int nbp, next_id;
     uint8_t map_exec[PROG_SIZE];     /* nonzero: an enabled exec bp covers it */
     uint8_t map_mem[PROG_SIZE];      /* CHFDEBUG_BP_READ / _WRITE bits */
+    uint8_t map_exec_off[PROG_SIZE]; /* nonzero: only a disabled exec bp covers it */
     uint8_t map_in[256], map_out[256];
     int have_vram_bp, have_scratch_bp;
     atomic_int break_pending;
@@ -116,8 +120,11 @@ struct chfdebug {
     int snap_valid;
     int in_edit;                 /* a debugger edit is running: no logging, no breakpoints */
 
+    /* the instruction trace: its own lock, so a window reading it never waits
+     * for a frame; the ring is allocated on the first enable */
     atomic_int trace_on;
-    chfdebug_trace ring[TRACE_N];
+    pthread_mutex_t trace_mtx;
+    chfdebug_trace *ring;
     int ring_head, ring_count;
 
     chfdebug_io_event io_ev[IOEV_N];
@@ -193,7 +200,7 @@ static void snap_refresh(chfdebug *d)
 const char *const chfdebug_reg_names[] = {
     "a", "w", "is", "isar", "pc", "pc0", "pc1", "dc0", "dc1", "j", "h", "k", "q",
     "hu", "hl", "ku", "kl", "qu", "ql", "icb", "o", "z", "c", "s",
-    "vpos", "hpos", "frame", "cycles", "value", "addr", "row", "col", "port", NULL,
+    "vpos", "hpos", "frame", "cycles", "value", "old", "addr", "row", "col", "port", NULL,
 };
 
 static uint8_t expr_read(void *user, int space, uint32_t addr)
@@ -235,6 +242,7 @@ static int expr_name(void *user, const char *raw, long *out)
     {
         const access_t *a = &d->acc;
         if (!strcmp(name, "value")) { *out = (long)a->value; return 1; }
+        if (!strcmp(name, "old"))   { *out = (long)a->old; return 1; }
         if (!strcmp(name, "addr"))  { *out = (long)a->addr; return 1; }
         if (!strcmp(name, "row") && a->type == CHFDEBUG_BP_VRAM) { *out = a->row; return 1; }
         if (!strcmp(name, "col") && a->type == CHFDEBUG_BP_VRAM) { *out = a->col; return 1; }
@@ -302,28 +310,50 @@ int chfdebug_eval(chfdebug *d, const char *text, long *out, char *err, int errsz
 
 /* ---- the hooks (emulation thread) ----------------------------------------- */
 
+static int appbank_page(chf_machine_t *m);
+
 static void trace_record(chfdebug *d, chf_machine_t *m, uint16_t pc)
 {
-    chfdebug_trace *t = &d->ring[d->ring_head];
     const f8_t *c = &m->cpu;
+    chfdebug_trace *entry;
     int vp, hp;
+    int page = -1;
 
-    t->pc = pc;
-    t->a = c->a;
-    t->w = c->w;
-    t->isar = (uint8_t)(c->is & 63);
-    t->dc0 = c->dc0;
-    t->bytes[0] = pbyte(m, pc);
-    t->len = (uint8_t)dasmf8_length(t->bytes[0]);
-    t->bytes[1] = t->len > 1 ? pbyte(m, (uint16_t)(pc + 1)) : 0;
-    t->bytes[2] = t->len > 2 ? pbyte(m, (uint16_t)(pc + 2)) : 0;
-    t->cycles = c->cycles;
+    /* the hook refires every 4 clocks while RESET is held or the stand-in is
+     * parked: nothing runs, so nothing is recorded */
+    if (m->parked || m->reset_held)
+        return;
+    if (pc >= FN_APP_WIN && pc < FN_APP_WIN + FN_APP_PAGE)
+        page = appbank_page(m);
+    pthread_mutex_lock(&d->trace_mtx);
+    if (!d->ring)
+    {
+        pthread_mutex_unlock(&d->trace_mtx);
+        return;
+    }
+    entry = &d->ring[d->ring_head];
+    entry->pc = pc;
+    entry->a = c->a;
+    entry->w = c->w;
+    entry->isar = (uint8_t)(c->is & 63);
+    entry->dc0 = c->dc0;
+    entry->bytes[0] = pbyte(m, pc);
+    entry->len = (uint8_t)dasmf8_length(entry->bytes[0]);
+    entry->bytes[1] = entry->len > 1 ? pbyte(m, (uint16_t)(pc + 1)) : 0;
+    entry->bytes[2] = entry->len > 2 ? pbyte(m, (uint16_t)(pc + 2)) : 0;
+    entry->cycles = c->cycles;
     chf_machine_beam(m, &vp, &hp);
-    t->vpos = (int16_t)vp;
-    t->hpos = (int16_t)hp;
+    entry->vpos = (int16_t)vp;
+    entry->hpos = (int16_t)hp;
+    entry->pc1 = c->pc1;
+    entry->dc1 = c->dc1;
+    entry->k = c->r[59];
+    entry->page = (int16_t)page;
+    entry->frame = (uint32_t)m->frames_done;
     d->ring_head = (d->ring_head + 1) % TRACE_N;
     if (d->ring_count < TRACE_N)
         d->ring_count++;
+    pthread_mutex_unlock(&d->trace_mtx);
 }
 
 static void romc_record(void *ctx, const f8_t *c, uint8_t romc, uint8_t dbus)
@@ -368,6 +398,9 @@ static void park(chfdebug *d, chf_machine_t *m, uint16_t pc, const char *reason)
     d->reason_addr = pc;
     atomic_store(&d->mode, MODE_RUN);
     atomic_store(&d->stop_req, 0);
+    /* the reason is recorded above; only now may a poller see "stopped", and
+     * the serial moves before it so a stop is never seen with the old one */
+    atomic_fetch_add(&d->stop_serial, 1);
     atomic_store(&d->stopped, 1);
     bump(d);
     /* parked, the machine is the windows' */
@@ -400,27 +433,33 @@ static int covers(const chfdebug_breakpoint *b, const access_t *a)
     }
 }
 
-static void access_reason(const access_t *a, char *dst, size_t n)
+/* Why an access stopped the machine; `pc` is the instruction that made it
+ * (the stop lands one instruction later). */
+static void access_reason(const access_t *acc, uint16_t pc, char *dst, size_t size)
 {
-    switch (a->type)
+    switch (acc->type)
     {
     case CHFDEBUG_BP_READ:
-        snprintf(dst, n, "read prog $%04X = $%02X", a->addr, a->value & 0xff);
+        snprintf(dst, size, "read prog $%04X = $%02X at $%04X", acc->addr, acc->value & 0xff, pc);
         break;
     case CHFDEBUG_BP_WRITE:
-        snprintf(dst, n, "write prog $%04X = $%02X", a->addr, a->value & 0xff);
+        snprintf(dst, size, "wrote $%04X = $%02X (was $%02X) at $%04X", acc->addr, acc->value & 0xff,
+                 acc->old & 0xff, pc);
         break;
     case CHFDEBUG_BP_IN:
-        snprintf(dst, n, "in port %u = $%02X", a->addr, a->value & 0xff);
+        snprintf(dst, size, "in port %u = $%02X at $%04X", acc->addr, acc->value & 0xff, pc);
         break;
     case CHFDEBUG_BP_OUT:
-        snprintf(dst, n, "out port %u = $%02X", a->addr, a->value & 0xff);
+        snprintf(dst, size, "out port %u = $%02X (was $%02X) at $%04X", acc->addr, acc->value & 0xff,
+                 acc->old & 0xff, pc);
         break;
     case CHFDEBUG_BP_VRAM:
-        snprintf(dst, n, "VRAM write row %d col %d = %u", a->row, a->col, a->value & 3);
+        snprintf(dst, size, "VRAM write row %d col %d = %u (was %u) at $%04X", acc->row, acc->col,
+                 acc->value & 3, acc->old & 3, pc);
         break;
     default:
-        snprintf(dst, n, "scratch write r%u = $%02X", a->addr, a->value & 0xff);
+        snprintf(dst, size, "scratch write r%u = $%02X (was $%02X) at $%04X", acc->addr,
+                 acc->value & 0xff, acc->old & 0xff, pc);
         break;
     }
 }
@@ -445,7 +484,7 @@ static int hit_check(chfdebug *d, const access_t *a)
         if (!cond_true(d, b))
             continue;
         b->hits++;
-        access_reason(a, d->break_reason, sizeof d->break_reason);
+        access_reason(a, d->cur_pc, d->break_reason, sizeof d->break_reason);
         atomic_store(&d->break_pending, 1);
         hit = 1;
         break;
@@ -499,6 +538,7 @@ static void scratch_check(chfdebug *d, chf_machine_t *m)
         a.type = CHFDEBUG_BP_SCRATCH;
         a.addr = r;
         a.value = m->cpu.r[r];
+        a.old = d->snap[r];
         a.row = a.col = 0;
         if (hit_check(d, &a))
             break;
@@ -653,6 +693,7 @@ static void on_instruction(chfdebug *d, chf_machine_t *m)
                 d->acc.type = CHFDEBUG_BP_EXEC;
                 d->acc.addr = pc;
                 d->acc.value = pbyte(m, pc);
+                d->acc.old = d->acc.value;
                 d->in_access = 1;
                 if (cond_true(d, b))
                 {
@@ -687,6 +728,21 @@ static void instr_hook(chf_machine_t *m, void *user)
         on_instruction(d, m);
 }
 
+/* What a port holds before an OUT lands: the video latch (ports 0, 1, 4, 5)
+ * or a 2102 Videocart's, else `fallback`. */
+static unsigned port_latch(const chf_machine_t *m, unsigned port, unsigned fallback)
+{
+    const chf_cart_t *c = m->cart;
+
+    if (port == 0 || port == 1)
+        return m->vid.latch[port];
+    if (port == 4 || port == 5)
+        return m->vid.latch[port - 2];
+    if (c && c->io_hi >= c->io_lo && port >= c->io_lo && port - c->io_lo < 2)
+        return c->latch[port - c->io_lo];
+    return fallback;
+}
+
 static void bus_hook(chf_machine_t *m, void *user, int kind, uint16_t addr, uint8_t data)
 {
     chfdebug *d = user;
@@ -696,6 +752,7 @@ static void bus_hook(chf_machine_t *m, void *user, int kind, uint16_t addr, uint
         return;
     memset(&a, 0, sizeof a);
     a.value = data;
+    a.old = data;
     switch (kind)
     {
     case CHF_BUS_MEMR:
@@ -704,6 +761,9 @@ static void bus_hook(chf_machine_t *m, void *user, int kind, uint16_t addr, uint
         a.addr = addr;
         if (atomic_load(&d->break_pending) || !(d->map_mem[addr] & a.type))
             return;
+        /* the hook runs before the store: a side-effect free peek is the old byte */
+        if (kind == CHF_BUS_MEMW)
+            a.old = chf_machine_peek(m, CHF_PEEK_PROG, addr);
         break;
     case CHF_BUS_IOR:
     case CHF_BUS_IOW:
@@ -736,6 +796,8 @@ static void bus_hook(chf_machine_t *m, void *user, int kind, uint16_t addr, uint
         if (atomic_load(&d->break_pending) ||
             !(kind == CHF_BUS_IOR ? d->map_in : d->map_out)[a.addr])
             return;
+        if (kind == CHF_BUS_IOW)
+            a.old = port_latch(m, a.addr, data);
         break;
     }
     case CHF_BUS_VRAM:
@@ -748,6 +810,7 @@ static void bus_hook(chf_machine_t *m, void *user, int kind, uint16_t addr, uint
         a.addr = addr;
         a.row = addr / CF_VRAM_COLS;
         a.col = addr % CF_VRAM_COLS;
+        a.old = m->vw.old;
         break;
     default:
         return;
@@ -780,6 +843,7 @@ static uint8_t watch_bits(chfdebug *d)
 static void rebuild_locked(chfdebug *d)
 {
     memset(d->map_exec, 0, sizeof d->map_exec);
+    memset(d->map_exec_off, 0, sizeof d->map_exec_off);
     memset(d->map_mem, 0, sizeof d->map_mem);
     memset(d->map_in, 0, sizeof d->map_in);
     memset(d->map_out, 0, sizeof d->map_out);
@@ -788,7 +852,12 @@ static void rebuild_locked(chfdebug *d)
     {
         const chfdebug_breakpoint *b = &d->bp[i];
         if (!b->enabled)
+        {
+            if (b->type & CHFDEBUG_BP_EXEC)
+                for (unsigned a = b->start; a <= b->end && a < PROG_SIZE; a++)
+                    d->map_exec_off[a] = 1;
             continue;
+        }
         if (b->type & CHFDEBUG_BP_EXEC)
             for (unsigned a = b->start; a <= b->end; a++)
                 d->map_exec[a] = 1;
@@ -821,6 +890,7 @@ chfdebug *chfdebug_create(void)
     pthread_mutex_init(&d->lock, NULL);
     pthread_cond_init(&d->cond, NULL);
     pthread_mutex_init(&d->fuji_lock, NULL);
+    pthread_mutex_init(&d->trace_mtx, NULL);
     fujitrace_init(&d->fuji);
     d->next_id = 1;
     d->reason_addr = -1;
@@ -842,6 +912,8 @@ void chfdebug_free(chfdebug *d)
     pthread_mutex_destroy(&d->lock);
     pthread_cond_destroy(&d->cond);
     pthread_mutex_destroy(&d->fuji_lock);
+    pthread_mutex_destroy(&d->trace_mtx);
+    free(d->ring);
     free(d);
 }
 
@@ -1026,11 +1098,29 @@ int chfdebug_stop_reason(chfdebug *d, char *dst, int dstsz, int *address)
     if (!d || !dst || dstsz <= 0)
         return 0;
     pthread_mutex_lock(&d->lock);
-    n = snprintf(dst, (size_t)dstsz, "%s", atomic_load(&d->stopped) ? d->reason : "running");
-    if (address)
-        *address = atomic_load(&d->stopped) ? d->reason_addr : -1;
+    if (atomic_load(&d->stopped))
+    {
+        n = snprintf(dst, (size_t)dstsz, "%s", d->reason);
+        if (d->reason_addr >= 0 && !strchr(d->reason, '$') && n < dstsz)
+            n += snprintf(dst + n, (size_t)(dstsz - n), " at $%04X", d->reason_addr);
+        if (n >= dstsz)
+            n = dstsz - 1;
+        if (address)
+            *address = d->reason_addr;
+    }
+    else
+    {
+        n = snprintf(dst, (size_t)dstsz, "running");
+        if (address)
+            *address = -1;
+    }
     pthread_mutex_unlock(&d->lock);
-    return n < dstsz ? n : dstsz - 1;
+    return n;
+}
+
+uint64_t chfdebug_stop_serial(chfdebug *d)
+{
+    return d ? (uint64_t)atomic_load(&d->stop_serial) : 0;
 }
 
 unsigned chfdebug_generation(chfdebug *d)
@@ -1478,6 +1568,7 @@ static void fill_line(chfdebug *d, chf_machine_t *m, uint16_t addr, chfdebug_lin
     l->address = addr;
     l->is_pc = addr == pc;
     l->has_breakpoint = d->map_exec[addr] != 0;
+    l->bp_disabled = !l->has_breakpoint && d->map_exec_off[addr] != 0;
     for (int i = 0, o = 0; i < l->length && o < (int)sizeof l->bytes - 3; i++)
         o += snprintf(l->bytes + o, sizeof l->bytes - (size_t)o, "%s%02X", i ? " " : "",
                       ob[i]);
@@ -2015,15 +2106,133 @@ int chfdebug_breakpoint_toggle(chfdebug *d, uint16_t addr)
     return chfdebug_breakpoint_add(d, CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, addr, addr, NULL) >= 0;
 }
 
+void chfdebug_breakpoint_clear_hits(chfdebug *d)
+{
+    if (!d)
+        return;
+    pthread_mutex_lock(&d->lock);
+    for (int i = 0; i < d->nbp; i++)
+        d->bp[i].hits = 0;
+    bump(d);
+    pthread_mutex_unlock(&d->lock);
+}
+
+/* ---- symbols -------------------------------------------------------------------- */
+
+int chfdebug_symbols_count(chfdebug *d)
+{
+    int count;
+
+    if (!d)
+        return 0;
+    chf_host_lock();
+    count = d->syms.n;
+    chf_host_unlock();
+    return count;
+}
+
+int chfdebug_symbols_get(chfdebug *d, int index, uint16_t *addr, char *name, int namesz, int *bank)
+{
+    int found = 0;
+
+    if (!d)
+        return 0;
+    chf_host_lock();
+    if (index >= 0 && index < d->syms.n)
+    {
+        const sym_entry *entry = &d->syms.v[index];
+
+        if (addr)
+            *addr = entry->addr;
+        if (name && namesz > 0)
+            snprintf(name, (size_t)namesz, "%s", entry->name);
+        if (bank)
+            *bank = entry->bank;
+        found = 1;
+    }
+    chf_host_unlock();
+    return found;
+}
+
+typedef struct { uint16_t addr; const char *name; int index; } sym_pick;
+
+static int sym_pick_cmp(const void *pa, const void *pb)
+{
+    const sym_pick *lhs = pa, *rhs = pb;
+    if (lhs->addr != rhs->addr)
+        return lhs->addr < rhs->addr ? -1 : 1;
+    return strcasecmp(lhs->name, rhs->name);
+}
+
+static int contains_nocase(const char *hay, const char *needle)
+{
+    const size_t len = strlen(needle);
+    if (!len)
+        return 1;
+    for (; *hay; hay++)
+        if (!strncasecmp(hay, needle, len))
+            return 1;
+    return 0;
+}
+
+int chfdebug_symbols_filter(chfdebug *d, const char *text, int *out, int max)
+{
+    sym_pick *pick;
+    int count = 0;
+
+    if (!d || !out || max <= 0)
+        return 0;
+    chf_host_lock();
+    if (d->syms.n <= 0 || (pick = malloc((size_t)d->syms.n * sizeof *pick)) == NULL)
+    {
+        chf_host_unlock();
+        return 0;
+    }
+    for (int i = 0; i < d->syms.n; i++)
+        if (contains_nocase(d->syms.v[i].name, text ? text : ""))
+        {
+            pick[count].addr = d->syms.v[i].addr;
+            pick[count].name = d->syms.v[i].name;
+            pick[count].index = i;
+            count++;
+        }
+    qsort(pick, (size_t)count, sizeof *pick, sym_pick_cmp);
+    if (count > max)
+        count = max;
+    for (int i = 0; i < count; i++)
+        out[i] = pick[i].index;
+    free(pick);
+    chf_host_unlock();
+    return count;
+}
+
+void chfdebug_clear_symbols(chfdebug *d)
+{
+    if (!d)
+        return;
+    chf_host_lock();
+    symtab_clear_user(&d->syms);
+    chf_host_unlock();
+    bump(d);
+}
+
 /* ---- trace ---------------------------------------------------------------------- */
 
 void chfdebug_trace_enable(chfdebug *d, int on)
 {
-    if (d)
+    if (!d)
+        return;
+    if (on)
     {
-        atomic_store(&d->trace_on, on != 0);
-        bump(d);
+        pthread_mutex_lock(&d->trace_mtx);
+        if (!d->ring)
+            d->ring = calloc(TRACE_N, sizeof *d->ring);
+        if (!d->ring)
+            on = 0;
+        pthread_mutex_unlock(&d->trace_mtx);
     }
+    atomic_store(&d->trace_on, on != 0);
+    bump(d);
 }
 
 int chfdebug_trace_enabled(chfdebug *d)
@@ -2031,17 +2240,18 @@ int chfdebug_trace_enabled(chfdebug *d)
     return d && atomic_load(&d->trace_on);
 }
 
-/* The ring is written by the instruction hook, under the run lock. */
+/* The ring is written by the instruction hook under trace_mtx, so a reader
+ * needs that lock and not the run lock. */
 int chfdebug_trace_read(chfdebug *d, chfdebug_trace *out, int max)
 {
     int n;
-    if (!d)
+    if (!d || max <= 0)
         return 0;
-    chf_host_lock();
-    n = d->ring_count < max ? d->ring_count : max;
+    pthread_mutex_lock(&d->trace_mtx);
+    n = !d->ring ? 0 : d->ring_count < max ? d->ring_count : max;
     for (int i = 0; i < n; i++)
         out[i] = d->ring[(d->ring_head - 1 - i + TRACE_N) % TRACE_N];
-    chf_host_unlock();
+    pthread_mutex_unlock(&d->trace_mtx);
     return n;
 }
 
@@ -2049,10 +2259,406 @@ void chfdebug_trace_clear(chfdebug *d)
 {
     if (!d)
         return;
-    chf_host_lock();
+    pthread_mutex_lock(&d->trace_mtx);
     d->ring_head = d->ring_count = 0;
-    chf_host_unlock();
+    pthread_mutex_unlock(&d->trace_mtx);
     bump(d);
+}
+
+int chfdebug_trace_count(chfdebug *d)
+{
+    int count;
+    if (!d)
+        return 0;
+    pthread_mutex_lock(&d->trace_mtx);
+    count = d->ring_count;
+    pthread_mutex_unlock(&d->trace_mtx);
+    return count;
+}
+
+static int trace_decode(const chfdebug_trace *entry, char *text, size_t textsz, unsigned *flags,
+                        int *target)
+{
+    uint8_t opbytes[3] = { entry->bytes[0], entry->bytes[1], entry->bytes[2] };
+
+    *flags = 0;
+    *target = -1;
+    return dasmf8(text, textsz, entry->pc, opbytes, flags, target);
+}
+
+int chfdebug_trace_format(const chfdebug_trace *entry, char *dst, int dstsz)
+{
+    char text[64];
+    unsigned flags;
+    int target, len;
+
+    if (!entry || !dst || dstsz <= 0)
+        return 0;
+    trace_decode(entry, text, sizeof text, &flags, &target);
+    len = snprintf(dst, (size_t)dstsz, "%04X  %-22s A=%02X W=%02X IS=o%02o DC0=%04X DC1=%04X PC1=%04X K=%02X",
+                 entry->pc, text, entry->a, entry->w, entry->isar, entry->dc0, entry->dc1, entry->pc1, entry->k);
+    if (len > 0 && len < dstsz && entry->page >= 0)
+        len += snprintf(dst + len, (size_t)(dstsz - len), " page %d", entry->page);
+    return len < dstsz ? len : dstsz - 1;
+}
+
+int chfdebug_trace_match(const chfdebug_trace *entry, int filter, uint16_t low, uint16_t high)
+{
+    char text[64];
+    unsigned flags;
+    int target;
+
+    if (!entry)
+        return 0;
+    if (filter == CHFDEBUG_TRACE_RANGE)
+    {
+        if (low > high)
+        {
+            uint16_t swap = low;
+            low = high;
+            high = swap;
+        }
+        return entry->pc >= low && entry->pc <= high;
+    }
+    if (filter == CHFDEBUG_TRACE_BRANCHES)
+    {
+        trace_decode(entry, text, sizeof text, &flags, &target);
+        /* LR P0,Q ($0D) jumps through Q without a flag of its own */
+        return flags != 0 || entry->bytes[0] == 0x0d;
+    }
+    return 1;
+}
+
+/* ---- memory search ---------------------------------------------------------------- */
+
+static int match_at(const uint8_t *mem, uint32_t addr, const uint8_t *pat, int patlen, uint8_t mask,
+                    int flags)
+{
+    for (int k = 0; k < patlen; k++)
+    {
+        uint8_t have = mem[addr + (uint32_t)k];
+        uint8_t want = pat[k];
+        if (flags & CHFDEBUG_SEARCH_NOCASE)
+        {
+            if (have >= 'a' && have <= 'z')
+                have = (uint8_t)(have - 32);
+            if (want >= 'a' && want <= 'z')
+                want = (uint8_t)(want - 32);
+        }
+        if ((have & mask) != (want & mask))
+            return 0;
+    }
+    return 1;
+}
+
+/* One space as it reads now, side-effect free; NULL unless stopped. *size is
+ * its length (0 when it has none). */
+static uint8_t *snapshot_space(chfdebug *d, int space, uint32_t *size)
+{
+    uint8_t *mem = NULL;
+    chf_machine_t *m;
+
+    *size = 0;
+    if (space < 0 || space > CHF_SPACE_IO)
+        return NULL;
+    chf_host_lock();
+    m = chfdebug_machine();
+    if (m && atomic_load(&d->stopped))
+    {
+        const uint32_t size_now = chf_machine_space_size(m, space);
+
+        mem = malloc(size_now ? size_now : 1);
+        if (mem)
+        {
+            for (uint32_t pos = 0; pos < size_now; pos++)
+                mem[pos] = chf_machine_peek(m, space, pos);
+            *size = size_now;
+        }
+    }
+    chf_host_unlock();
+    return mem;
+}
+
+static int search_buf(const uint8_t *mem, uint32_t size, const uint8_t *pat, int patlen,
+                      uint8_t mask, int flags, uint32_t from, uint32_t to, uint32_t *out, int max)
+{
+    int found = 0;
+    if (size < (uint32_t)patlen)
+        return 0;
+    if (to > size - (uint32_t)patlen)
+        to = size - (uint32_t)patlen;
+    for (uint32_t pos = from; pos <= to && found < max; pos++)
+        if (match_at(mem, pos, pat, patlen, mask, flags))
+            out[found++] = pos;
+    return found;
+}
+
+int chfdebug_search(chfdebug *d, int space, const uint8_t *pat, int patlen, uint8_t mask, int flags,
+                    uint32_t from, uint32_t to, uint32_t *out, int max)
+{
+    uint8_t *mem;
+    uint32_t size;
+    int found;
+
+    if (!d || !pat || patlen <= 0 || !out || max <= 0)
+        return -1;
+    if ((mem = snapshot_space(d, space, &size)) == NULL)
+        return -1;
+    if (from > to)
+    {
+        uint32_t swap = from;
+        from = to;
+        to = swap;
+    }
+    found = search_buf(mem, size, pat, patlen, mask, flags, from, to, out, max);
+    free(mem);
+    return found;
+}
+
+int chfdebug_search_next(chfdebug *d, int space, const uint8_t *pat, int patlen, uint8_t mask,
+                         int flags, uint32_t from, int backward, uint32_t *found)
+{
+    uint8_t *mem;
+    uint32_t size, hit = 0;
+    int result = 0;
+
+    if (!d || !pat || patlen <= 0 || !found)
+        return -1;
+    if ((mem = snapshot_space(d, space, &size)) == NULL)
+        return -1;
+    if (size >= (uint32_t)patlen)
+    {
+        const uint32_t last = size - (uint32_t)patlen;     /* the last START that fits */
+
+        if (!backward)
+        {
+            /* after `from` to the end, then 0..from (which includes `from`) */
+            if (from < last &&
+                search_buf(mem, size, pat, patlen, mask, flags, from + 1, last, &hit, 1))
+                result = 1;
+            else if (search_buf(mem, size, pat, patlen, mask, flags, 0, from < last ? from : last,
+                                &hit, 1))
+                result = 1;
+        }
+        else
+        {
+            /* the nearest match before `from`, else the last one from `from` up */
+            for (int pass = 0; pass < 2 && !result; pass++)
+            {
+                long start = pass == 0 ? (long)from - 1 : (long)last;
+                long stop = pass == 0 ? 0 : (long)from;
+
+                if (start > (long)last)
+                    start = (long)last;
+                for (long pos = start; pos >= stop; pos--)
+                    if (match_at(mem, (uint32_t)pos, pat, patlen, mask, flags))
+                    {
+                        hit = (uint32_t)pos;
+                        result = 1;
+                        break;
+                    }
+            }
+        }
+    }
+    if (result)
+        *found = hit;
+    free(mem);
+    return result;
+}
+
+/* ---- the memory map ---------------------------------------------------------------- */
+
+enum {
+    RG_BIOS, RG_BIOS_LO, RG_BIOS_HI, RG_ROM, RG_OPEN, RG_RAM, RG_BANKWIN, RG_BANKLATCH,
+    RG_FJ_ROM, RG_FJ_PAGE, RG_FJ_RAM, RG_FJ_REPLY, RG_FJ_STATUS, RG_FJ_REGSEL, RG_FJ_BANKSEL,
+    RG_FJ_SWAP, RG_FJ_REGDATA, RG_FJ_TX
+};
+
+typedef struct {
+    int cls, readable, writable;
+    char name[48];
+} region_info;
+
+/* Which kind of memory answers a PROG read at addr, in the order the bus
+ * resolves it (BIOS, the cartridge's RAM, then its ROM / hotspots). */
+static int region_class(const chf_machine_t *m, const chf_cart_status_t *status, unsigned addr)
+{
+    const chf_cart_t *c = m->cart;
+
+    if (addr < CF_BIOS_SIZE)
+        return !m->have_bios ? RG_BIOS : addr < CF_BIOS_HALF ? RG_BIOS_LO : RG_BIOS_HI;
+    if (m->fujinet)
+    {
+        if (addr < FN_ROM_BASE + FN_ROM_SIZE)
+            return RG_FJ_ROM;
+        if (status->npages && status->page >= 0 && addr >= FN_APP_WIN && addr < FN_APP_WIN + FN_APP_PAGE)
+            return RG_FJ_PAGE;
+        if (addr >= FN_ARENA_BASE)
+        {
+            const unsigned off = addr - FN_ARENA_BASE;
+
+            if (!status->mailbox || off < FN_RAM_TOP)
+                return RG_FJ_RAM;
+            if (off < FN_R_BASE)
+                return RG_FJ_REPLY;
+            if (off < FN_H_REGSEL)
+                return RG_FJ_STATUS;
+            if (off < FN_H_REGSEL + FN_HOT_BANK)
+                return RG_FJ_REGSEL;
+            if (off < FN_H_REGSEL + 0xf0)
+                return RG_FJ_BANKSEL;
+            if (off < FN_H_REGDATA)
+                return RG_FJ_SWAP;
+            if (off < FN_H_DATA)
+                return RG_FJ_REGDATA;
+            return RG_FJ_TX;
+        }
+        return RG_OPEN;
+    }
+    if (!c)
+        return RG_OPEN;
+    if (c->ops->read_ram && addr >= c->ram_lo && addr <= c->ram_hi)
+        return RG_RAM;
+    if (c->ops->write_bank && addr >= c->bank_lo && addr <= c->bank_hi)
+        return RG_BANKLATCH;
+    if (c->type == CHF_CART_MULTI || c->type == CHF_CART_MULTI_OLD)
+        return addr - FN_ROM_BASE < 0x2000 ? RG_BANKWIN : RG_OPEN;
+    return addr - FN_ROM_BASE < c->rom_size ? RG_ROM : RG_OPEN;
+}
+
+static void region_describe(const chf_machine_t *m, const chf_cart_status_t *status, int cls,
+                            region_info *info)
+{
+    const chf_cart_t *c = m->cart;
+
+    memset(info, 0, sizeof *info);
+    info->cls = cls;
+    info->readable = 1;
+    switch (cls)
+    {
+    case RG_BIOS:
+        snprintf(info->name, sizeof info->name, "BIOS stand-in");
+        break;
+    case RG_BIOS_LO:
+        snprintf(info->name, sizeof info->name, "BIOS %s", m->bios_id == CHF_ROM_SL90025 ? "sl90025" : "sl31253");
+        break;
+    case RG_BIOS_HI:
+        snprintf(info->name, sizeof info->name, "BIOS sl31254");
+        break;
+    case RG_ROM:
+        snprintf(info->name, sizeof info->name, "Cartridge ROM");
+        break;
+    case RG_OPEN:
+        info->readable = 0;
+        snprintf(info->name, sizeof info->name, "Open bus");
+        break;
+    case RG_RAM:
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "Cartridge RAM (3853)");
+        break;
+    case RG_BANKWIN:
+    {
+        const int nbanks = c && c->rom_size ? (int)((c->rom_size + 0x1fff) / 0x2000) : 1;
+
+        if (c && c->type == CHF_CART_MULTI)
+            snprintf(info->name, sizeof info->name, "Multicart bank (bank %d/%d half %d)", c->bank, nbanks, c->half);
+        else
+            snprintf(info->name, sizeof info->name, "Multicart bank (bank %d/%d)", c ? c->bank : 0, nbanks);
+        break;
+    }
+    case RG_BANKLATCH:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "Bank latch (write only)");
+        break;
+    case RG_FJ_ROM:
+        snprintf(info->name, sizeof info->name, "FujiNet ROM window");
+        break;
+    case RG_FJ_PAGE:
+        snprintf(info->name, sizeof info->name, "APPBANK page %d/%d", status->page, (int)status->npages);
+        break;
+    case RG_FJ_RAM:
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, status->mailbox ? "FujiNet RAM" : "FujiNet RAM (mailbox dead)");
+        break;
+    case RG_FJ_REPLY:
+        snprintf(info->name, sizeof info->name, "FujiNet REPLY");
+        break;
+    case RG_FJ_STATUS:
+        snprintf(info->name, sizeof info->name, "FujiNet status page");
+        break;
+    case RG_FJ_REGSEL:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "FujiNet REGSEL (write only)");
+        break;
+    case RG_FJ_BANKSEL:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "FujiNet APPBANK_SEL (write only)");
+        break;
+    case RG_FJ_SWAP:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "FujiNet SWAP (write only)");
+        break;
+    case RG_FJ_REGDATA:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "FujiNet REGDATA (write only)");
+        break;
+    default:
+        info->readable = 0;
+        info->writable = 1;
+        snprintf(info->name, sizeof info->name, "FujiNet TXDATA (write only)");
+        break;
+    }
+}
+
+int chfdebug_memory_map(chfdebug *d, chfdebug_region *out, int max)
+{
+    chf_machine_t *m;
+    chf_cart_status_t status;
+    int count = 0;
+    unsigned run_lo = 0;
+    int cur;
+
+    if (!d || !out || max <= 0)
+        return 0;
+    chf_host_lock();
+    m = chfdebug_machine();
+    if (!m)
+    {
+        chf_host_unlock();
+        return 0;
+    }
+    memset(&status, 0, sizeof status);
+    if (m->fujinet)
+        chf_fujinet_status(m->fujinet, &status);
+    cur = region_class(m, &status, 0);
+    for (unsigned addr = 1; addr <= PROG_SIZE; addr++)
+    {
+        const int cls = addr < PROG_SIZE ? region_class(m, &status, addr) : -1;
+
+        if (cls == cur)
+            continue;
+        if (count < max)
+        {
+            region_info info;
+
+            region_describe(m, &status, cur, &info);
+            out[count].low = (uint16_t)run_lo;
+            out[count].high = (uint16_t)(addr - 1);
+            out[count].readable = info.readable;
+            out[count].writable = info.writable;
+            snprintf(out[count].name, sizeof out[count].name, "%s", info.name);
+            count++;
+        }
+        run_lo = addr;
+        cur = cls;
+    }
+    chf_host_unlock();
+    return count;
 }
 
 /* ---- files ------------------------------------------------------------------------ */

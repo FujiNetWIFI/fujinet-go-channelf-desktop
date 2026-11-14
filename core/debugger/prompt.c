@@ -15,6 +15,8 @@
 #include <strings.h>
 #include <time.h>
 
+#include "chfmemtools.h"
+#include "chfvidtab.h"
 #include "debugger_internal.h"
 
 typedef struct {
@@ -37,10 +39,10 @@ static void out(outbuf *o, const char *fmt, ...)
 
 static const char *const commands[] = {
     "help", "step", "over", "out", "run", "stop", "runto", "scanline", "frame",
-    "break", "bpr", "bpw", "bpi", "bpo", "bpv", "bps", "delete", "enable", "disable", "clear",
+    "break", "bpr", "bpw", "bpa", "bpi", "bpo", "bpv", "bps", "delete", "enable", "disable", "clear",
     "breaks", "print", "regs", "set", "mem", "poke", "scratch", "isar", "kstack", "vram", "pal",
     "video", "ports", "sound", "input", "cart", "mailbox", "bios", "romc", "label", "labels",
-    "disasm", "trace", "save", NULL,
+    "disasm", "trace", "watch", "unwatch", "find", "save", NULL,
 };
 
 static const char *help_text =
@@ -52,6 +54,7 @@ static const char *help_text =
     "scanline [n] | frame [n]   run until the beam has moved n lines / n frames\n"
     "break <addr>[-<end>] [cond]            execute breakpoint\n"
     "bpr | bpw <addr>[-<end>] [cond]        PROG-space data read / write (the cartridge's RAM)\n"
+    "bpa <addr>[-<end>] [cond]              PROG-space read or write (Access)\n"
     "bpi | bpo <port>[-<end>] [cond]        port read / write (IN, INS / OUT, OUTS)\n"
     "bpv <row>,<col>[-<row>,<col>] [cond]   VRAM write (a strobe) into a cell range\n"
     "bps <reg>[-<end>] [cond]               scratchpad write: r12, r12-r15, 59\n"
@@ -72,12 +75,14 @@ static const char *help_text =
     "label <addr> [name] | labels [file]\n"
     "disasm [addr] [n]\n"
     "trace [on|off|clear|n] record / show the last n instructions\n"
+    "watch [space] [expr|lo-hi]  add to / list the watch list; unwatch <n|all>\n"
+    "find [space] [hex] <bytes> | find [space] text <string>   search a stopped space\n"
     "save <dis|mailbox|vram|scratch|cart|screen|vramshot|regs> <file>\n"
     "Expressions: $0800 0x800 800h 2048 %1010 o17; registers a w is isar pc pc0 pc1 dc0 dc1\n"
     "j h k q hu hl ku kl qu ql, flags icb o z c s, r0-r63; [addr] a PROG byte; p[addr] s[reg]\n"
     "v[row*128+col] c[off] io[port] the five spaces; labels and port names (PANEL, ROW_SOUND);\n"
-    "vpos hpos frame cycles; in a condition value and addr (row and col for bpv, port for\n"
-    "bpi/bpo); C operators.\n";
+    "vpos hpos frame cycles; in a condition value, old (before a write) and addr (row, col for bpv,\n"
+    "port for bpi/bpo); C operators.\n";
 
 static char *next_tok(char **p)
 {
@@ -166,6 +171,31 @@ static int space_by_name(const char *n)
 
 static const char *const space_label[5] = { "prog", "scratch", "vram", "cart", "io" };
 
+/* An optional leading space word ("scratch r12", "vram 10,20") on a watch or
+ * find: its space, with *text moved past it; PROG when there is none. A single
+ * letter is not one (p, s, v, c may be labels). */
+static int watch_space(char **text)
+{
+    char *word_start = *text, *word_end = word_start;
+    int space;
+
+    while (*word_end && !isspace((unsigned char)*word_end))
+        word_end++;
+    if (word_end - word_start >= 2 && word_end - word_start < 10)
+    {
+        char word[10];
+        memcpy(word, word_start, (size_t)(word_end - word_start));
+        word[word_end - word_start] = '\0';
+        space = space_by_name(word);
+        if (space >= 0)
+        {
+            *text = rest_of(word_end);
+            return space;
+        }
+    }
+    return CHF_SPACE_PROG;
+}
+
 static void show_regs(chfdebug *d, outbuf *o)
 {
     chfdebug_cpu c;
@@ -238,8 +268,13 @@ static void list_breaks(chfdebug *d, outbuf *o)
     {
         char kinds[16] = "";
         if (bp[i].type & CHFDEBUG_BP_EXEC)    strcat(kinds, "x");
-        if (bp[i].type & CHFDEBUG_BP_READ)    strcat(kinds, "r");
-        if (bp[i].type & CHFDEBUG_BP_WRITE)   strcat(kinds, "w");
+        if ((bp[i].type & CHFDEBUG_BP_ACCESS) == CHFDEBUG_BP_ACCESS)
+            strcat(kinds, "a");
+        else
+        {
+            if (bp[i].type & CHFDEBUG_BP_READ)    strcat(kinds, "r");
+            if (bp[i].type & CHFDEBUG_BP_WRITE)   strcat(kinds, "w");
+        }
         if (bp[i].type & CHFDEBUG_BP_IN)      strcat(kinds, "in");
         if (bp[i].type & CHFDEBUG_BP_OUT)     strcat(kinds, "out");
         if (bp[i].type & CHFDEBUG_BP_VRAM)    strcat(kinds, "vram");
@@ -528,6 +563,8 @@ int chfdebug_command(chfdebug *d, const char *command, char *dst, int dstsz)
         add_bp(d, &o, CHFDEBUG_BP_READ, CHF_SPACE_PROG, p);
     else if (!strcmp(cmd, "bpw"))
         add_bp(d, &o, CHFDEBUG_BP_WRITE, CHF_SPACE_PROG, p);
+    else if (!strcmp(cmd, "bpa"))
+        add_bp(d, &o, CHFDEBUG_BP_ACCESS, CHF_SPACE_PROG, p);
     else if (!strcmp(cmd, "bpi"))
         add_bp(d, &o, CHFDEBUG_BP_IN, CHF_SPACE_IO, p);
     else if (!strcmp(cmd, "bpo"))
@@ -688,7 +725,34 @@ int chfdebug_command(chfdebug *d, const char *command, char *dst, int dstsz)
     else if (!strcmp(cmd, "pal"))
         o.len += chfdebug_text_pal(dst + o.len, dstsz - o.len);
     else if (!strcmp(cmd, "video"))
-        o.len += chfdebug_text_video(dst + o.len, dstsz - o.len);
+    {
+        /* a short-lived Video tab: it reads the machine and goes away */
+        char *arg = next_tok(&p);
+        int section = CHFVID_S_REGISTERS;
+        if (arg)
+        {
+            section = chfvid_section_from_name(arg);
+            if (section < 0)
+            {
+                out(&o, "video: pixel, registers, colours, lines, writes or timing\n");
+                return o.len;
+            }
+        }
+        chfvid_tab *tab = chfvid_tab_new(d);
+        if (!tab)
+            out(&o, "video: not available\n");
+        else
+        {
+            static char text[16384];
+            chfvid_tab_refresh(tab, 1);
+            int len = chfvid_tab_text(tab, section, text, (int)sizeof text);
+            chfvid_tab_free(tab);
+            if (len > 0)
+                out(&o, "%s\n", text);
+            else
+                out(&o, "video: no frame yet\n");
+        }
+    }
     else if (!strcmp(cmd, "ports"))
         o.len += chfdebug_text_ports(dst + o.len, dstsz - o.len);
     else if (!strcmp(cmd, "sound"))
@@ -775,6 +839,77 @@ int chfdebug_command(chfdebug *d, const char *command, char *dst, int dstsz)
                     tr[i].a, tr[i].w, tr[i].isar, tr[i].dc0);
             }
         }
+    }
+    else if (!strcmp(cmd, "watch"))
+    {
+        char *text = rest_of(p);
+        int space = watch_space(&text);
+
+        if (*text && chfwatch_add(space, text) < 0)
+            out(&o, "no room for another watch\n");
+        if (!chfwatch_count())
+            out(&o, "no watches (watch [prog|scratch|vram|cart|io] <addr|label|lo-hi>)\n");
+        else
+            for (int i = 0; i < chfwatch_count(); i++)
+            {
+                char line[160];
+                chfwatch_format(d, i, line, sizeof line);
+                out(&o, "%2d  %s\n", i, line);
+            }
+    }
+    else if (!strcmp(cmd, "unwatch"))
+    {
+        char *token = next_tok(&p);
+        if (token && !strcmp(token, "all"))
+            chfwatch_clear();
+        else if (token && eval(d, &o, token, &v))
+            return o.len;
+        else if (token)
+            chfwatch_remove((int)v);
+        else
+            out(&o, "unwatch <n|all>\n");
+    }
+    else if (!strcmp(cmd, "find"))
+    {
+        char *text = rest_of(p), *token;
+        const int space = watch_space(&text);
+        int kind = CHFSEARCH_HEX, count = 0, flags = 0, found;
+        uint8_t pat[CHFSEARCH_MAX], mask;
+        uint32_t hit[32];
+        char joined[160];
+
+        p = text;
+        token = next_tok(&p);
+        if (token && !strcmp(token, "text"))
+        {
+            kind = CHFSEARCH_TEXT;
+            token = rest_of(p);
+        }
+        else if (token && !strcmp(token, "hex"))
+            token = rest_of(p);
+        else if (token)
+        {
+            snprintf(joined, sizeof joined, "%s %s", token, rest_of(p));
+            token = joined;
+        }
+        if (!token || !*token || !chfsearch_parse(kind, token, pat, &count, &mask, &flags))
+        {
+            out(&o, "find [space] [hex] <bytes> | find [space] text <string>\n");
+            return o.len;
+        }
+        found = chfdebug_search(d, space, pat, count, mask, flags, 0, 0xffffffffu, hit, 32);
+        if (found < 0)
+            out(&o, "stop the machine first\n");
+        else if (!found)
+            out(&o, "not found\n");
+        else
+            for (int i = 0; i < found; i++)
+            {
+                if (space == CHF_SPACE_PROG)
+                    out(&o, "$%04X\n", hit[i]);
+                else
+                    out(&o, "%s $%X\n", space_label[space], hit[i]);
+            }
     }
     else if (!strcmp(cmd, "save"))
     {

@@ -26,6 +26,12 @@ chf_test(debug_test debug_test.c)
 add_test(NAME debug COMMAND debug_test)
 set_tests_properties(debug PROPERTIES TIMEOUT 120)
 
+# The debugger's memory tools (core/include/chfmemtools.h): search parsing, the
+# space-aware range parser, the watch list, trace filters, breakpoint text and
+# region names. No machine.
+chf_test(memtools_test memtools_test.c)
+add_test(NAME memtools COMMAND memtools_test)
+
 # The FujiNet trace the way the Cart tab reads it, through a whole session with an
 # EXTERNAL FujiNet (the cartridge dials a stand-in on loopback, no built-in
 # runtime): it fills from session start with no window open, survives an attach

@@ -1,7 +1,6 @@
 /*
- * The Win32 debugger window over the F8 / Channel F video debugger engine
- * (chfdebug.h): eight tabs -- Prompt, CPU & RAM, Disassembly, Video,
- * Sound & I/O, Breakpoints, Cart, FujiNet.
+ * The Win32 debugger window over the CDP1802 / CDP1861 debugger engine
+ * (chfdebug.h).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later

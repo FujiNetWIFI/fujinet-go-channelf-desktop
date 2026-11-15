@@ -1,30 +1,60 @@
 /*
- * Debugger window (Win32) over the Fairchild F8 / Channel F video debugger
- * engine, via core/include/chfdebug.h. Mirrors the GTK and Qt debuggers tab
- * for tab -- Prompt, CPU & RAM, Disassembly, Video, Sound & I/O, Breakpoints,
- * Cart, FujiNet -- built from plain common controls, with the disassembly,
- * the video picture, the scratchpad grid, the row palette strip and the
- * controllers' lamps drawn by hand. A Help button (and F1) opens the Help
- * topic of the tab showing.
+ * Debugger window (Win32) over the F8 / Channel F video debugger engine, via
+ * core/include/chfdebug.h. Mirrors the GNOME, Qt and Studio II debuggers tab
+ * for tab -- Console, Disassembly, Memory, Breakpoints, Watches, Cart & I/O,
+ * Trace, History, Video, Sound, Symbols, FujiNet -- built from plain common
+ * controls, with the disassembly, the memory dump, the scratchpad grid and the
+ * video pictures drawn by hand. The registers and flags sit in a strip under
+ * the tabs, on every tab.
  *
- * The Video tab is the showpiece: the six views of the 128 x 64 video RAM
- * (the frame the display shows, the RAM live, the beam's CRT, the whole RAM,
- * its raw values, the palettes) at a chosen scale with the overlays, a hover
- * that names the cell under the pointer and its last writer, a click that
- * pins it and a double click that breaks on writes to it; beside it the 64 row
- * palettes, the four palettes, the four ports as raw, complement and decoded,
- * and the log of VRAM writes.
+ * Each tab's controls are children of a container window of their own, so
+ * Pop Out can SetParent a tab into a window titled "Channel F Debugger - <Tab>"
+ * (Dock, or closing that window, puts it back in its place; one tab always
+ * stays).
  *
- * The engine only exists while this window is showing: showing it attaches
- * (which stops the machine, as on every sibling) and hiding it detaches,
- * which lets the machine run on at full speed. The window refreshes on a
- * timer keyed to the engine's generation counter rather than on every tick,
- * only the tab that is showing, and the timer exists only while the window
- * does.
+ * The engine only engages while this window is showing: showing it attaches
+ * (which stops the machine, as on every sibling) and hiding it (the close
+ * box, F12, or the main window's F12 / View menu item, which toggles it)
+ * detaches, which lets the machine run on at full speed. The toolbar carries
+ * a single Stop/Run button (the accent while stopped), the stepping controls
+ * (Step, Step Over, Step Out, Run to Cursor, Scanline, Frame), Clear
+ * Breakpoints, a "Break at" box, symbol loading and clearing, and the save
+ * menu; F5 F7 F8 Shift+F8 Shift+F7 F9 F12 work wherever the focus is inside
+ * the window (chf_debugger_pretranslate).
  *
- * Everything is laid out in 96-dpi units scaled by the window's DPI (the
- * manifest makes the process per-monitor aware), and every control is a
- * Unicode window so the engine's UTF-8 reaches the screen as it is.
+ * A 100 ms timer polls the engine's generation counter (never its stop
+ * callback, which fires off the UI thread) and refreshes the tab showing,
+ * and only that one, when something changed; while the machine runs it
+ * refreshes the live values of that tab twice a second. Every new stop
+ * (chfdebug_stop_serial) brings every view to the spot: the Disassembly to
+ * the PC, the Memory dump to the PC's neighbourhood, Trace and History to
+ * their newest line. After a step the window waits a few milliseconds for
+ * the stop to settle so the status does not flash "Running".
+ *
+ * Memory has the five address spaces (PROG, SCRATCH, VRAM, CART, IO); Go To,
+ * Find, Poke, the highlights and Show in Memory apply to the space selected.
+ * With SCRATCH selected the 8 x 8 octal scratchpad grid (the ISAR cell
+ * outlined, changed cells in the accent, the BIOS K stack shaded; click a
+ * cell to poke it) and the K-stack list sit above the dump.
+ *
+ * The Video tab (dbg_video.c, over core/include/chfvidtab.h: a picture in
+ * five views, an inspector, ports, colours, lines, writes and timing) and the
+ * FujiNet tab (every FujiBus packet on the BoIP link, both ways) carry over.
+ * Address fields take a label, else bare hex, else the engine's grammar ($ or
+ * 0x, registers, arithmetic); the register and byte boxes show hex without a
+ * prefix and read it back the same way (the ISAR in octal). Only the console
+ * reads bare digits as decimal.
+ *
+ * CHF_DEBUGGER_TAB (a tab number, or the start of a tab's name or label, in
+ * any case; the old prompt cpu ram io sound still work) picks the tab the
+ * window opens on: 0 Console, 1 Disassembly, 2 Memory, 3 Breakpoints,
+ * 4 Watches, 5 Cart & I/O, 6 Trace, 7 History, 8 Video, 9 Sound, 10 Symbols,
+ * 11 FujiNet. For captures: CHF_WATCH (a comma-separated list of watches to
+ * add, each optionally prefixed prog: scratch: vram: cart: io:),
+ * CHF_WATCH_BREAK (a watch added and a break-on-change armed over it),
+ * CHF_MEM_GOTO (the Memory tab's Go to), CHF_MEM_SPACE (the Memory space),
+ * CHF_HISTORY=1 (recording on) and CHF_POPOUT (a tab to pop out, named like
+ * CHF_DEBUGGER_TAB). The Video tab reads CHF_DEBUGGER_VIDEO_*.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -37,123 +67,353 @@
 #include <windowsx.h>
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
 
+#include "chfdebug.h"
+#include "chfmemtools.h"
+#include "chfsession.h"
+#include "dbg_video.h"
+#include "dbg_widgets.h"
+#include "resource.h"
 #include "../help/help_window.h"
-#include "dbg_internal.h"
 
-#ifndef EM_SETCUEBANNER
-#define EM_SETCUEBANNER 0x1501
-#endif
+/* The Channel F tan (CHFSESSION_ACCENT_RGB) is pale: dark ink on tan fills, the dark accent for outlines. */
+#define CHF_ACCENT_COLORREF RGB((CHFSESSION_ACCENT_RGB >> 16) & 255, (CHFSESSION_ACCENT_RGB >> 8) & 255, CHFSESSION_ACCENT_RGB & 255)
+#define CHF_ACCENT_TEXT RGB(0x14, 0x14, 0x14)
+#define CHF_ACCENT_DARK_COLORREF RGB((CHFSESSION_ACCENT_DARK_RGB >> 16) & 255, (CHFSESSION_ACCENT_DARK_RGB >> 8) & 255, CHFSESSION_ACCENT_DARK_RGB & 255)
 
+static HBRUSH chf_accent_brush(void)
+{
+    static HBRUSH brush;
+    if (!brush) brush = CreateSolidBrush(CHF_ACCENT_COLORREF);
+    return brush;
+}
+
+static HBRUSH chf_accent_hot_brush(void)
+{
+    static HBRUSH brush;
+    if (!brush) brush = CreateSolidBrush(RGB(0xF2 + (255 - 0xF2) / 3, 0xC3 + (255 - 0xC3) / 3, 0x00 + (255 - 0x00) / 3));
+    return brush;
+}
+
+static HBRUSH chf_accent_dark_brush(void)
+{
+    static HBRUSH brush;
+    if (!brush) brush = CreateSolidBrush(CHF_ACCENT_DARK_COLORREF);
+    return brush;
+}
+
+/* A checkable push button's NM_CUSTOMDRAW: the accent while it is on, the
+ * stock look (and focus, hover and press) while off. */
+static LRESULT chf_accent_customdraw(const NMCUSTOMDRAW *cd, int on)
+{
+    char text[64];
+    RECT r;
+    if (cd->dwDrawStage != CDDS_PREPAINT || !on) return CDRF_DODEFAULT;
+    r = cd->rc;
+    FillRect(cd->hdc, &r, (cd->uItemState & CDIS_HOT) ? chf_accent_hot_brush() : chf_accent_brush());
+    FrameRect(cd->hdc, &r, chf_accent_dark_brush());
+    SetBkMode(cd->hdc, TRANSPARENT);
+    SetTextColor(cd->hdc, CHF_ACCENT_TEXT);
+    text[0] = '\0';
+    GetWindowTextA(cd->hdr.hwndFrom, text, sizeof text);
+    {
+        HFONT f = (HFONT)SendMessageA(cd->hdr.hwndFrom, WM_GETFONT, 0, 0);
+        HGDIOBJ old = f ? SelectObject(cd->hdc, f) : NULL;
+        DrawTextA(cd->hdc, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        if (old) SelectObject(cd->hdc, old);
+    }
+    if (GetFocus() == cd->hdr.hwndFrom) {
+        InflateRect(&r, -3, -3);
+        DrawFocusRect(cd->hdc, &r);
+    }
+    return CDRF_SKIPDEFAULT;
+}
+
+#define DISASM_MAX 96        /* rows fetched at most; the view shows what fits */
+#define MEM_BYTES 0x20000    /* the biggest space (CART), 16 bytes a row */
+#define MEM_MAX_LINES (MEM_BYTES / 16 + 1)
+#define EVENTS_MAX 400       /* sound, I/O and cartridge events listed */
+#define NSPACES 5            /* PROG SCRATCH VRAM CART IO */
+#define MAX_BPS 128
+#define HISTORY_MAX 64
 #define TRACE_MAX 512        /* FujiNet packets shown */
-#define MAILBOX_BASE 0xF800  /* the cartridge's mailbox page, as the console reads it */
-#define MAILBOX_SIZE 0x800
+#define HIST_RING 65536      /* the engine's instruction ring */
+#define HIST_SHOWN 2000      /* the newest matching lines a Trace/History tab shows */
+#define HIST_TICKS 4         /* the Trace tab, every ~400 ms while the machine runs */
+#define MEM_REGION_MAX 64    /* regions of the memory map held */
+#define SYMBOL_MAX 4096      /* symbols the Symbols tab lists at most */
+#define CONSOLE_KEEP (256 * 1024)
+#define NOTICE_MS 4000       /* how long a notice holds the status line */
+
+/* A disassembly row's columns, in characters: address, bytes, label, the
+ * instruction, and the comment. */
+#define COL_BYTES 6
+#define COL_LABEL 19
+#define LABEL_W 22
+#define COL_DISASM (COL_LABEL + LABEL_W + 1)
+#define COMMENT_COL (COL_DISASM + 30)
+
+/* Sizes at 96 dpi; S() scales them to the window's. */
+#define GUTTER_W 18          /* the disassembly's breakpoint column */
+#define MONO_PX 13           /* the monospace font */
+#define START_W 1400
+#define START_H 800
 
 #define WM_DBG_ACCEPT  (WM_APP + 2)   /* wp: control id -- Enter in an edit */
-#define WM_DBG_TAB     (WM_APP + 3)   /* Tab in the prompt: complete */
-#define WM_DBG_HISTORY (WM_APP + 4)   /* wp: 0 Up (older), 1 Down (newer) in the prompt */
+#define WM_DBG_TAB     (WM_APP + 3)   /* Tab in the console: complete */
+#define WM_DBG_HISTORY (WM_APP + 4)   /* wp: 0 Up (older), 1 Down (newer) in the console */
+#define WM_DBG_SYNC    (WM_APP + 5)   /* resync once a list's notification is over */
+/* (WM_APP + 6 is dbg_widgets.h's WM_DBG_SCRATCH_PICK) */
 
 #define TIMER_REFRESH 1
-#define TICKS_SLOW 5                  /* running: the slow pages every 5th 100 ms tick */
 
+#define DBG_CLASS "ChfDebuggerWindow"
+#define DISASM_CLASS "ChfDbgDisasm"
+#define MEMVIEW_CLASS "ChfDbgMem"
+#define PAGE_CLASS "ChfDbgPage"
+#define POP_CLASS "ChfDbgPop"
+
+enum { TAB_CONSOLE, TAB_DISASM, TAB_MEMORY, TAB_BREAKS, TAB_WATCHES, TAB_CART, TAB_TRACE, TAB_HISTORY,
+       TAB_VIDEO, TAB_SOUND, TAB_SYMBOLS, TAB_FUJINET, TAB_COUNT };
+
+/* The tabs, in order: the names CHF_DEBUGGER_TAB takes, and their labels
+ * (which it takes too). */
+static const struct { const char *name, *label; } k_tabs[TAB_COUNT] = {
+    { "console", "Console" }, { "disassembly", "Disassembly" }, { "memory", "Memory" },
+    { "breakpoints", "Breakpoints" }, { "watches", "Watches" }, { "cart", "Cart & I/O" },
+    { "trace", "Trace" }, { "history", "History" }, { "video", "Video" }, { "sound", "Sound" },
+    { "symbols", "Symbols" }, { "fujinet", "FujiNet" },
+};
+
+#define NREGS 7             /* A W ISAR PC0 PC1 DC0 DC1 */
+#define NCHECKS 5           /* S C Z O ICB */
 #define NSAVE 8
 
 enum {
-    IDC_RUN = 1000, IDC_STEP, IDC_OVER, IDC_OUT, IDC_SCAN, IDC_FRAME, IDC_TORUN, IDC_LOAD_SYMBOLS, IDC_SAVE,
-    IDC_HELP_BTN, IDC_STATUS, IDC_TABS,
-    IDC_PROMPT_OUT, IDC_PROMPT_IN,
-    IDC_FIELD0, IDC_FIELD_LAST = IDC_FIELD0 + NFIELDS - 1,
-    IDC_FLAG0, IDC_FLAG_LAST = IDC_FLAG0 + NFLAGS - 1,
-    IDC_CPU_STATE, IDC_SCR_GRID, IDC_SCR_REG, IDC_SCR_VAL, IDC_KSTACK,
-    IDC_MEM_VIEW, IDC_RAM_SPACE, IDC_RAM_GOTO, IDC_RAM_PREV, IDC_RAM_NEXT, IDC_RAM_ADDR, IDC_RAM_VAL,
+    IDC_RUN = 1000, IDC_STEP, IDC_OVER, IDC_OUT, IDC_RUN_TO, IDC_FRAME, IDC_SYMBOLS, IDC_SAVE,
+    IDC_STATUS, IDC_TABS, IDC_TOGGLE_BP, IDC_HELP_BTN, IDC_POPOUT, IDC_DOCK, IDC_SCANLINE, IDC_CLEAR_BPS,
+    IDC_BREAK_AT, IDC_CLEAR_SYMBOLS, IDC_SYM_FILTER, IDC_SYM_LIST,
+    IDC_CON_OUT, IDC_CON_PROMPT, IDC_CON_IN,
+    IDC_REG0, IDC_REG_LAST = IDC_REG0 + NREGS - 1,
+    IDC_CHK0, IDC_CHK_LAST = IDC_CHK0 + NCHECKS - 1,
+    IDC_MEM_VIEW, IDC_MEM_GOTO, IDC_MEM_WRITE,
     IDC_FOLLOW_PC, IDC_JUMP, IDC_DISASM,
-    IDC_VIEW_MODE, IDC_SCALE_MODE, IDC_OVL0, IDC_OVL_LAST = IDC_OVL0 + NOVERLAYS - 1,
-    IDC_VPIC, IDC_VSTATUS, IDC_VTABS,
-    IDC_HOVER_TEXT, IDC_PIN_TEXT, IDC_PIN_BREAK, IDC_PIN_CLEAR, IDC_ROWS_VIEW, IDC_PAL_TEXT, IDC_PORTS_TEXT,
-    IDC_WR_ROW0, IDC_WR_ROW1, IDC_WR_COL0, IDC_WR_COL1, IDC_WR_CHANGES, IDC_WR_FRAME, IDC_WR_PALCOLS,
-    IDC_WR_CLEAR, IDC_WR_TEXT,
-    IDC_IO_DRAW, IDC_IO_STATE, IDC_SND_LOG, IDC_IO_LOG, IDC_IO_CLEAR,
-    IDC_BP_LIST, IDC_BP_TYPE, IDC_BP_START, IDC_BP_END, IDC_BP_COND, IDC_BP_ADD,
-    IDC_BP_REMOVE, IDC_BP_ENABLE, IDC_BP_CLEAR,
-    IDC_CART_TEXT, IDC_CART_MAILBOX, IDC_CART_EVENTS,
-    IDC_FUJI_NOTE, IDC_FUJI_CLEAR, IDC_FUJI_TEXT, IDC_FUJI_STATE,
+    IDC_BP_LIST, IDC_BP_REMOVE, IDC_BP_CLEAR, IDC_BP_TYPE, IDC_BP_START, IDC_BP_END, IDC_BP_COND,
+    IDC_BP_ADD, IDC_BP_CLEAR_HITS,
+    IDC_WT_ENTRY, IDC_WT_ADD, IDC_WT_LIST, IDC_WT_REMOVE, IDC_WT_MEM, IDC_WT_BRK,
+    IDC_SRCH_KIND, IDC_SRCH_ENTRY, IDC_SRCH_NEXT, IDC_SRCH_PREV, IDC_MEM_SPACE, IDC_SCRATCH, IDC_KSTACK,
+    IDC_WT_SPACE,
+    IDC_CART_TEXT, IDC_CART_MAILBOX, IDC_CART_EVENTS, IDC_CART_PORTS, IDC_IO_LOG, IDC_LAMPS,
+    IDC_SOUND_TEXT, IDC_SOUND_LEVEL, IDC_SOUND_LOG,
+    IDC_H_REC0, IDC_H_REC1, IDC_H_CLEAR0, IDC_H_CLEAR1, IDC_H_FILTER0, IDC_H_FILTER1, IDC_H_RANGE0, IDC_H_RANGE1,
+    IDC_H_TEXT0, IDC_H_TEXT1,
+    IDC_FUJI_CLEAR, IDC_FUJI_TEXT, IDC_FUJI_STATE,
     IDC_SAVE_KIND0, IDC_SAVE_KIND_LAST = IDC_SAVE_KIND0 + NSAVE - 1,
-    IDC_SYMS_CART, IDC_SYMS_FILE,
-    IDC_LABEL_FIRST = 3000
+    IDC_LABEL_FIRST
 };
 
-debugger *g_debugger;
+typedef struct {
+    HWND hwnd, tabs;
+    HWND run_btn, step_btn, over_btn, out_btn, run_to_btn, scan_btn, frame_btn, clear_bps_btn, break_at_label, break_at, sym_btn,
+         clear_sym_btn, save_btn, popout_btn, help_btn, status;
 
-static const char *const kSaveKinds[NSAVE] = { "dis", "mailbox", "vram", "scratch", "cart", "screen", "vramshot", "regs" };
-static const char *const kSaveTitles[NSAVE] = {
-    "Disassembly (PROG space)...", "Mailbox page...", "Video RAM (8192 bytes)...", "Scratchpad (64 bytes)...",
-    "Cartridge image...", "Screen (PPM)...", "Video RAM picture (PPM)...", "Registers and ports (text)..." };
+    /* Each tab's controls are children of a container of its own, so a tab can
+     * be peeled off into a window (SetParent) and put back. */
+    HWND pg[TAB_COUNT];
+    HWND popped[TAB_COUNT];     /* the window a tab lives in, or NULL */
+    int tab_page[TAB_COUNT];    /* the tab at each tab-control index */
+    int ntabs;
+    HWND new_parent;            /* where child() puts the next control */
 
-/* The editable CPU fields, in the order the CPU page lays them out. */
-typedef struct { const char *name; int reg; int digits; int octal; } cpu_field;
-static const cpu_field kFields[NFIELDS] = {
-    { "PC", CHF_REG_PC, 4, 0 }, { "PC0", CHF_REG_PC0, 4, 0 }, { "PC1", CHF_REG_PC1, 4, 0 },
-    { "DC0", CHF_REG_DC0, 4, 0 }, { "DC1", CHF_REG_DC1, 4, 0 }, { "A", CHF_REG_A, 2, 0 },
-    { "W", CHF_REG_W, 2, 0 }, { "ISAR", CHF_REG_ISAR, 3, 1 }, { "J", CHF_REG_J, 2, 0 },
-    { "H", CHF_REG_H, 4, 0 }, { "K", CHF_REG_K, 4, 0 }, { "Q", CHF_REG_Q, 4, 0 } };
-static const char *const kFlagNames[NFLAGS] = { "S (positive)", "C", "Z", "O", "ICB" };
-static const int kFlagIds[NFLAGS] = { CHF_REG_SIGN, CHF_REG_CARRY, CHF_REG_ZERO, CHF_REG_OVERFLOW, CHF_REG_ICB };
+    /* console */
+    HWND con_out, con_prompt, con_in;
+    char history[HISTORY_MAX][256];
+    int nhistory, history_pos;
 
-/* The page names CHF_DEBUGGER_TAB accepts, by page, and the Help contexts. */
-static const char *const kPageNames[PAGE_COUNT] = { "prompt", "cpu", "disassembly", "video", "io",
-                                                    "breakpoints", "cart", "fujinet" };
-static const char *const kHelpContexts[PAGE_COUNT] = {
-    "debugger/prompt", "debugger/cpu", "debugger/disassembly", "debugger/video", "debugger/io",
-    "debugger/breakpoints", "debugger/cart", "debugger/fujinet" };
-static const wchar_t *const kPageTitles[PAGE_COUNT] = {
-    L"Prompt", L"CPU && RAM", L"Disassembly", L"Video", L"Sound && I/O", L"Breakpoints", L"Cart",
-    L"FujiNet" };
-static const wchar_t *const kSectionTitles[SEC_COUNT] = { L"Cell", L"Rows && palettes", L"Ports", L"Writes" };
+    /* the registers strip, under the tabs */
+    HWND reg_label[NREGS], reg[NREGS], chk[NCHECKS], kdepth, beam;
+    int strip_rows;             /* register rows the strip's last layout used */
 
-static const wchar_t *const kSpaceNames[NSPACES] = {
-    L"Program (CPU view)", L"Scratchpad", L"Video RAM", L"Cartridge", L"I/O ports" };
-static const wchar_t *const kViewNames[NVIEWS] = {
-    L"Frame (what the display shows)", L"Live (the video RAM now)", L"Beam (what a CRT shows)",
-    L"VRAM (all 128 x 64 cells)", L"Values (raw, false colour)", L"Palettes" };
-static const wchar_t *const kScaleNames[NSCALES] = { L"Fit", L"1x", L"2x", L"3x", L"4x" };
-static const wchar_t *const kOverlayNames[NOVERLAYS] = {
-    L"Visible area", L"Grid", L"Palette columns", L"Beam", L"Write cursor", L"Heat", L"Dirty", L"Palette rows" };
-static const wchar_t *const kBpTypes[NBPTYPES] = {
-    L"Execute", L"Read", L"Write", L"Port in", L"Port out", L"VRAM write", L"Scratchpad write" };
-static const char *const kBpHints[NBPTYPES] = {
-    "Address in hex ($0802) or a label; a range runs to the second address.",
-    "A data read of PROG space: address in hex ($8000) or a label.",
-    "A write to PROG space (the cartridge's RAM): address in hex or a label.",
-    "A port read: the port in hex ($01); a range runs to the second port.",
-    "A port write: the port in hex ($05); a range runs to the second port.",
-    "A write to a cell: row,col in decimal (12,40); a range is the rectangle between two cells.",
-    "A write to a scratchpad register: 0-63 in decimal (59), or r59; a range runs to the second." };
+    /* memory */
+    HWND mem_title, mem_space, mem_view, goto_label, mem_goto, write_label, mem_write;
+    HWND srch_kind, srch_entry, srch_next, srch_prev, srch_note;
+    HWND scratch, kstack_head, kstack;
+    int mem_sp;                 /* the space showing: CHF_SPACE_* */
+    int mem_digits;             /* hex digits of an address in it */
+    int mem_size;               /* its size in bytes */
+    int mem_hl;                 /* a highlighted range (Go to, Find, a watch) */
+    int mem_hl_space;           /* ... and the space it was made in */
+    uint32_t mem_hl_lo, mem_hl_hi;
+    uint8_t *mem_buf;           /* what the dump shows (MEM_BYTES) */
+    chfdebug_region mem_map[MEM_REGION_MAX];   /* the memory map the rows are labelled from (PROG) */
+    int mem_map_count;
+    chfdebug_cpu cpu;           /* as last read */
+    uint8_t prev_r[64];         /* the scratchpad before the last change, so changed cells show */
+    int prev_valid;
+    uint64_t changed_mask;      /* scratchpad cells that changed since the registers last differed */
+    int mem_first;              /* the dump's first visible text line */
+    int mem_follow;             /* scroll the highlight into view on the next refresh */
+    int mem_recentre;           /* a stop happened: bring the PC's row into view */
 
-/* ---- text helpers ----------------------------------------------------------- */
+    /* disassembly */
+    HWND follow_pc, jump_label, jump, disasm_hint, disasm;
+    int disasm_top;             /* address of the first disassembly line */
+    int recentre;               /* a stop happened: bring the PC into view */
+    uint64_t stop_serial;       /* the last stop the window followed */
+    int selected;               /* the selected line's address, or -1 */
+    chfdebug_line lines[DISASM_MAX];
+    int line_count, pc_line;
 
-/* UTF-8 into a fixed wide buffer, always terminated. */
-void dbg_wide_from(const char *utf8, wchar_t *w, int n)
+    /* video: the page holds its own controls (dbg_video.c) */
+    HWND video;
+
+    /* sound */
+    HWND sound_text, sound_level, sound_log_label, sound_log;
+    chfdebug_io io;
+    chfdebug_video vid;
+
+    /* cart & I/O: the cartridge, the mailbox page, the controllers, the ports and their logs */
+    HWND cart_mailbox_label, cart_mailbox, lamps, ports_label, ports_text;
+    HWND cart_ev_label, cart_events, io_log_label, io_log;
+    chfdebug_cart cart_state;
+    chfdebug_sound_event snd_events[EVENTS_MAX];
+    int nsnd;
+    chfdebug_io_event io_events[EVENTS_MAX];
+    int nio;
+    chfdebug_cart_event cart_events_buf[EVENTS_MAX];
+    int ncart_ev;
+
+    /* symbols */
+    HWND sym_filter_label, sym_filter, sym_count, sym_list;
+    int sym_indices[SYMBOL_MAX];
+    int sym_shown;
+    char sym_sig[128];
+    int sym_force;              /* rebuild the list even if its signature held (symbols loaded) */
+
+    /* breakpoints */
+    HWND bp_hint, bp_stop, bp_remove, bp_clear, bp_clear_hits, bp_list, bp_empty;
+    HWND bp_type, bp_start, bp_end, bp_cond, bp_add, bp_msg;
+    chfdebug_breakpoint bps[MAX_BPS];
+    int nbps;
+    char bp_sig[MAX_BPS * 200]; /* what the list shows, to rebuild on change */
+    int bp_sig_ok;
+
+    /* watches */
+    HWND wt_label, wt_space, wt_entry, wt_add, wt_list, wt_remove, wt_mem, wt_brk, wt_msg;
+    char wt_sig[CHFWATCH_MAX * 120];
+    int wt_sig_ok;
+
+    /* cart & I/O */
+    HWND cart_text;
+
+    /* trace (0) and history (1) share the engine's ring */
+    HWND h_rec[2], h_clear[2], h_filter[2], h_range[2], h_note[2], h_text[2];
+    uint64_t h_sig[2];
+    int h_ok[2];
+    int h_ticks;
+
+    /* fujinet */
+    HWND fuji_title, fuji_note, fuji_clear, fuji_text, fuji_state_title, fuji_state;
+    uint64_t fuji_last;
+    int fuji_count;
+
+    HWND views[24];             /* the read-only text views, drawn on the window colour */
+    int nviews;
+    HWND dim[64];               /* captions and hints, drawn grey */
+    int ndim, nlabels;
+
+    HFONT ui, ui_bold, mono;
+    int dpi;
+    int mono_w, mono_h, line_h;
+    HACCEL accel;
+    HBRUSH bp_on;
+
+    chfsession *session;
+    chfdebug *dbg;
+
+    int page;
+    unsigned seen_gen;
+    int was_stopped;
+    int running_ticks;
+    int updating;               /* a refresh is setting controls */
+
+    char notice[200];           /* a message holding the status line a moment */
+    DWORD notice_until;
+} debugger;
+
+static debugger *g_dbg;
+
+/* The editable registers, in the order the strip lays them out: A and W in
+ * hex, the ISAR in octal, the program and data counters in hex. */
+static const char *const k_reg_names[NREGS] = { "A", "W", "ISAR", "PC0", "PC1", "DC0", "DC1" };
+static const int k_reg_ids[NREGS] = { CHF_REG_A, CHF_REG_W, CHF_REG_ISAR, CHF_REG_PC0, CHF_REG_PC1, CHF_REG_DC0,
+                                      CHF_REG_DC1 };
+static const int k_reg_digits[NREGS] = { 2, 2, 2, 4, 4, 4, 4 };
+
+/* The check boxes: S (positive), C, Z, O and ICB. */
+static const char *const k_chk_names[NCHECKS] = { "S", "C", "Z", "O", "ICB" };
+static const int k_chk_ids[NCHECKS] = { CHF_REG_SIGN, CHF_REG_CARRY, CHF_REG_ZERO, CHF_REG_OVERFLOW, CHF_REG_ICB };
+
+static const char *const k_save_kinds[NSAVE] = { "dis", "mailbox", "vram", "scratch", "cart", "screen", "vramshot",
+                                                 "regs" };
+static const char *const k_save_titles[NSAVE] = {
+    "Disassembly (PROG $0000-$47FF)...", "Mailbox page ($F800-$FFFF)...", "VRAM (8192 bytes)...",
+    "Scratchpad (64 bytes)...", "Cartridge image...", "Screen (PPM)...", "Whole VRAM view (PPM)...",
+    "Registers (CPU, ports and I/O, text)..." };
+
+static const char *const k_space_names[NSPACES] = { "PROG", "SCRATCH", "VRAM", "CART", "IO" };
+static const char *const k_space_titles[NSPACES] = {
+    "PROG: the 64K the CPU sees, labelled by the live memory map",
+    "SCRATCH: the 64 registers (r0-r63, octal as the ISAR holds them)",
+    "VRAM: the 128 x 64 video RAM, row * 128 + column, 2-bit cells",
+    "CART: the cartridge's own memory",
+    "IO: the ports as the CPU would read them now" };
+
+#define NBPTYPES 8
+static const char *const k_bp_types[NBPTYPES] = { "Execute", "Read", "Write", "Access", "IN", "OUT", "VRAM",
+                                                  "SCRATCH" };
+static const int k_bp_type_ids[NBPTYPES] = { CHFDEBUG_BP_EXEC, CHFDEBUG_BP_READ, CHFDEBUG_BP_WRITE,
+                                             CHFDEBUG_BP_ACCESS, CHFDEBUG_BP_IN, CHFDEBUG_BP_OUT, CHFDEBUG_BP_VRAM,
+                                             CHFDEBUG_BP_SCRATCH };
+static const int k_bp_spaces[NBPTYPES] = { CHF_SPACE_PROG, CHF_SPACE_PROG, CHF_SPACE_PROG, CHF_SPACE_PROG,
+                                           CHF_SPACE_IO, CHF_SPACE_IO, CHF_SPACE_VRAM, CHF_SPACE_SCRATCH };
+
+/* ---- helpers ---------------------------------------------------------------- */
+
+static void edit_text(HWND h, char *out, int outsz) { GetWindowTextA(h, out, outsz); }
+
+static void wide(const char *utf8, wchar_t *out, int outn)
 {
-    w[0] = 0;
-    if (MultiByteToWideChar(CP_UTF8, 0, utf8 ? utf8 : "", -1, w, n) <= 0) w[n - 1] = 0;
+    if (outn <= 0) return;
+    out[0] = 0;
+    if (utf8 && MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, outn) <= 0) out[0] = 0;
+    out[outn - 1] = 0;
 }
 
-/* EDIT controls want CRLF and render control characters as boxes; the
- * engine's text is UTF-8. Returns a malloc'd wide string, or NULL. */
-static wchar_t *view_wide(const char *text)
+/* A label set only when it changed (no flicker on the live refresh). */
+static void set_label(HWND h, const char *utf8)
 {
-    const size_t n = strlen(text);
+    wchar_t cur[512], w[512];
+    wide(utf8, w, 512);
+    GetWindowTextW(h, cur, 512);
+    if (wcscmp(cur, w) != 0) SetWindowTextW(h, w);
+}
+
+/* EDIT controls want CR LF and draw control characters as boxes: engine
+ * text (UTF-8) as the wide text a view shows. */
+static wchar_t *wide_view_text(const char *text)
+{
+    size_t n = strlen(text), i, o = 0;
     char *buf = malloc(n * 2 + 1);
     wchar_t *w = NULL;
-    size_t i, o = 0;
     int wn;
     if (!buf) return NULL;
     for (i = 0; i < n; i++) {
-        const unsigned char c = (unsigned char)text[i];
+        unsigned char c = (unsigned char)text[i];
         if (c == '\n') { buf[o++] = '\r'; buf[o++] = '\n'; }
         else if (c >= 0x20 || c == '\t') buf[o++] = (char)c;
     }
@@ -163,89 +423,6 @@ static wchar_t *view_wide(const char *text)
         MultiByteToWideChar(CP_UTF8, 0, buf, -1, w, wn);
     free(buf);
     return w;
-}
-
-/* Replaces a read-only view's text only when it changed, and keeps the
- * reader where they were (the live views refresh while the machine runs). */
-static void view_set(HWND h, const char *text)
-{
-    wchar_t *w = view_wide(text);
-    int len, first;
-    if (!w) return;
-    len = GetWindowTextLengthW(h);
-    if (len == (int)wcslen(w)) {
-        wchar_t *cur = malloc(((size_t)len + 1) * sizeof *cur);
-        const int same = cur && GetWindowTextW(h, cur, len + 1) == len && wcscmp(cur, w) == 0;
-        free(cur);
-        if (same) { free(w); return; }
-    }
-    first = (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0);
-    SetWindowTextW(h, w);
-    SendMessageW(h, EM_LINESCROLL, 0, first);
-    free(w);
-}
-
-static void view_append(HWND h, const char *text)
-{
-    wchar_t *w = view_wide(text);
-    int len;
-    if (!w) return;
-    len = GetWindowTextLengthW(h);
-    SendMessageW(h, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM)w);
-    SendMessageW(h, EM_SCROLLCARET, 0, 0);
-    free(w);
-}
-
-/* Whether a log's reader is at its end (it then follows new lines). */
-static int view_at_end(const debugger *d, HWND h)
-{
-    RECT c;
-    const int first = (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0);
-    const int count = (int)SendMessageW(h, EM_GETLINECOUNT, 0, 0);
-    GetClientRect(h, &c);
-    return first + (d->mono_h > 0 && c.bottom > d->mono_h ? c.bottom / d->mono_h : 1) >= count;
-}
-
-/* Replaces a log's text where the reader left it, or, following, at its end;
- * nothing is touched when it did not change. */
-static void view_set_at(HWND h, const char *text, int follow)
-{
-    wchar_t *w = view_wide(text);
-    int first, len;
-    if (!w) return;
-    len = GetWindowTextLengthW(h);
-    if (len == (int)wcslen(w)) {
-        wchar_t *cur = malloc(((size_t)len + 1) * sizeof *cur);
-        const int same = cur && GetWindowTextW(h, cur, len + 1) == len && wcscmp(cur, w) == 0;
-        free(cur);
-        if (same) { free(w); return; }
-    }
-    first = (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0);
-    SetWindowTextW(h, w);
-    if (follow) SendMessageW(h, EM_LINESCROLL, 0, SendMessageW(h, EM_GETLINECOUNT, 0, 0));
-    else SendMessageW(h, EM_LINESCROLL, 0, first - (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0));
-    free(w);
-}
-
-/* A short control's text from UTF-8; the control repaints only when it differs
- * (no flicker on the live refresh). */
-void dbg_label_set(HWND h, const char *utf8)
-{
-    wchar_t cur[512], w[512];
-    dbg_wide_from(utf8, w, 512);
-    GetWindowTextW(h, cur, 512);
-    if (wcscmp(cur, w) != 0) SetWindowTextW(h, w);
-}
-
-/* The text of an edit as UTF-8. */
-static void edit_text(HWND h, char *out, int outsz)
-{
-    wchar_t w[512];
-    out[0] = '\0';
-    w[0] = 0;
-    GetWindowTextW(h, w, 512);
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, outsz, NULL, NULL) <= 0) out[outsz - 1] = '\0';
 }
 
 static size_t addf(char *s, size_t len, size_t cap, const char *fmt, ...)
@@ -260,413 +437,405 @@ static size_t addf(char *s, size_t len, size_t cap, const char *fmt, ...)
     return len + (size_t)n < cap ? len + (size_t)n : cap - 1;
 }
 
-/* $hex, 0xhex, #dec, or bare hex, as the prompt reads numbers. */
-static int parse_num(const char *text, long *out)
+/* Blanks off both ends, in place. */
+static char *strip(char *s)
 {
-    char buf[64];
-    const char *p;
-    char *end;
-    long v;
-    int base = 16;
+    char *e;
+    while (*s == ' ' || *s == '\t') s++;
+    e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = '\0';
+    return s;
+}
 
+/* The engine's address grammar in one space (labels, $ and 0x, o17 octal,
+ * registers, label+n, lo-hi and lo..hi ranges; a bare token is hex in PROG,
+ * VRAM, CART and IO and decimal in SCRATCH; "row,col" in VRAM). 1 and
+ * lo..hi, or 0 with the reason in err. */
+static int parse_in_space(debugger *d, int space, const char *text, uint32_t *lo, uint32_t *hi, char *err, int errsz)
+{
+    char buf[128], *s;
     snprintf(buf, sizeof buf, "%s", text);
-    p = buf;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '$') p++;
-    else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
-    else if (*p == '#') { p++; base = 10; }
-    if (!*p) return 0;
-    v = strtol(p, &end, base);
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
-    if (*end) return 0;
-    *out = v;
-    return 1;
-}
-
-/* ISAR in octal: "12" or upper.lower ("1.2"). */
-static int parse_isar(const char *text, long *out)
-{
-    char buf[32];
-    char *dot, *end;
-    long v;
-    snprintf(buf, sizeof buf, "%s", text);
-    dot = strchr(buf, '.');
-    if (dot) {
-        long u, l;
-        *dot = '\0';
-        u = strtol(buf, &end, 8);
-        if (*end || !buf[0]) return 0;
-        l = strtol(dot + 1, &end, 8);
-        if (*end || !dot[1]) return 0;
-        v = (u << 3) | l;
-    } else {
-        v = strtol(buf, &end, 8);
-        if (*end || !buf[0]) return 0;
-    }
-    if (v < 0 || v > 63) return 0;
-    *out = v;
-    return 1;
-}
-
-static int resolve_addr(debugger *d, const char *text)
-{
-    long v;
-    int addr = -1;
-    const char *p = text;
-    while (*p == ' ') p++;
-    if (!*p) return -1;
-    if (*p != '$' && *p != '#' && !(p[0] == '0' && (p[1] == 'x' || p[1] == 'X')))
-        addr = chfdebug_label_address(d->dbg, p);
-    if (addr < 0 && parse_num(p, &v) && v >= 0 && v <= 0xffff) addr = (int)v;
-    return addr;
-}
-
-/* A hex dump with a column header, 16 bytes a row, row labels from base. */
-static void hexdump(char *s, size_t cap, const uint8_t *m, int n, unsigned base, int digits)
-{
-    size_t len = 0;
-    int row, col;
-    len = addf(s, len, cap, "%*s", digits + 3, "");
-    for (col = 0; col < 16; col++) len = addf(s, len, cap, "%X  ", col);
-    for (row = 0; row * 16 < n; row++) {
-        len = addf(s, len, cap, "\n$%0*X: ", digits, base + (unsigned)row * 16);
-        for (col = 0; col < 16 && row * 16 + col < n; col++)
-            len = addf(s, len, cap, "%02X ", m[row * 16 + col]);
-    }
-}
-
-static HBRUSH make_brush(uint32_t rgb)
-{
-    return CreateSolidBrush(RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff));
-}
-
-/* ---- images ------------------------------------------------------------------ */
-
-static int image_reserve(image *im, size_t px)
-{
-    uint32_t *p;
-    if (px <= im->cap) return 1;
-    p = realloc(im->px, px * sizeof *p);
-    if (!p) return 0;
-    im->px = p;
-    im->cap = px;
-    return 1;
-}
-
-/* One of the video views into im at an integer scale: asks for its size
- * first, grows the buffer to fit and draws. 0 (and an empty image) when
- * there is none. */
-static int fetch_view(debugger *d, image *im, int view, unsigned flags, int scale)
-{
-    int w = 0, h = 0;
-    im->w = im->h = 0;
-    chfdebug_video_view(d->dbg, view, flags, scale, NULL, 0, &w, &h);
-    if (w > 0 && h > 0) {
-        if (!image_reserve(im, (size_t)w * (size_t)h)) return 0;
-    } else if (!image_reserve(im, (size_t)CHFDEBUG_VIEW_MAX_PIXELS * (size_t)scale * (size_t)scale)) {
+    s = strip(buf);
+    if (!*s) {
+        snprintf(err, (size_t)errsz, "Nothing typed");
         return 0;
     }
-    w = h = 0;
-    if (!chfdebug_video_view(d->dbg, view, flags, scale, im->px, im->cap, &w, &h) || w <= 0 || h <= 0)
+    err[0] = '\0';
+    if (!chfsym_parse_range(d->dbg, space, s, lo, hi)) {
+        snprintf(err, (size_t)errsz, "Not an address, label or expression in %s",
+                 space >= 0 && space < NSPACES ? k_space_names[space] : "?");
         return 0;
-    im->w = w;
-    im->h = h;
+    }
     return 1;
 }
 
-/* ---- the Video tab ------------------------------------------------------------ */
-
-static unsigned video_flags(const debugger *d)
+/* An expression through the engine's grammar (PROG); one value. 0 and
+ * *value, or -1 with the reason in err. */
+static int eval_expression(debugger *d, const char *text, long *value, char *err, int errsz)
 {
-    unsigned bits = 0;
-    int i;
-    for (i = 0; i < NOVERLAYS; i++)
-        if (SendMessageW(d->overlay[i], BM_GETCHECK, 0, 0) == BST_CHECKED) bits |= 1u << i;
-    return bits;
+    uint32_t low, high;
+    if (!parse_in_space(d, CHF_SPACE_PROG, text, &low, &high, err, errsz)) return -1;
+    *value = (long)low;
+    return 0;
 }
 
-/* The integer scale for a view: the one the combo chose, or for Fit the
- * largest that fits the picture window. */
-static int video_scale(debugger *d, int view, unsigned flags)
+/* A PROG address field: a label first, then bare digits as hex (as the dumps
+ * show them), else the engine's grammar, wrapped to 16 bits. -1 with the
+ * reason in err when it is none of them. (The console keeps the engine's own
+ * rule: bare digits decimal.) */
+static int resolve_addr(debugger *d, const char *text, char *err, int errsz)
 {
-    const int sel = (int)SendMessageW(d->scale_mode, CB_GETCURSEL, 0, 0);
-    int w = 0, h = 0, s;
-    RECT c;
-    if (sel > 0) return sel;
-    chfdebug_video_view(d->dbg, view, flags, 1, NULL, 0, &w, &h);
-    GetClientRect(d->vpic, &c);
-    if (w <= 0 || h <= 0 || c.right <= 0) return 2;
-    s = c.right / w < c.bottom / h ? c.right / w : c.bottom / h;
-    return s < 1 ? 1 : s > 8 ? 8 : s;
+    uint32_t low, high;
+    if (!parse_in_space(d, CHF_SPACE_PROG, text, &low, &high, err, errsz)) return -1;
+    return (int)(low & 0xFFFF);
 }
 
-/* A cell as the hover and the pin tell it. */
-static void describe_cell(debugger *d, int row, int col, char *out, size_t n)
+/* A PROG range field: "lo-hi" or "lo..hi", else a label, an address or an
+ * expression (one byte). */
+static int parse_range_ui(debugger *d, const char *text, uint16_t *lo, uint16_t *hi, char *err, int errsz)
 {
-    chfdebug_vram_cell c;
-    size_t len = 0;
-    if (row < 0 || col < 0 || chfdebug_vram_cell_get(d->dbg, row, col, &c) < 0) {
-        snprintf(out, n, "(none)");
-        return;
+    uint32_t low, high;
+    if (!parse_in_space(d, CHF_SPACE_PROG, text, &low, &high, err, errsz)) return 0;
+    *lo = (uint16_t)low;
+    *hi = (uint16_t)high;
+    return 1;
+}
+
+/* A register or byte box: hex without a prefix, as the boxes show it, or
+ * else the engine's grammar. */
+static int parse_hexish(debugger *d, const char *text, long *out)
+{
+    char buf[64], err[64], *s, *end;
+    long v;
+    snprintf(buf, sizeof buf, "%s", text);
+    s = strip(buf);
+    if (!*s) return 0;
+    v = strtol(s, &end, 16);
+    if (end != s && !*end) {
+        *out = v;
+        return 1;
     }
-    len = addf(out, len, n, "Row %d, column %d   %s%s%s\n", c.row, c.col, c.visible ? "visible" : "hidden",
-               c.hidden_why ? ": " : "", c.hidden_why ? c.hidden_why : "");
-    len = addf(out, len, n, "Value %d   palette %d (%s)\nPen %d: %s   RGB #%06X\n", c.value, c.palette,
-               chfdebug_palette_name(c.palette), c.pen, chfdebug_colour_name(c.pen), c.rgb & 0xffffff);
-    if (c.last_pc < 0)
-        len = addf(out, len, n, "Written %u times, none since the debugger attached", c.writes);
+    err[0] = '\0';
+    return eval_expression(d, s, out, err, sizeof err) == 0;
+}
+
+/* The ISAR box: octal digits as the box shows them, else the grammar. */
+static int parse_isar(debugger *d, const char *text, long *out)
+{
+    char buf[64], err[64], *s, *end;
+    long v;
+    snprintf(buf, sizeof buf, "%s", text);
+    s = strip(buf);
+    if (!*s) return 0;
+    v = strtol(s, &end, 8);
+    if (end != s && !*end) {
+        *out = v;
+        return 1;
+    }
+    err[0] = '\0';
+    return eval_expression(d, s, out, err, sizeof err) == 0;
+}
+
+static const char *base_name(const char *path)
+{
+    const char *a = strrchr(path, '\\'), *b = strrchr(path, '/');
+    if (b && (!a || b > a)) a = b;
+    return a ? a + 1 : path;
+}
+
+/* ---- scale and fonts --------------------------------------------------------- */
+
+static int system_dpi(void)
+{
+    HDC dc = GetDC(NULL);
+    int v = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    if (dc) ReleaseDC(NULL, dc);
+    return v > 0 ? v : 96;
+}
+
+/* The window's DPI (Windows 10 1607+), else the system's. */
+static int window_dpi(HWND hwnd)
+{
+    typedef UINT (WINAPI *dpi_fn)(HWND);
+    static dpi_fn fn;
+    static int looked;
+    if (!looked) {
+        HMODULE user = GetModuleHandleA("user32.dll");
+        fn = user ? (dpi_fn)(void (*)(void))GetProcAddress(user, "GetDpiForWindow") : NULL;
+        looked = 1;
+    }
+    if (fn && hwnd) {
+        const UINT v = fn(hwnd);
+        if (v) return (int)v;
+    }
+    return system_dpi();
+}
+
+static int S(const debugger *d, int v) { return MulDiv(v, d->dpi, 96); }
+
+/* The message font at dpi (system metrics come at the system DPI), at its
+ * own size (px 0) or px pixels at 96 dpi; face NULL keeps the message
+ * font's, otherwise a fixed-pitch face (Consolas). */
+static HFONT make_font(int dpi, int px, int weight, const char *face)
+{
+    NONCLIENTMETRICSA ncm;
+    LOGFONTA lf;
+    ZeroMemory(&ncm, sizeof ncm);
+    ncm.cbSize = sizeof ncm;
+    if (SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0))
+        lf = ncm.lfMessageFont;
     else
-        len = addf(out, len, n, "Written %u times; last by PC $%04X at frame %u, line %d (was %d)", c.writes,
-                   c.last_pc & 0xffff, c.last_frame, c.last_line, c.last_old);
-}
-
-static void refresh_hover_texts(debugger *d)
-{
-    char t[512];
-    if (d->vsec != SEC_CELL) return;
-    describe_cell(d, d->hover_row, d->hover_col, t, sizeof t);
-    view_set(d->hover_text, t);
-    describe_cell(d, d->pin_row, d->pin_col, t, sizeof t);
-    view_set(d->pin_text, t);
-}
-
-/* The status line under the picture: the view and, if the pointer is on one,
- * the cell. */
-static void refresh_vstatus(debugger *d)
-{
-    char t[300], cell[200] = "";
-    if (d->hover_row >= 0) {
-        chfdebug_vram_cell c;
-        if (chfdebug_vram_cell_get(d->dbg, d->hover_row, d->hover_col, &c) >= 0) {
-            if (c.visible)
-                snprintf(cell, sizeof cell, "   row %d col %d: value %d, %s", c.row, c.col, c.value,
-                         chfdebug_colour_name(c.pen));
-            else
-                snprintf(cell, sizeof cell, "   row %d col %d: value %d, %s (hidden: %s)", c.row, c.col, c.value,
-                         chfdebug_colour_name(c.pen), c.hidden_why ? c.hidden_why : "outside the picture");
-        }
+        GetObjectA(GetStockObject(DEFAULT_GUI_FONT), sizeof lf, &lf);
+    if (px > 0) lf.lfHeight = -MulDiv(px, dpi, 96);
+    else lf.lfHeight = -MulDiv(abs(lf.lfHeight ? lf.lfHeight : 12), dpi, system_dpi());
+    lf.lfWidth = 0;
+    lf.lfWeight = weight;
+    if (face) {
+        snprintf(lf.lfFaceName, sizeof lf.lfFaceName, "%s", face);
+        lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
     }
-    snprintf(t, sizeof t, "%dx%d at %dx.%s", d->vimg.w, d->vimg.h, d->vimg_scale,
-             cell[0] ? cell : "   Hover for a cell, click to pin it, double-click to break on its writes.");
-    dbg_label_set(d->vstatus, t);
+    return CreateFontIndirectA(&lf);
 }
 
-void dbg_hover_changed(debugger *d, int row, int col)
+static BOOL CALLBACK refont_child(HWND h, LPARAM lp)
 {
-    if (row == d->hover_row && col == d->hover_col) return;
-    d->hover_row = row;
-    d->hover_col = col;
-    InvalidateRect(d->vpic, NULL, FALSE);
-    refresh_hover_texts(d);
-    refresh_vstatus(d);
+    const HFONT *map = (const HFONT *)lp;     /* old ui, bold, mono; new ui, bold, mono */
+    const HFONT f = (HFONT)SendMessageA(h, WM_GETFONT, 0, 0);
+    int i;
+    for (i = 0; i < 3; i++)
+        if (f && f == map[i]) SendMessageA(h, WM_SETFONT, (WPARAM)map[i + 3], TRUE);
+    return TRUE;
 }
 
-void dbg_pin_cell(debugger *d, int row, int col)
+/* The message font and Consolas at the window's DPI; the controls already
+ * made take the new ones. */
+static void make_fonts(debugger *d)
 {
-    d->pin_row = row;
-    d->pin_col = col;
-    InvalidateRect(d->vpic, NULL, FALSE);
-    refresh_hover_texts(d);
-}
+    HFONT old[3] = { d->ui, d->ui_bold, d->mono };
+    HDC dc;
+    TEXTMETRICA tm;
+    HGDIOBJ prev;
+    int i;
 
-void dbg_break_on_cell(debugger *d, int row, int col)
-{
-    char msg[160];
-    const int id = chfdebug_breakpoint_add(d->dbg, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, (uint16_t)(row * 128 + col),
-                                           (uint16_t)(row * 128 + col), "");
-    snprintf(msg, sizeof msg, id >= 0 ? "Breaking on writes to row %d column %d (breakpoint %d)."
-                                      : "Could not set a breakpoint on row %d column %d.", row, col, id);
-    dbg_label_set(d->vstatus, msg);
-}
+    d->ui = make_font(d->dpi, 0, FW_NORMAL, NULL);
+    d->ui_bold = make_font(d->dpi, 0, FW_BOLD, NULL);
+    d->mono = make_font(d->dpi, MONO_PX, FW_NORMAL, "Consolas");
 
-/* Rows whose palette changed since the frame before. */
-static void track_palettes(debugger *d)
-{
-    int row;
-    if (d->vid.frame == d->pal_changed_frame && d->prev_row_valid) return;
-    memset(d->pal_changed, 0, sizeof d->pal_changed);
-    if (d->prev_row_valid)
-        for (row = 0; row < CHFDEBUG_VRAM_ROWS; row++)
-            if (d->vid.row_palette[row] != d->prev_row_pal[row]) d->pal_changed[row / 32] |= 1u << (row % 32);
-    memcpy(d->prev_row_pal, d->vid.row_palette, sizeof d->prev_row_pal);
-    d->prev_row_valid = 1;
-    d->pal_changed_frame = d->vid.frame;
-}
-
-static void refresh_palette_text(debugger *d)
-{
-    static char t[2048];
-    size_t len = 0;
-    int p, v;
-    for (p = 0; p < 4; p++) {
-        len = addf(t, len, sizeof t, "%sP%d %s (%d rows)\n", p ? "\n" : "", p, chfdebug_palette_name(p),
-                   d->vid.palette_rows[p]);
-        for (v = 0; v < 4; v++) {
-            const int pen = chfdebug_palette_pen(p, v);
-            len = addf(t, len, sizeof t, "  %d  #%06X  %s\n", v, chfdebug_colour_rgb(pen) & 0xffffff,
-                       chfdebug_colour_name(pen));
-        }
+    /* the monospace cell, for the hand-drawn views */
+    dc = GetDC(d->hwnd);
+    prev = SelectObject(dc, d->mono);
+    d->mono_w = S(d, 7);
+    d->mono_h = S(d, 15);
+    if (GetTextMetricsA(dc, &tm)) {
+        d->mono_w = tm.tmAveCharWidth;
+        d->mono_h = tm.tmHeight;
     }
-    view_set(d->pal_text, t);
-}
+    d->line_h = d->mono_h + S(d, 2);
+    SelectObject(dc, prev);
+    ReleaseDC(d->hwnd, dc);
 
-static void refresh_ports_text(debugger *d)
-{
-    static char t[3072];
-    const chfdebug_video *v = &d->vid;
-    static const char *const freq[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
-    size_t len = 0;
-    len = addf(t, len, sizeof t,
-        "Port 0   console buttons and the write strobe\n"
-        "  raw $%02X   complement $%02X   strobe %d\n"
-        "  controllers %s   panel latch $%X\n"
-        "  the CPU reads $%02X now\n\n",
-        v->port0, (uint8_t)~v->port0, v->strobe, v->controllers_enabled ? "enabled" : "off", v->panel_latch & 15,
-        v->in0);
-    len = addf(t, len, sizeof t,
-        "Port 1   colour; the right controller (Player 1)\n"
-        "  raw $%02X   complement $%02X   value %d (%s)\n"
-        "  the CPU reads $%02X now\n\n",
-        v->port1, (uint8_t)~v->port1, v->value, chfdebug_colour_name(chfdebug_palette_pen(0, v->value & 3)), v->in1);
-    len = addf(t, len, sizeof t,
-        "Port 4   column; the left controller (Player 2)\n"
-        "  raw $%02X   complement $%02X   column %d\n"
-        "  the CPU reads $%02X now\n\n",
-        v->port4, (uint8_t)~v->port4, v->col, v->in4);
-    len = addf(t, len, sizeof t,
-        "Port 5   row and the beeper\n"
-        "  raw $%02X   complement $%02X   row %d   sound mode %d (%s)\n"
-        "  the CPU reads $%02X now\n\n",
-        v->port5, (uint8_t)~v->port5, v->row, v->sound_mode, freq[v->sound_mode & 3], v->in5);
-    len = addf(t, len, sizeof t,
-        "The next strobe writes %d to row %d, column %d (%s)\n\n"
-        "Beam   line %d of %d   cycle %d of %d   frame %u   %s\n"
-        "Strobes   %u this frame so far, %u in the last whole one (%u changed a cell)\n",
-        v->value, v->row, v->col, v->row >= CHFDEBUG_VIS_ROW0 && v->row < CHFDEBUG_VIS_ROW0 + CHFDEBUG_VIS_ROWS &&
-        v->col >= CHFDEBUG_VIS_COL0 && v->col < CHFDEBUG_VIS_COL0 + CHFDEBUG_VIS_COLS ? "visible" : "hidden",
-        v->line, v->lines, v->cycle_in_line, v->cycles_per_line, v->frame, v->is_pal ? "PAL" : "NTSC",
-        v->strobes_frame, v->strobes_last, v->changes_last);
-    view_set(d->ports_text, t);
-}
-
-static int field_int(HWND h, int def)
-{
-    char t[32];
-    edit_text(h, t, sizeof t);
-    return t[0] ? atoi(t) : def;
-}
-
-static void refresh_writes(debugger *d)
-{
-    static char t[WRITES_MAX * 90 + 128];
-    chfdebug_vram_filter f;
-    size_t len = 0;
-    char counts[200];
-    int i, follow;
-    f.row0 = field_int(d->wr_row0, 0);
-    f.row1 = field_int(d->wr_row1, 63);
-    f.col0 = field_int(d->wr_col0, 0);
-    f.col1 = field_int(d->wr_col1, 127);
-    f.changes_only = SendMessageW(d->wr_changes, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    f.this_frame = SendMessageW(d->wr_frame, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    f.palette_cols = SendMessageW(d->wr_palcols, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    d->nwrites = chfdebug_vram_writes(d->dbg, &f, d->writes, WRITES_MAX);
-    if (d->nwrites < 0) d->nwrites = 0;
-    snprintf(counts, sizeof counts, "Frame %u: %u strobes so far; the last whole frame had %u (%u changed a cell). %d listed.",
-             d->vid.frame, d->vid.strobes_frame, d->vid.strobes_last, d->vid.changes_last, d->nwrites);
-    dbg_label_set(d->wr_counts, counts);
-    t[0] = '\0';
-    for (i = 0; i < d->nwrites; i++) {
-        const chfdebug_vram_write *w = &d->writes[i];
-        len = addf(t, len, sizeof t, "%sf%-6u l%3d c%-9llu pc $%04X  r%-2d c%-3d  %d -> %d", i ? "\n" : "", w->frame,
-                   w->line, (unsigned long long)w->cycle, w->pc, w->row, w->col, w->old, w->value);
+    if (old[0]) {
+        HFONT map[6] = { old[0], old[1], old[2], d->ui, d->ui_bold, d->mono };
+        int p;
+        EnumChildWindows(d->hwnd, refont_child, (LPARAM)map);
+        for (p = 0; p < TAB_COUNT; p++)
+            if (d->popped[p]) EnumChildWindows(d->popped[p], refont_child, (LPARAM)map);
+        if (d->video) dbg_video_fonts(d->video, d->ui, d->mono, d->dpi);
     }
-    if (d->nwrites == 0) len = addf(t, len, sizeof t, "(no VRAM writes match, or the engine saw none since it attached)");
-    follow = view_at_end(d, d->wr_text);
-    view_set_at(d->wr_text, t, follow);
+    for (i = 0; i < 3; i++)
+        if (old[i]) DeleteObject(old[i]);
 }
 
-static void refresh_video(debugger *d, int slow)
+static int text_w(debugger *d, HFONT f, const char *text)
 {
-    const int view = (int)SendMessageW(d->view_mode, CB_GETCURSEL, 0, 0);
-    const unsigned flags = video_flags(d);
-    int scale;
-    chfdebug_video_get(d->dbg, &d->vid);
-    track_palettes(d);
-    scale = video_scale(d, view < 0 ? 0 : view, flags);
-    if (fetch_view(d, &d->vimg, view < 0 ? 0 : view, flags, scale)) {
-        d->vimg_view = view < 0 ? 0 : view;
-        d->vimg_scale = scale;
-    }
-    InvalidateRect(d->vpic, NULL, FALSE);
-    refresh_vstatus(d);
-    switch (d->vsec) {
-    case SEC_CELL: refresh_hover_texts(d); break;
-    case SEC_ROWS:
-        InvalidateRect(d->rows_view, NULL, FALSE);
-        if (slow) refresh_palette_text(d);
-        break;
-    case SEC_PORTS: refresh_ports_text(d); break;
-    case SEC_WRITES: if (slow) refresh_writes(d); break;
-    default: break;
-    }
+    HDC dc = GetDC(d->hwnd);
+    HGDIOBJ old = SelectObject(dc, f);
+    SIZE sz = { 0, 0 };
+    GetTextExtentPoint32A(dc, text, (int)strlen(text), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(d->hwnd, dc);
+    return sz.cx;
 }
 
-/* ---- the other pages' refreshers ------------------------------------------------ */
+static int btn_w(debugger *d, const char *text)
+{
+    const int w = text_w(d, d->ui, text) + S(d, 24);
+    return w < S(d, 64) ? S(d, 64) : w;
+}
+
+static int in_list(HWND h, const HWND *list, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (list[i] == h) return 1;
+    return 0;
+}
+
+/* ---- the text views ------------------------------------------------------------ */
+
+/* The rows an EDIT view shows. */
+static int edit_rows(debugger *d, HWND h)
+{
+    RECT c;
+    GetClientRect(h, &c);
+    return d->mono_h > 0 && c.bottom > d->mono_h ? c.bottom / d->mono_h : 1;
+}
+
+/* Whether a log's reader is at its end (it then follows new lines). */
+static int edit_at_end(debugger *d, HWND h)
+{
+    const int first = (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0);
+    const int count = (int)SendMessageW(h, EM_GETLINECOUNT, 0, 0);
+    return first + edit_rows(d, h) >= count;
+}
+
+static void edit_to_end(HWND h)
+{
+    SendMessageW(h, EM_LINESCROLL, 0, SendMessageW(h, EM_GETLINECOUNT, 0, 0));
+}
+
+static void edit_scroll_to(HWND h, int first)
+{
+    SendMessageW(h, EM_LINESCROLL, 0, first - (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0));
+}
+
+/* Replaces a view's text where the reader left it (a refresh must not throw
+ * a scrolled view back to its top), or, following, at its end. */
+static void set_text_at(HWND h, const char *text, int follow)
+{
+    const int first = (int)SendMessageW(h, EM_GETFIRSTVISIBLELINE, 0, 0);
+    wchar_t *w = wide_view_text(text);
+    if (!w) return;
+    SendMessageW(h, WM_SETREDRAW, FALSE, 0);
+    SetWindowTextW(h, w);
+    if (follow) edit_to_end(h);
+    else edit_scroll_to(h, first);
+    SendMessageW(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+    free(w);
+}
+
+static void refresh_status(debugger *d);
+
+static int notice_showing(debugger *d)
+{
+    return d->notice[0] && (LONG)(GetTickCount() - d->notice_until) < 0;
+}
+
+/* The other frontends' toasts: the message holds the status line a moment. */
+static void toast(debugger *d, const char *msg)
+{
+    snprintf(d->notice, sizeof d->notice, "%s", msg);
+    d->notice_until = GetTickCount() + NOTICE_MS;
+    refresh_status(d);
+}
+
+/* ---- the console ---------------------------------------------------------------- */
+
+/* Long sessions keep the last CONSOLE_KEEP characters, whole lines. */
+static void console_trim(debugger *d)
+{
+    const int len = GetWindowTextLengthW(d->con_out);
+    wchar_t *all, *nl;
+    int cut;
+    if (len <= CONSOLE_KEEP) return;
+    all = malloc(((size_t)len + 1) * sizeof *all);
+    if (!all) return;
+    GetWindowTextW(d->con_out, all, len + 1);
+    cut = len - CONSOLE_KEEP * 3 / 4;
+    nl = wcschr(all + cut, L'\n');
+    if (nl) cut = (int)(nl - all) + 1;
+    free(all);
+    SendMessageW(d->con_out, EM_SETSEL, 0, (LPARAM)cut);
+    SendMessageW(d->con_out, EM_REPLACESEL, FALSE, (LPARAM)L"");
+}
+
+/* Onto the console's transcript, which follows its end only while the
+ * reader is there. */
+static void console_append(debugger *d, const char *text)
+{
+    const int follow = edit_at_end(d, d->con_out);
+    const int first = (int)SendMessageW(d->con_out, EM_GETFIRSTVISIBLELINE, 0, 0);
+    wchar_t *w = wide_view_text(text);
+    int len;
+    if (!w) return;
+    len = GetWindowTextLengthW(d->con_out);
+    SendMessageW(d->con_out, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(d->con_out, EM_REPLACESEL, FALSE, (LPARAM)w);
+    free(w);
+    console_trim(d);
+    if (follow) edit_to_end(d->con_out);
+    else edit_scroll_to(d->con_out, first);
+}
+
+/* Command output, ended with a newline. */
+static void console_output(debugger *d, const char *text)
+{
+    const size_t n = strlen(text);
+    if (!n) return;
+    console_append(d, text);
+    if (text[n - 1] != '\n') console_append(d, "\n");
+}
+
+/* Messages from Load Symbols and Save land in the console and, since it may
+ * not be the tab showing, on the status line. */
+static void say(debugger *d, const char *msg)
+{
+    console_output(d, msg);
+    toast(d, msg);
+}
+
+/* ---- refreshers -------------------------------------------------------------- */
 
 static void refresh_status(debugger *d)
 {
-    char reason[160], buf[220];
+    char reason[160], text[220];
     int addr;
-    const int stopped = chfdebug_is_stopped(d->dbg);
-    chfdebug_stop_reason(d->dbg, reason, sizeof reason, &addr);
-    if (stopped) snprintf(buf, sizeof buf, "Stopped%s%s", reason[0] ? ": " : "", reason);
-    else snprintf(buf, sizeof buf, "Running");
-    dbg_label_set(d->status, buf);
-    dbg_label_set(d->run_btn, stopped ? "Run (F5)" : "Stop (F5)");
-    InvalidateRect(d->run_btn, NULL, FALSE);
-}
+    const int stopped = chfdebug_is_stopped(d->dbg) != 0;
 
-static int mem_space_now(const debugger *d)
-{
-    const int sel = (int)SendMessageW(d->ram_space, CB_GETCURSEL, 0, 0);
-    return sel >= 0 && sel < NSPACES ? sel : CHF_SPACE_PROG;
-}
-
-static int mem_digits(int space)
-{
-    switch (space) {
-    case CHF_SPACE_PROG: return 4;
-    case CHF_SPACE_VRAM: return 4;
-    case CHF_SPACE_CART: return 5;
-    default: return 2;
+    if (notice_showing(d)) {
+        snprintf(text, sizeof text, "%s", d->notice);
+    } else if (stopped) {
+        reason[0] = '\0';
+        chfdebug_stop_reason(d->dbg, reason, sizeof reason, &addr);
+        snprintf(text, sizeof text, "Stopped%s%s", reason[0] ? ": " : "", reason);
+    } else {
+        snprintf(text, sizeof text, "Running");
     }
+    set_label(d->status, text);
+    set_label(d->run_btn, stopped ? "Run (F5)" : "Stop (F5)");
+    InvalidateRect(d->run_btn, NULL, FALSE);
+    InvalidateRect(d->status, NULL, TRUE);
 }
 
-/* The memory view: 16 rows of 16 bytes from mem_base in the space showing. */
-static void refresh_mem(debugger *d)
+/* The BIOS's K stack: r59 points at the top (40..58), two bytes a return. */
+static void refresh_kstack(debugger *d)
 {
-    static uint8_t bytes[16 * MEM_ROWS];
-    static char dump[4096];
-    const int space = mem_space_now(d);
-    const uint32_t size = (uint32_t)chfdebug_space_size(d->dbg, space);
-    char title[128];
-    if (d->mem_base >= size) d->mem_base = size > sizeof bytes ? (size - 1) & ~0xfu : 0;
-    memset(bytes, 0xff, sizeof bytes);
-    chfdebug_read(d->dbg, space, d->mem_base, bytes, (int)sizeof bytes);
-    hexdump(dump, sizeof dump, bytes, (int)sizeof bytes, d->mem_base, mem_digits(space));
-    view_set(d->mem_view, dump);
-    snprintf(title, sizeof title, "%ls from $%0*X (size $%X; reads have no side effects)", kSpaceNames[space],
-             mem_digits(space), d->mem_base, size);
-    dbg_label_set(d->mem_label, title);
+    static char text[1024];
+    const chfdebug_cpu *c = &d->cpu;
+    size_t len = 0;
+    int i;
+    if (c->k_depth < 0) {
+        len = addf(text, len, sizeof text, "r59 = %02o (octal 0%o): not a K-stack pointer\n(r40-r59 is the stack; "
+                   "r59 odd, 40-58 when in use)", c->r[59], c->r[59]);
+    } else {
+        len = addf(text, len, sizeof text, "r59 = %d (depth %d)", c->r[59], c->k_depth);
+        for (i = 0; i < c->k_depth && i < 10; i++) {
+            char name[48];
+            name[0] = '\0';
+            chfdebug_address_label(d->dbg, c->k_stack[i], name, sizeof name);
+            len = addf(text, len, sizeof text, "\n%2d: $%04X%s%s", i + 1, c->k_stack[i], name[0] ? "  " : "", name);
+        }
+        if (c->k_depth == 0) len = addf(text, len, sizeof text, "\n(empty)");
+    }
+    set_text_at(d->kstack, text, 0);
 }
 
 static void refresh_cpu(debugger *d)
 {
     chfdebug_cpu *c = &d->cpu;
-    static char buf[2048];
+    char buf[240];
     int i;
-    size_t len = 0;
     chfdebug_cpu_get(d->dbg, c);
 
     /* the scratchpad cells that changed since the registers last differed */
@@ -680,276 +849,778 @@ static void refresh_cpu(debugger *d)
         d->prev_valid = 1;
     }
     {
-        const unsigned v[NFIELDS] = { (unsigned)c->pc & 0xffff, c->pc0, c->pc1, c->dc0, c->dc1, c->a, c->w, c->isar,
-                                      c->j_h_k_q[0], c->j_h_k_q[1], c->j_h_k_q[2], c->j_h_k_q[3] };
-        for (i = 0; i < NFIELDS; i++) {
-            if (GetFocus() == d->fld[i]) continue;      /* do not fight the user's typing */
-            if (kFields[i].octal) snprintf(buf, sizeof buf, "%o.%o", (v[i] >> 3) & 7, v[i] & 7);
-            else snprintf(buf, sizeof buf, "%0*X", kFields[i].digits, v[i] & ((1u << (4 * kFields[i].digits)) - 1));
-            dbg_label_set(d->fld[i], buf);
+        const unsigned v[NREGS] = { c->a, c->w, c->isar & 63u, c->pc0, c->pc1, c->dc0, c->dc1 };
+        for (i = 0; i < NREGS; i++) {
+            if (GetFocus() == d->reg[i]) continue;      /* do not fight the user's typing */
+            if (i == 2) snprintf(buf, sizeof buf, "%02o", v[i]);
+            else snprintf(buf, sizeof buf, "%0*X", k_reg_digits[i], v[i] & ((1u << (4 * k_reg_digits[i])) - 1u));
+            set_label(d->reg[i], buf);
         }
     }
     {
-        const int flags[NFLAGS] = { c->sign, c->carry, c->zero, c->overflow, c->icb };
-        for (i = 0; i < NFLAGS; i++)
-            SendMessageW(d->flag[i], BM_SETCHECK, flags[i] ? BST_CHECKED : BST_UNCHECKED, 0);
+        const int on[NCHECKS] = { c->sign, c->carry, c->zero, c->overflow, c->icb };
+        d->updating = 1;
+        for (i = 0; i < NCHECKS; i++)
+            SendMessageA(d->chk[i], BM_SETCHECK, on[i] ? BST_CHECKED : BST_UNCHECKED, 0);
+        d->updating = 0;
     }
-    len = addf(buf, len, sizeof buf,
-        "PC $%04X   (PC0 $%04X: the CPU has fetched the opcode, dbus $%02X)\n"
-        "ISAR o%02o = %o.%o   W $%02X: S%s C%d Z%d O%d ICB%d\n"
-        "Cycles %llu   instructions %llu   illegal opcodes %u\n"
-        "Beam   line %d   cycle %d   frame %u\n"
-        "%s, BIOS %s\n",
-        c->pc & 0xffff, c->pc0, c->dbus, c->isar & 63, (c->isar >> 3) & 7, c->isar & 7, c->w,
-        c->sign ? "+" : "-", c->carry, c->zero, c->overflow, c->icb, (unsigned long long)c->cycles,
-        (unsigned long long)c->instructions, c->illegal_count, c->vpos, c->hpos, c->frame,
-        chf_machine_name(c->machine),
-        c->bios == CHF_ROM_SL31253 ? "sl31253" : c->bios == CHF_ROM_SL90025 ? "sl90025" : "the stand-in");
-    if (c->illegal_count && c->illegal_pc >= 0) {
-        /* the last illegal opcode's address, on the line it belongs to */
-        len = addf(buf, len, sizeof buf, "Last illegal opcode at $%04X\n", c->illegal_pc & 0xffff);
-    }
-    view_set(d->cpu_state, buf);
+    if (c->k_depth < 0) snprintf(buf, sizeof buf, "K depth -  (r59 = %02o)", c->r[59]);
+    else snprintf(buf, sizeof buf, "K depth %d  (r59 = %d)", c->k_depth, c->r[59]);
+    set_label(d->kdepth, buf);
+    snprintf(buf, sizeof buf, "PC $%04X   Line %d  Cycle %d  Frame %u  Cycles %llu%s", (unsigned)c->pc & 0xFFFFu, c->vpos,
+             c->hpos, (unsigned)c->frame, (unsigned long long)c->cycles,
+             c->illegal_count ? "  (illegal opcodes run)" : "");
+    set_label(d->beam, buf);
+    dbg_scratch_update(d->scratch, c, d->changed_mask, d->mono, d->mono_w, d->mono_h, d->dpi);
+    refresh_kstack(d);
+}
 
-    /* the BIOS's K stack: r59 points at the top (40..58), two bytes a return */
-    len = 0;
-    if (c->k_depth < 0) {
-        len = addf(buf, len, sizeof buf, "r59 = %02o (octal 0%o): not a K-stack pointer", c->r[59], c->r[59]);
-        len = addf(buf, len, sizeof buf, "\n(r40-r59 is the stack; r59 odd, 40-58 when in use)");
-    } else {
-        len = addf(buf, len, sizeof buf, "r59 = %d (depth %d)", c->r[59], c->k_depth);
-        for (i = 0; i < c->k_depth && i < 10; i++)
-            len = addf(buf, len, sizeof buf, "\n%2d: $%04X", i + 1, c->k_stack[i]);
-        if (c->k_depth == 0) len = addf(buf, len, sizeof buf, "\n(empty)");
+/* ---- the memory dump ------------------------------------------------------------ */
+
+/* An EDIT cannot give a byte range its own background, so the dump is a
+ * small window class: a header line and a row of 16 bytes a line, painted by
+ * hand, scrolled on its own scroll bar, the highlighted range (Go to, Find,
+ * a watch) in the accent. It shows the space selected. */
+static int mem_lines(const debugger *d)
+{
+    return (d->mem_size + 15) / 16 + 1;
+}
+
+static int mem_addr_w(const debugger *d)
+{
+    return d->mem_digits + 2;
+}
+
+static int mem_vis_rows(debugger *d)
+{
+    RECT c;
+    GetClientRect(d->mem_view, &c);
+    return d->line_h > 0 && c.bottom > d->line_h ? c.bottom / d->line_h : 1;
+}
+
+static void mem_sync_scroll(debugger *d)
+{
+    SCROLLINFO si;
+    const int vis = mem_vis_rows(d), total = mem_lines(d);
+    int max_first = total - vis;
+    if (max_first < 0) max_first = 0;
+    if (d->mem_first > max_first) d->mem_first = max_first;
+    if (d->mem_first < 0) d->mem_first = 0;
+    memset(&si, 0, sizeof si);
+    si.cbSize = sizeof si;
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = total - 1;
+    si.nPage = (UINT)vis;
+    si.nPos = d->mem_first;
+    SetScrollInfo(d->mem_view, SB_VERT, &si, TRUE);
+}
+
+static void mem_scroll_to(debugger *d, int first)
+{
+    d->mem_first = first;
+    mem_sync_scroll(d);
+    InvalidateRect(d->mem_view, NULL, FALSE);
+}
+
+/* A row's address in the space's own notation. */
+static int mem_addr_text(const debugger *d, int base, char *out, size_t n)
+{
+    if (d->mem_sp == CHF_SPACE_SCRATCH) return snprintf(out, n, "r%02d", base);
+    return snprintf(out, n, "%0*X", d->mem_digits, base);
+}
+
+static void paint_mem(debugger *d, HDC dc, const RECT *c)
+{
+    const int x0 = S(d, 4), cw = d->mono_w, total = mem_lines(d), aw = mem_addr_w(d);
+    int i, col;
+    FillRect(dc, c, GetSysColorBrush(COLOR_WINDOW));
+    SelectObject(dc, d->mono);
+    SetBkMode(dc, TRANSPARENT);
+    for (i = 0; (d->mem_first + i) < total && i * d->line_h < c->bottom; i++) {
+        const int line = d->mem_first + i, y = i * d->line_h, ty = y + (d->line_h - d->mono_h) / 2;
+        char t[24];
+        if (line == 0) {
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            for (col = 0; col < 16; col++) {
+                const int len = d->mem_sp == CHF_SPACE_SCRATCH ? snprintf(t, sizeof t, "%d", col)
+                                                               : snprintf(t, sizeof t, "%X", col);
+                TextOutA(dc, x0 + cw * (aw + col * 3 + (col >= 8)), ty, t, len);
+            }
+        } else {
+            const int base = (line - 1) * 16;
+            const uint8_t *r = d->mem_buf + (line - 1) * 16;
+            const int hl_here = d->mem_hl && d->mem_hl_space == d->mem_sp;
+            int len = mem_addr_text(d, base, t, sizeof t);
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            TextOutA(dc, x0, ty, t, len);
+            for (col = 0; col < 16; col++) {
+                const int hl = hl_here && (uint32_t)(base + col) >= d->mem_hl_lo && (uint32_t)(base + col) <= d->mem_hl_hi;
+                const int bx = x0 + cw * (aw + col * 3 + (col >= 8));
+                const int ax = x0 + cw * (aw + 16 * 3 + 2 + col);
+                char a = (char)(r[col] >= 0x20 && r[col] < 0x7F ? r[col] : '.');
+                if (base + col >= d->mem_size) break;
+                if (hl) {
+                    RECT b1 = { bx - 1, y, bx + 2 * cw + 1, y + d->line_h };
+                    RECT b2 = { ax, y, ax + cw, y + d->line_h };
+                    FillRect(dc, &b1, chf_accent_brush());
+                    FillRect(dc, &b2, chf_accent_brush());
+                    SetTextColor(dc, CHF_ACCENT_TEXT);
+                } else {
+                    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+                }
+                len = snprintf(t, sizeof t, "%02X", r[col]);
+                TextOutA(dc, bx, ty, t, len);
+                TextOutA(dc, ax, ty, &a, 1);
+            }
+            {
+                char region[64];
+                const int rx = x0 + cw * (aw + 16 * 3 + 2 + 16 + 2);
+                region[0] = '\0';
+                if (d->mem_sp == CHF_SPACE_PROG)
+                    chfmem_region_name(d->mem_map, d->mem_map_count, (uint16_t)base, region, sizeof region);
+                else if (d->mem_sp == CHF_SPACE_VRAM)
+                    snprintf(region, sizeof region, "row %d, columns %d-%d", base / 128, base % 128, base % 128 + 15);
+                SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                TextOutA(dc, rx, ty, region, (int)strlen(region));
+            }
+        }
     }
-    view_set(d->kstack, buf);
-    InvalidateRect(d->scr_grid, NULL, FALSE);
+}
+
+static LRESULT CALLBACK memview_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    debugger *d = g_dbg;
+    if (!d) return DefWindowProcA(hwnd, msg, wp, lp);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps), mem;
+        RECT c;
+        HBITMAP bmp;
+        HGDIOBJ oldbmp;
+        GetClientRect(hwnd, &c);
+        mem = CreateCompatibleDC(dc);
+        bmp = CreateCompatibleBitmap(dc, c.right > 0 ? c.right : 1, c.bottom > 0 ? c.bottom : 1);
+        oldbmp = SelectObject(mem, bmp);
+        paint_mem(d, mem, &c);
+        BitBlt(dc, 0, 0, c.right, c.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldbmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        RECT c;
+        GetClientRect(hwnd, &c);
+        paint_mem(d, (HDC)wp, &c);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (d->mem_view == hwnd) mem_sync_scroll(d);
+        return 0;
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        int rows = -delta * 3 / WHEEL_DELTA;
+        if (!rows) rows = delta > 0 ? -1 : 1;
+        mem_scroll_to(d, d->mem_first + rows);
+        return 0;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO si;
+        const int vis = mem_vis_rows(d);
+        int first = d->mem_first;
+        memset(&si, 0, sizeof si);
+        si.cbSize = sizeof si;
+        si.fMask = SIF_TRACKPOS;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: first--; break;
+        case SB_LINEDOWN: first++; break;
+        case SB_PAGEUP: first -= vis; break;
+        case SB_PAGEDOWN: first += vis; break;
+        case SB_TOP: first = 0; break;
+        case SB_BOTTOM: first = mem_lines(d); break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: first = si.nTrackPos; break;
+        default: break;
+        }
+        mem_scroll_to(d, first);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        const int vis = mem_vis_rows(d);
+        int first = d->mem_first;
+        switch (wp) {
+        case VK_UP: first--; break;
+        case VK_DOWN: first++; break;
+        case VK_PRIOR: first -= vis; break;
+        case VK_NEXT: first += vis; break;
+        case VK_HOME: first = 0; break;
+        case VK_END: first = mem_lines(d); break;
+        default: return DefWindowProcA(hwnd, msg, wp, lp);
+        }
+        mem_scroll_to(d, first);
+        return 0;
+    }
+    default: break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void refresh_mem(debugger *d)
+{
+    static const int digits[NSPACES] = { 4, 3, 4, 5, 2 };
+    int size = chfdebug_space_size(d->dbg, d->mem_sp);
+    d->mem_digits = digits[d->mem_sp];
+    if (size < 0) size = 0;
+    if (size > MEM_BYTES) size = MEM_BYTES;
+    d->mem_size = size;
+    memset(d->mem_buf, 0, MEM_BYTES);
+    if (size > 0) chfdebug_read(d->dbg, d->mem_sp, 0, d->mem_buf, size);
+    if (d->mem_sp == CHF_SPACE_PROG) {
+        d->mem_map_count = chfdebug_memory_map(d->dbg, d->mem_map, MEM_REGION_MAX);
+        if (d->mem_map_count < 0) d->mem_map_count = 0;
+    }
+    if (d->mem_recentre) {
+        /* a new stop: PROG to the PC, a third of the way down; VRAM to the cell the next strobe writes */
+        d->mem_recentre = 0;
+        if (d->mem_sp == CHF_SPACE_PROG) {
+            chfdebug_cpu cpu;
+            chfdebug_cpu_get(d->dbg, &cpu);
+            mem_scroll_to(d, 1 + (cpu.pc & 0xFFFF) / 16 - mem_vis_rows(d) / 3);
+        } else if (d->mem_sp == CHF_SPACE_VRAM) {
+            chfdebug_video v;
+            chfdebug_video_get(d->dbg, &v);
+            mem_scroll_to(d, 1 + (v.row * 128 + v.col) / 16 - mem_vis_rows(d) / 3);
+        } else {
+            mem_scroll_to(d, 0);
+        }
+    }
+    mem_sync_scroll(d);
+    InvalidateRect(d->mem_view, NULL, FALSE);
+}
+
+static void layout(debugger *d);
+
+/* The Memory tab shows `space`: its dump, and the scratchpad grid above it for SCRATCH. */
+static void set_mem_space(debugger *d, int space)
+{
+    if (space < 0 || space >= NSPACES) return;
+    if (space != d->mem_sp) {
+        d->mem_sp = space;
+        d->mem_first = 0;
+        d->mem_recentre = 1;
+    }
+    d->updating = 1;
+    SendMessageA(d->mem_space, CB_SETCURSEL, (WPARAM)space, 0);
+    d->updating = 0;
+    set_label(d->mem_title, k_space_titles[space]);
+    ShowWindow(d->scratch, space == CHF_SPACE_SCRATCH ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->kstack_head, space == CHF_SPACE_SCRATCH ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->kstack, space == CHF_SPACE_SCRATCH ? SW_SHOW : SW_HIDE);
+    layout(d);
     refresh_mem(d);
 }
 
-void dbg_scratch_pick(debugger *d, int reg)
+/* lo..hi of `space` highlighted and scrolled to in the dump (a Go to, a Find,
+ * a watch's Memory button). */
+static void show_in_memory(debugger *d, int space, uint32_t lo, uint32_t hi)
 {
-    char t[16];
-    snprintf(t, sizeof t, "%02o", reg);
-    dbg_label_set(d->scr_reg, t);
-    snprintf(t, sizeof t, "%02X", d->cpu.r[reg & 63]);
-    dbg_label_set(d->scr_val, t);
-    SetFocus(d->scr_val);
-    SendMessageW(d->scr_val, EM_SETSEL, 0, -1);
+    int line;
+    d->mem_hl = 1;
+    d->mem_hl_space = space;
+    d->mem_hl_lo = lo;
+    d->mem_hl_hi = hi;
+    d->mem_recentre = 0;
+    if (space != d->mem_sp) set_mem_space(d, space);
+    else refresh_mem(d);
+    /* the row 30% of the way down */
+    line = 1 + (int)(lo / 16) - mem_vis_rows(d) * 3 / 10;
+    mem_scroll_to(d, line > 0 ? line : 0);
 }
 
-void dbg_refresh_disasm(debugger *d)
+/* The disassembly rows the view has room for. */
+static int disasm_rows(debugger *d)
 {
     RECT c;
-    int pc_line = -1, rows;
-    const int follow = SendMessageW(d->follow_pc, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    int rows;
+    if (!d->disasm || d->line_h <= 0) return 1;
     GetClientRect(d->disasm, &c);
-    rows = d->mono_h > 0 ? c.bottom / d->mono_h : 1;
+    rows = (c.bottom - c.top) / d->line_h;
     if (rows < 1) rows = 1;
     if (rows > DISASM_MAX) rows = DISASM_MAX;
-    if (follow) {
-        /* the PC a third of the way down, so what led to it shows too */
-        chfdebug_cpu cpu;
-        chfdebug_cpu_get(d->dbg, &cpu);
-        d->disasm_top = chfdebug_row_address(d->dbg, (uint16_t)cpu.pc, -(rows / 3));
+    return rows;
+}
+
+static int row_address(debugger *d, int addr, int rows)
+{
+    const int a = chfdebug_row_address(d->dbg, (uint16_t)addr, rows);
+    return a < 0 ? addr : a & 0xFFFF;
+}
+
+static int following(debugger *d)
+{
+    return SendMessageA(d->follow_pc, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+static void refresh_disasm(debugger *d)
+{
+    int pc_line = -1;
+    const int rows = disasm_rows(d);
+
+    if (following(d) || d->recentre) {
+        /* the PC a third of the way down, so what led to it shows too; after a
+         * stop, even if the user had scrolled away */
+        chfdebug_cpu c;
+        chfdebug_cpu_get(d->dbg, &c);
+        d->disasm_top = row_address(d, c.pc & 0xFFFF, -(rows / 3));
     }
+    d->recentre = 0;
     d->line_count = chfdebug_disassemble(d->dbg, (uint16_t)d->disasm_top, d->lines, rows, &pc_line);
+    if (d->line_count < 0) d->line_count = 0;
     d->pc_line = pc_line;
     InvalidateRect(d->disasm, NULL, FALSE);
 }
 
-/* The controllers, the beeper and the 2102 Videocarts' RAM port. */
-static void refresh_io(debugger *d)
+static void lv_set(HWND lv, int row, int col, const char *text)
 {
-    static char s[2048], lg[EVENTS_MAX * 80 + 64];
-    size_t len = 0;
-    int i, follow;
-    static const char *const freq[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
-    chfdebug_io_get(d->dbg, &d->io);
-    chfdebug_video_get(d->dbg, &d->vid);
-    InvalidateRect(d->io_draw, NULL, FALSE);
-
-    len = addf(s, len, sizeof s, "Machine   %s%s\nCartridge type %d   %s\n", chf_machine_name(d->io.machine),
-               d->io.is_pal ? " (PAL)" : "", d->io.cart_type, d->io.reset_held ? "RESET held" : "RESET released");
-    len = addf(s, len, sizeof s, "Beeper    %s, level %d%s\n          %u mode changes, %llu samples\n", freq[d->io.sound_mode & 3],
-               d->io.sound_level, d->io.sound_forced ? " (forced on)" : "", d->io.sound_changes,
-               (unsigned long long)d->io.audio_samples);
-    if (d->io.has_2102)
-        len = addf(s, len, sizeof s, "2102 RAM  port $%02X, address $%03X (%u), bit %d\n", d->io.ram_port,
-                   d->io.ram_addr, d->io.ram_addr, d->io.ram_bit);
-    else
-        len = addf(s, len, sizeof s, "2102 RAM  none (the Maze and Hangman Videocarts have one)\n");
-    view_set(d->io_state, s);
-
-    d->nsnd = chfdebug_sound_events(d->dbg, d->snd_events, EVENTS_MAX);
-    if (d->nsnd < 0) d->nsnd = 0;
-    len = 0;
-    lg[0] = '\0';
-    for (i = 0; i < d->nsnd; i++) {
-        const chfdebug_sound_event *e = &d->snd_events[i];
-        len = addf(lg, len, sizeof lg, "%sf%-6u pc $%04X  mode %d -> %d  (%s)", i ? "\n" : "", e->frame, e->pc,
-                   e->old_mode, e->mode, freq[e->mode & 3]);
-    }
-    if (d->nsnd == 0) len = addf(lg, len, sizeof lg, "(no mode changes since the debugger attached)");
-    follow = view_at_end(d, d->snd_log);
-    view_set_at(d->snd_log, lg, follow);
-
-    d->nio = chfdebug_io_events(d->dbg, d->io_events, EVENTS_MAX);
-    if (d->nio < 0) d->nio = 0;
-    len = 0;
-    lg[0] = '\0';
-    for (i = 0; i < d->nio; i++) {
-        const chfdebug_io_event *e = &d->io_events[i];
-        len = addf(lg, len, sizeof lg, "%sf%-6u pc $%04X  %s $%02X %s $%02X", i ? "\n" : "", e->frame, e->pc,
-                   e->is_write ? "OUT" : "IN ", e->port, e->is_write ? "<-" : "->", e->value);
-    }
-    if (d->nio == 0) len = addf(lg, len, sizeof lg, "(no port accesses since the debugger attached)");
-    follow = view_at_end(d, d->io_log);
-    view_set_at(d->io_log, lg, follow);
+    wchar_t w[256];
+    LVITEMW it;
+    wide(text, w, 256);
+    memset(&it, 0, sizeof it);
+    it.iSubItem = col;
+    it.pszText = w;
+    SendMessageW(lv, LVM_SETITEMTEXTW, (WPARAM)row, (LPARAM)&it);
 }
 
-static const char *bp_where(const chfdebug_breakpoint *b, char *out, size_t n)
+static int page_visible(debugger *d, int page)
 {
-    switch (b->type) {
-    case CHFDEBUG_BP_VRAM:
-        if (b->start == b->end) snprintf(out, n, "r%d,c%d", b->start / 128, b->start % 128);
-        else snprintf(out, n, "r%d,c%d-r%d,c%d", b->start / 128, b->start % 128, b->end / 128, b->end % 128);
-        break;
-    case CHFDEBUG_BP_SCRATCH:
-        if (b->start == b->end) snprintf(out, n, "r%d", b->start);
-        else snprintf(out, n, "r%d-r%d", b->start, b->end);
-        break;
-    case CHFDEBUG_BP_IN: case CHFDEBUG_BP_OUT:
-        if (b->start == b->end) snprintf(out, n, "$%02X", b->start);
-        else snprintf(out, n, "$%02X-$%02X", b->start, b->end);
-        break;
-    default:
-        if (b->start == b->end) snprintf(out, n, "$%04X", b->start);
-        else snprintf(out, n, "$%04X-$%04X", b->start, b->end);
-        break;
-    }
-    return out;
+    return d->popped[page] != NULL || d->page == page;
 }
 
-static const char *bp_kind(int type)
+/* The list, or (empty) the hint in its place. */
+static void show_bp_list(debugger *d)
 {
-    switch (type) {
-    case CHFDEBUG_BP_EXEC: return "exec";
-    case CHFDEBUG_BP_READ: return "read";
-    case CHFDEBUG_BP_WRITE: return "write";
-    case CHFDEBUG_BP_IN: return "in";
-    case CHFDEBUG_BP_OUT: return "out";
-    case CHFDEBUG_BP_VRAM: return "vram";
-    case CHFDEBUG_BP_SCRATCH: return "scratch";
-    default: return "?";
-    }
+    const int on = page_visible(d, TAB_BREAKS);
+    ShowWindow(d->bp_list, on && d->nbps > 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(d->bp_empty, on && d->nbps == 0 ? SW_SHOW : SW_HIDE);
 }
 
+/* "Stopped: <why>" / "Running." over the list. */
+static void refresh_bp_stop(debugger *d)
+{
+    char reason[160], text[200];
+    int addr;
+    if (chfdebug_is_stopped(d->dbg)) {
+        reason[0] = '\0';
+        chfdebug_stop_reason(d->dbg, reason, sizeof reason, &addr);
+        snprintf(text, sizeof text, reason[0] ? "Stopped: %s" : "Stopped.", reason);
+    } else {
+        snprintf(text, sizeof text, "Running.");
+    }
+    set_label(d->bp_stop, text);
+}
+
+/* Rebuilt only when something in it changed (each step refreshes), keeping
+ * the selected breakpoint selected. */
 static void refresh_bps(debugger *d)
 {
-    int i, sel = (int)SendMessageW(d->bp_list, LB_GETCURSEL, 0, 0);
+    static char sig[sizeof d->bp_sig];
+    size_t len = 0;
+    int i, sel_id = -1;
+    const int sel = (int)SendMessageA(d->bp_list, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+
+    refresh_bp_stop(d);
+    if (sel >= 0 && sel < d->nbps) sel_id = d->bps[sel].id;
     d->nbps = chfdebug_breakpoint_list(d->dbg, d->bps, MAX_BPS);
     if (d->nbps < 0) d->nbps = 0;
-    SendMessageW(d->bp_list, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(d->bp_list, LB_RESETCONTENT, 0, 0);
+    sig[0] = '\0';
+    for (i = 0; i < d->nbps; i++) {
+        char desc[256];
+        chfbp_describe(d->dbg, &d->bps[i], desc, sizeof desc);
+        len = addf(sig, len, sizeof sig, "%d %d %u %s\n", d->bps[i].id, d->bps[i].enabled, d->bps[i].hits, desc);
+    }
+    if (d->bp_sig_ok && strcmp(sig, d->bp_sig) == 0) { show_bp_list(d); return; }
+    memcpy(d->bp_sig, sig, sizeof sig);
+    d->bp_sig_ok = 1;
+
+    d->updating = 1;
+    SendMessageA(d->bp_list, LVM_DELETEALLITEMS, 0, 0);
     for (i = 0; i < d->nbps; i++) {
         const chfdebug_breakpoint *b = &d->bps[i];
-        char line[300], where[64];
-        wchar_t w[300];
-        snprintf(line, sizeof line, "%c %3d  %-7s  %-18s  hits %-6u %s%s", b->enabled ? '+' : '-', b->id,
-                 bp_kind(b->type), bp_where(b, where, sizeof where), b->hits, b->condition[0] ? "if " : "",
-                 b->condition);
-        dbg_wide_from(line, w, 300);
-        SendMessageW(d->bp_list, LB_ADDSTRING, 0, (LPARAM)w);
+        LVITEMA it;
+        char id[16], desc[256], hits[24];
+        snprintf(id, sizeof id, "#%d", b->id);
+        chfbp_describe(d->dbg, b, desc, sizeof desc);
+        snprintf(hits, sizeof hits, "%u", b->hits);
+        memset(&it, 0, sizeof it);
+        it.mask = LVIF_TEXT;
+        it.iItem = i;
+        it.pszText = id;
+        SendMessageA(d->bp_list, LVM_INSERTITEMA, 0, (LPARAM)&it);
+        lv_set(d->bp_list, i, 1, desc);
+        lv_set(d->bp_list, i, 2, hits);
+        memset(&it, 0, sizeof it);
+        it.stateMask = LVIS_STATEIMAGEMASK | LVIS_SELECTED | LVIS_FOCUSED;
+        it.state = INDEXTOSTATEIMAGEMASK(b->enabled ? 2 : 1);
+        if (b->id == sel_id) it.state |= LVIS_SELECTED | LVIS_FOCUSED;
+        SendMessageA(d->bp_list, LVM_SETITEMSTATE, (WPARAM)i, (LPARAM)&it);
     }
-    if (d->nbps == 0)
-        SendMessageW(d->bp_list, LB_ADDSTRING, 0,
-                     (LPARAM)L"(no breakpoints -- double-click a disassembly line, or add one below)");
-    if (sel >= 0 && sel < d->nbps) SendMessageW(d->bp_list, LB_SETCURSEL, (WPARAM)sel, 0);
-    SendMessageW(d->bp_list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(d->bp_list, NULL, FALSE);
+    d->updating = 0;
+    show_bp_list(d);
 }
+
+/* ---- watches ---------------------------------------------------------------------- */
+
+/* The rows are rebuilt when a value or the list changed, keeping the
+ * selection. */
+static void refresh_watches(debugger *d)
+{
+    static char sig[sizeof d->wt_sig];
+    const int n = chfwatch_count();
+    const int keep = (int)SendMessageA(d->wt_list, LB_GETCURSEL, 0, 0);
+    char lines[CHFWATCH_MAX][120];
+    size_t len = 0;
+    int i;
+
+    sig[0] = '\0';
+    for (i = 0; i < n; i++) {
+        chfwatch_format(d->dbg, i, lines[i], sizeof lines[i]);
+        len = addf(sig, len, sizeof sig, "%s\n", lines[i]);
+    }
+    if (d->wt_sig_ok && strcmp(sig, d->wt_sig) == 0) return;
+    memcpy(d->wt_sig, sig, sizeof sig);
+    d->wt_sig_ok = 1;
+    SendMessageA(d->wt_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageA(d->wt_list, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < n; i++) SendMessageA(d->wt_list, LB_ADDSTRING, 0, (LPARAM)lines[i]);
+    if (keep >= 0 && keep < n) SendMessageA(d->wt_list, LB_SETCURSEL, (WPARAM)keep, 0);
+    SendMessageA(d->wt_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(d->wt_list, NULL, TRUE);
+}
+
+/* ---- cart & I/O ------------------------------------------------------------------- */
 
 static int cart_is_fujinet(const chfdebug_cart *c)
 {
     return c->present && c->type_name && strcmp(c->type_name, "FujiNet") == 0;
 }
 
+/* A hex dump of the mailbox page ($F800-$FFFF), 16 bytes a line. */
+static size_t mailbox_dump(char *s, size_t cap, const uint8_t *page)
+{
+    size_t len = 0;
+    int row, col;
+    for (row = 0; row < 0x800 / 16; row++) {
+        len = addf(s, len, cap, "%04X ", 0xF800 + row * 16);
+        for (col = 0; col < 16; col++) len = addf(s, len, cap, " %02X", page[row * 16 + col]);
+        len = addf(s, len, cap, "\n");
+    }
+    return len;
+}
+
 static void refresh_cart(debugger *d)
 {
-    chfdebug_cart *c = &d->cart_state;
-    char info[256];
-    static char s[6144], ev[EVENTS_MAX * 80 + 64];
-    static char dump[MAILBOX_SIZE / 16 * 56 + 256];
-    size_t len = 0;
-    int i, follow;
+    static char text[16384], current[16384], dump[0x800 / 16 * 56 + 64], dump_current[0x800 / 16 * 56 + 64];
+    static char ev[EVENTS_MAX * 80 + 64], ev_current[EVENTS_MAX * 80 + 64];
+    static char logbuf[EVENTS_MAX * 80 + 64], log_current[EVENTS_MAX * 80 + 64];
+    static char ports[2048], ports_current[2048];
     static const char *const kinds[5] = { "?", "REG", "TX", "BANK", "SWAP" };
+    chfdebug_cart *c = &d->cart_state;
+    size_t len = 0;
+    int index;
+    char info[256];
+
     chfdebug_cart_get(d->dbg, c);
     chfdebug_cart_info(d->dbg, info, sizeof info);
-    if (!c->present) {
-        view_set(d->cart_text, "No cartridge is running.");
-        view_set(d->cart_mailbox, "");
-        view_set(d->cart_events, "");
-        return;
-    }
-    len = addf(s, len, sizeof s, "%s\n\nType            %s\n", info, c->type_name ? c->type_name : "?");
-    if (cart_is_fujinet(c)) {
-        const uint8_t *sp = c->status_page;
-        len = addf(s, len, sizeof s,
-            "Link            %s%s\n"
-            "Mailbox         %s\n"
-            "Running         %s\n"
-            "Armed           %s\n"
-            "Live image      %u bytes, CRC-32 %08X\n",
-            c->link_up ? "up" : "down", c->link_off ? " (switched off)" : "",
-            c->mailbox ? "open" : "closed",
-            c->app_live ? "a FujiNet app" : c->booted_game ? "a game from the network" : "CONFIG",
-            c->armed ? "yes (a swap waits for the console)" : "no", c->live_size, c->live_crc);
-        if (c->staged_size)
-            len = addf(s, len, sizeof s, "Staged          %s%s, %u bytes, CRC-32 %08X\n",
-                       c->staged_app ? "an app" : "a game", c->staged_mailbox ? " that claims the mailbox" : "",
-                       c->staged_size, c->staged_crc);
-        else
-            len = addf(s, len, sizeof s, "Staged          nothing\n");
-        len = addf(s, len, sizeof s, "Swaps           %d\nAPPBANK pages   %d", c->swaps, c->npages);
-        if (c->page >= 0) len = addf(s, len, sizeof s, ", page %d at $4800\n", c->page);
-        else len = addf(s, len, sizeof s, ", none showing at $4800\n");
-        len = addf(s, len, sizeof s,
-            "Boot            state %d   %d%%   error %d\n\n"
-            "The status page ($FC00-$FC0F)\n"
-            "  ACKSEQ $%02X   STATUS $%02X (link %d, busy %d)   ERR $%02X   REPLY_CMD $%02X\n"
-            "  RXLEN %u   BOOT_STATE %u   BOOT_PCT %u   BOOT_ERR %u\n"
-            "  MAGIC \"%c%c\"   PROTO_VER %u   TICK %u (60 Hz count)\n"
-            "Queue           %u deep\n",
-            c->boot_state, c->boot_pct, c->boot_err, sp[0], sp[1], sp[1] & 1, (sp[1] >> 1) & 1, sp[2], sp[3],
-            sp[4] | (sp[5] << 8), sp[6], sp[7], sp[8], sp[9] >= 32 && sp[9] < 127 ? sp[9] : '.',
-            sp[10] >= 32 && sp[10] < 127 ? sp[10] : '.', sp[11], c->tick, c->queue_depth);
-        hexdump(dump, sizeof dump, c->mailbox_page, MAILBOX_SIZE, MAILBOX_BASE, 4);
-        view_set(d->cart_mailbox, dump);
-    } else {
-        len = addf(s, len, sizeof s, "Softlist        %s\n", c->softlist_name ? c->softlist_name : "(not in the list)");
-        if (c->description) len = addf(s, len, sizeof s, "Description     %s\n", c->description);
-        len = addf(s, len, sizeof s, "ROM             %u bytes, CRC-32 %08X\n", c->rom_size, c->rom_crc);
-        if (c->ram_size) len = addf(s, len, sizeof s, "RAM             %u %s\n", c->ram_size,
-                                    c->ram_size == 1024 ? "bits (a 2102)" : "bytes");
-        else len = addf(s, len, sizeof s, "RAM             none\n");
-        if (c->bank || c->half) len = addf(s, len, sizeof s, "Bank            %d (half %d)\n", c->bank, c->half);
-        view_set(d->cart_mailbox, "(the mailbox page is the FujiNet cartridge's)");
-    }
-    view_set(d->cart_text, s);
+    chfdebug_io_get(d->dbg, &d->io);
+    chfdebug_video_get(d->dbg, &d->vid);
+    d->mem_map_count = chfdebug_memory_map(d->dbg, d->mem_map, MEM_REGION_MAX);
+    if (d->mem_map_count < 0) d->mem_map_count = 0;
+    dbg_lamps_update(d->lamps, &d->io, &d->vid, d->mono, d->mono_w, d->mono_h, d->dpi);
 
-    d->ncart_ev = chfdebug_cart_events(d->dbg, d->cart_events_buf, EVENTS_MAX);
-    if (d->ncart_ev < 0) d->ncart_ev = 0;
-    len = 0;
-    ev[0] = '\0';
-    for (i = 0; i < d->ncart_ev; i++) {
-        const chfdebug_cart_event *e = &d->cart_events_buf[i];
-        len = addf(ev, len, sizeof ev, "%sf%-6u pc $%04X  %-4s reg $%02X = $%02X", i ? "\n" : "", e->frame, e->pc,
-                   kinds[e->kind <= 4 ? e->kind : 0], e->reg, e->value);
+    if (!c->present) {
+        len = addf(text, len, sizeof text, "No cartridge is running.\n");
+        dump[0] = '\0';
+    } else {
+        len = addf(text, len, sizeof text, "%s\n\nType            %s\n", info, c->type_name ? c->type_name : "?");
+        if (cart_is_fujinet(c)) {
+            const uint8_t *sp = c->status_page;
+            len = addf(text, len, sizeof text,
+                "Link            %s%s\n"
+                "Mailbox         %s\n"
+                "Running         %s\n"
+                "Armed           %s\n"
+                "Live image      %u bytes, CRC-32 %08X\n",
+                c->link_up ? "up" : "down", c->link_off ? " (switched off)" : "",
+                c->mailbox ? "open" : "closed",
+                c->app_live ? "a FujiNet app" : c->booted_game ? "a game from the network" : "CONFIG",
+                c->armed ? "yes (a swap waits for the console)" : "no", c->live_size, c->live_crc);
+            if (c->staged_size)
+                len = addf(text, len, sizeof text, "Staged          %s%s, %u bytes, CRC-32 %08X\n",
+                           c->staged_app ? "an app" : "a game", c->staged_mailbox ? " that claims the mailbox" : "",
+                           c->staged_size, c->staged_crc);
+            else
+                len = addf(text, len, sizeof text, "Staged          nothing\n");
+            len = addf(text, len, sizeof text, "Swaps           %d\nAPPBANK pages   %d", c->swaps, c->npages);
+            if (c->page >= 0) len = addf(text, len, sizeof text, ", page %d at $4800\n", c->page);
+            else len = addf(text, len, sizeof text, ", none showing at $4800\n");
+            len = addf(text, len, sizeof text,
+                "Boot            state %d   %d%%   error %d\n\n"
+                "The status page ($FC00-$FC0F)\n"
+                "  ACKSEQ $%02X   STATUS $%02X (link %d, busy %d)   ERR $%02X   REPLY_CMD $%02X\n"
+                "  RXLEN %u   BOOT_STATE %u   BOOT_PCT %u   BOOT_ERR %u\n"
+                "  MAGIC \"%c%c\"   PROTO_VER %u   TICK %u (60 Hz count)\n"
+                "Queue           %u deep\n",
+                c->boot_state, c->boot_pct, c->boot_err, sp[0], sp[1], sp[1] & 1, (sp[1] >> 1) & 1, sp[2], sp[3],
+                sp[4] | (sp[5] << 8), sp[6], sp[7], sp[8], sp[9] >= 32 && sp[9] < 127 ? sp[9] : '.',
+                sp[10] >= 32 && sp[10] < 127 ? sp[10] : '.', sp[11], c->tick, c->queue_depth);
+            mailbox_dump(dump, sizeof dump, c->mailbox_page);
+        } else {
+            len = addf(text, len, sizeof text, "Softlist        %s\n", c->softlist_name ? c->softlist_name : "(not in the list)");
+            if (c->description) len = addf(text, len, sizeof text, "Description     %s\n", c->description);
+            len = addf(text, len, sizeof text, "ROM             %u bytes, CRC-32 %08X\n", c->rom_size, c->rom_crc);
+            if (c->ram_size) len = addf(text, len, sizeof text, "RAM             %u %s\n", c->ram_size,
+                                        c->ram_size == 1024 ? "bits (a 2102)" : "bytes");
+            else len = addf(text, len, sizeof text, "RAM             none\n");
+            if (c->bank || c->half) len = addf(text, len, sizeof text, "Bank            %d (half %d)\n", c->bank, c->half);
+            snprintf(dump, sizeof dump, "(the mailbox page is the FujiNet cartridge's)");
+        }
     }
-    if (d->ncart_ev == 0) len = addf(ev, len, sizeof ev, "(no cartridge events since the debugger attached)");
-    follow = view_at_end(d, d->cart_events);
-    view_set_at(d->cart_events, ev, follow);
+    len = addf(text, len, sizeof text, "\nMemory map (PROG, as mapped now)\n");
+    for (index = 0; index < d->mem_map_count; index++)
+        len = addf(text, len, sizeof text, "  %04X-%04X  %c%c  %s\n", d->mem_map[index].low, d->mem_map[index].high,
+                   d->mem_map[index].readable ? 'r' : '-', d->mem_map[index].writable ? 'w' : '-',
+                   d->mem_map[index].name);
+    if (strcmp(text, current) != 0) {
+        memcpy(current, text, sizeof current);
+        set_text_at(d->cart_text, text, 0);
+    }
+    if (strcmp(dump, dump_current) != 0) {
+        memcpy(dump_current, dump, sizeof dump_current);
+        set_text_at(d->cart_mailbox, dump, 0);
+    }
+
+    /* the ports, raw / complemented / decoded, and the 2102 latch */
+    {
+        const chfdebug_video *v = &d->vid;
+        static const char *const freq[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
+        len = 0;
+        len = addf(ports, len, sizeof ports, "%s%s   %s\n", chf_machine_name(d->io.machine), d->io.is_pal ? " (PAL)" : "",
+                   d->io.reset_held ? "RESET held" : "RESET released");
+        len = addf(ports, len, sizeof ports, "Port   latch  ~latch  reads  meaning\n");
+        len = addf(ports, len, sizeof ports, "0      $%02X    $%02X    $%02X   strobe %s, controllers %s, panel latch $%X\n", v->port0,
+                   (~v->port0) & 0xFF, v->in0, v->strobe ? "up" : "down", v->controllers_enabled ? "read" : "off",
+                   v->panel_latch);
+        len = addf(ports, len, sizeof ports, "1      $%02X    $%02X    $%02X   value %d\n", v->port1, (~v->port1) & 0xFF, v->in1,
+                   v->value);
+        len = addf(ports, len, sizeof ports, "4      $%02X    $%02X    $%02X   column %d\n", v->port4, (~v->port4) & 0xFF, v->in4,
+                   v->col);
+        len = addf(ports, len, sizeof ports, "5      $%02X    $%02X    $%02X   row %d, sound %d (%s)\n", v->port5,
+                   (~v->port5) & 0xFF, v->in5, v->row, v->sound_mode, freq[v->sound_mode & 3]);
+        if (d->io.has_2102)
+            len = addf(ports, len, sizeof ports, "2102 RAM  port $%02X, address $%03X (%u), bit %d\n", d->io.ram_port,
+                       d->io.ram_addr, d->io.ram_addr, d->io.ram_bit);
+        else
+            len = addf(ports, len, sizeof ports, "2102 RAM  none (the Maze and Hangman Videocarts have one)\n");
+        if (strcmp(ports, ports_current) != 0) {
+            memcpy(ports_current, ports, sizeof ports_current);
+            set_text_at(d->ports_text, ports, 0);
+        }
+    }
+
+    /* the cartridge's events, and the port log */
+    {
+        int follow;
+        len = 0;
+        ev[0] = '\0';
+        d->ncart_ev = c->present ? chfdebug_cart_events(d->dbg, d->cart_events_buf, EVENTS_MAX) : 0;
+        if (d->ncart_ev < 0) d->ncart_ev = 0;
+        for (index = 0; index < d->ncart_ev; index++) {
+            const chfdebug_cart_event *e = &d->cart_events_buf[index];
+            len = addf(ev, len, sizeof ev, "%sf%-6u pc $%04X  %-4s reg $%02X = $%02X", index ? "\n" : "", e->frame, e->pc,
+                       kinds[e->kind <= 4 ? e->kind : 0], e->reg, e->value);
+        }
+        if (d->ncart_ev == 0) len = addf(ev, len, sizeof ev, "(no cartridge events since the debugger attached)");
+        if (strcmp(ev, ev_current) != 0) {
+            follow = edit_at_end(d, d->cart_events);
+            memcpy(ev_current, ev, sizeof ev_current);
+            set_text_at(d->cart_events, ev, follow);
+        }
+        len = 0;
+        logbuf[0] = '\0';
+        d->nio = chfdebug_io_events(d->dbg, d->io_events, EVENTS_MAX);
+        if (d->nio < 0) d->nio = 0;
+        for (index = 0; index < d->nio; index++) {
+            const chfdebug_io_event *e = &d->io_events[index];
+            len = addf(logbuf, len, sizeof logbuf, "%sf%-6u pc $%04X  %s $%02X %s $%02X", index ? "\n" : "", e->frame, e->pc,
+                       e->is_write ? "OUT" : "IN ", e->port, e->is_write ? "<-" : "->", e->value);
+        }
+        if (d->nio == 0) len = addf(logbuf, len, sizeof logbuf, "(no port accesses since the debugger attached)");
+        if (strcmp(logbuf, log_current) != 0) {
+            follow = edit_at_end(d, d->io_log);
+            memcpy(log_current, logbuf, sizeof log_current);
+            set_text_at(d->io_log, logbuf, follow);
+        }
+    }
+}
+
+/* The beeper: its mode and level, the ~2 ms forced-on interval and the
+ * sound-mode timeline. */
+static void refresh_sound(debugger *d)
+{
+    static char text[2048], current[2048], log[EVENTS_MAX * 80 + 64], log_current[EVENTS_MAX * 80 + 64];
+    static const char *const freq[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
+    chfdebug_io io;
+    size_t len = 0;
+    int index, level;
+
+    chfdebug_io_get(d->dbg, &io);
+    d->io = io;
+    level = io.sound_level < 0 ? 0 : io.sound_level > 32767 ? 32767 : io.sound_level;
+    len = addf(text, len, sizeof text, "Beeper     mode %d: %s%s\nLevel      %d of 32767\n", io.sound_mode,
+               freq[io.sound_mode & 3], io.sound_forced ? "   (forced on: the ~2 ms after a change)" : "", level);
+    len = addf(text, len, sizeof text, "Changes    %u mode changes, %llu samples since power-on\n", io.sound_changes,
+               (unsigned long long)io.audio_samples);
+    len = addf(text, len, sizeof text,
+               "\nThe Channel F has no sound chip: port 5 bits 7-6 pick the tone (0 off, 1 1 kHz, 2 500 Hz,\n"
+               "3 120 Hz) and the level shown is the beeper's envelope.\n");
+    if (strcmp(text, current) != 0) {
+        memcpy(current, text, sizeof current);
+        set_text_at(d->sound_text, text, 0);
+    }
+    SendMessageA(d->sound_level, PBM_SETPOS, (WPARAM)level, 0);
+
+    d->nsnd = chfdebug_sound_events(d->dbg, d->snd_events, EVENTS_MAX);
+    if (d->nsnd < 0) d->nsnd = 0;
+    len = 0;
+    log[0] = '\0';
+    for (index = 0; index < d->nsnd; index++) {
+        const chfdebug_sound_event *e = &d->snd_events[index];
+        len = addf(log, len, sizeof log, "%sf%-6u pc $%04X  mode %d -> %d  (%s)", index ? "\n" : "", e->frame, e->pc,
+                   e->old_mode, e->mode, freq[e->mode & 3]);
+    }
+    if (d->nsnd == 0) len = addf(log, len, sizeof log, "(no mode changes since the debugger attached)");
+    if (strcmp(log, log_current) != 0) {
+        const int follow = edit_at_end(d, d->sound_log);
+        memcpy(log_current, log, sizeof log_current);
+        set_text_at(d->sound_log, log, follow);
+    }
+}
+
+/* The symbol table, filtered by the box: address, name and ROM bank, in the
+ * engine's order (address, then name). The indices are fetched afresh every
+ * time: the engine reorders them when symbols are loaded or cleared. */
+static void refresh_symbols(debugger *d)
+{
+    char filter[96], signature[128], count_text[96];
+    int total, shown, index;
+
+    edit_text(d->sym_filter, filter, sizeof filter);
+    total = chfdebug_symbols_count(d->dbg);
+    shown = chfdebug_symbols_filter(d->dbg, strip(filter), d->sym_indices, SYMBOL_MAX);
+    if (shown < 0) shown = 0;
+    snprintf(signature, sizeof signature, "%d %d %s", total, shown, filter);
+    if (d->sym_shown >= 0 && strcmp(signature, d->sym_sig) == 0 && !d->sym_force) return;
+    d->sym_force = 0;
+    snprintf(d->sym_sig, sizeof d->sym_sig, "%s", signature);
+    d->sym_shown = shown;
+    SendMessageA(d->sym_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageA(d->sym_list, LVM_DELETEALLITEMS, 0, 0);
+    for (index = 0; index < shown; index++) {
+        uint16_t address = 0;
+        char name[96], address_text[16], bank_text[16];
+        int bank = CHFDEBUG_SYM_ANY;
+        LVITEMA item;
+        if (!chfdebug_symbols_get(d->dbg, d->sym_indices[index], &address, name, sizeof name, &bank)) continue;
+        if (bank == CHFDEBUG_SYM_PORT) {
+            snprintf(address_text, sizeof address_text, "%02X", address);
+            snprintf(bank_text, sizeof bank_text, "port");
+        } else {
+            snprintf(address_text, sizeof address_text, "%04X", address);
+            snprintf(bank_text, sizeof bank_text, bank >= 0 ? "%d" : "", bank);
+        }
+        memset(&item, 0, sizeof item);
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.pszText = address_text;
+        SendMessageA(d->sym_list, LVM_INSERTITEMA, 0, (LPARAM)&item);
+        lv_set(d->sym_list, index, 1, name);
+        lv_set(d->sym_list, index, 2, bank_text);
+    }
+    SendMessageA(d->sym_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(d->sym_list, NULL, TRUE);
+    snprintf(count_text, sizeof count_text, "%d of %d symbol%s", shown, total, total == 1 ? "" : "s");
+    set_label(d->sym_count, count_text);
+}
+
+/* ---- trace and history ------------------------------------------------------------- */
+
+/* Both tabs read the engine's one ring (newest first) and show the newest
+ * HIST_SHOWN matching entries, oldest first. Record on either toggles the
+ * same recorder. */
+static void hist_refresh(debugger *d, int idx, int force)
+{
+    static chfdebug_trace ring[HIST_RING];
+    static int hit[HIST_SHOWN];
+    static char text[HIST_SHOWN * 120];
+    const int on = chfdebug_trace_enabled(d->dbg);
+    const int total = chfdebug_trace_count(d->dbg);
+    uint16_t lo = 0, hi = 0xFFFF;
+    int filter = CHFDEBUG_TRACE_ALL, n, i, shown = 0, k;
+    uint64_t sig;
+    size_t len = 0;
+    char note[120], range[96], err[96];
+
+    for (k = 0; k < 2; k++) {                /* both Record buttons follow the engine */
+        const int was = SendMessageA(d->h_rec[k], BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (was != (on != 0)) {
+            SendMessageA(d->h_rec[k], BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+            InvalidateRect(d->h_rec[k], NULL, FALSE);
+        }
+    }
+    switch ((int)SendMessageA(d->h_filter[idx], CB_GETCURSEL, 0, 0)) {
+    case 1: filter = CHFDEBUG_TRACE_BRANCHES; break;
+    case 2:
+        edit_text(d->h_range[idx], range, sizeof range);
+        if (parse_range_ui(d, range, &lo, &hi, err, sizeof err)) filter = CHFDEBUG_TRACE_RANGE;
+        else {
+            set_label(d->h_note[idx], err);
+            return;
+        }
+        break;
+    default: break;
+    }
+    n = total > 0 ? chfdebug_trace_read(d->dbg, ring, HIST_RING) : 0;
+    /* what the view shows depends on the newest entry, the count and the filter */
+    sig = (uint64_t)n * 1000003u + (n ? ring[0].cycles * 31u + ring[0].pc : 0) + (uint64_t)filter * 7919u +
+          lo * 131u + hi + (uint64_t)on * 17u;
+    if (!force && d->h_ok[idx] && sig == d->h_sig[idx]) return;
+    d->h_sig[idx] = sig;
+    d->h_ok[idx] = 1;
+    for (i = 0; i < n && shown < HIST_SHOWN; i++)       /* newest matches first */
+        if (chfdebug_trace_match(&ring[i], filter, lo, hi)) hit[shown++] = i;
+    text[0] = '\0';
+    for (i = shown - 1; i >= 0; i--) {                   /* oldest first */
+        char line[160];
+        chfdebug_trace_format(&ring[hit[i]], line, sizeof line);
+        len = addf(text, len, sizeof text, "%s\n", line);
+    }
+    if (!shown) len = addf(text, len, sizeof text, on ? "(nothing recorded yet)" : "(recording is off: press Record)");
+    set_text_at(d->h_text[idx], text, 1);
+    if (!on && n == 0) snprintf(note, sizeof note, "recording off");
+    else snprintf(note, sizeof note, "%s%d instruction%s recorded, %d shown", on ? "Recording. " : "", n, n == 1 ? "" : "s",
+                  shown);
+    set_label(d->h_note[idx], note);
 }
 
 /* The packet log is rebuilt only when it changed: a new packet, or a
@@ -957,82 +1628,203 @@ static void refresh_cart(debugger *d)
 static void refresh_fujinet(debugger *d, int force)
 {
     static chfdebug_fuji_packet p[TRACE_MAX];
-    static char t[TRACE_MAX * 320 + 128];
-    static char state[2048];
-    char note[200], status[128];
+    static char t[TRACE_MAX * 320 + 128];   /* an entry is at most ~300 */
+    static char state[4096];
+    char note[200];
     size_t len = 0;
     int n = chfdebug_fujinet_trace(d->dbg, p, TRACE_MAX), i, follow;
 
+    char status[128];
     if (chfsession_fujinet_external(d->session)) {
         chfsession_cart_status(d->session, status, sizeof status);
-        snprintf(note, sizeof note, "External FujiNet at %s. Cartridge: %s.",
-                 chfsession_boip_endpoint(d->session), status);
+        snprintf(note, sizeof note, "External FujiNet at %s. Cartridge: %s.", chfsession_boip_endpoint(d->session),
+                 status);
     } else if (!chfsession_fujinet_running(d->session)) {
-        snprintf(note, sizeof note, "FujiNet is off (Preferences \xe2\x96\xb8 FujiNet).");
+        snprintf(note, sizeof note, "FujiNet is off (Settings \xe2\x96\xb8 FujiNet).");
     } else {
         chfsession_cart_status(d->session, status, sizeof status);
         snprintf(note, sizeof note, "FujiNet is on. Cartridge: %s.", status);
     }
-    dbg_label_set(d->fuji_note, note);
-    chfdebug_fujinet_state(d->dbg, state, sizeof state);
-    view_set(d->fuji_state, state);
+    set_label(d->fuji_note, note);
+    state[0] = '\0';
+    chfdebug_fujinet_state(d->dbg, state, (int)sizeof state);
+    set_text_at(d->fuji_state, state, 0);
     if (n < 0) n = 0;
 
     if (!force && n == d->fuji_count && (n == 0 || p[n - 1].serial == d->fuji_last)) return;
-    follow = force || d->fuji_count < 0 || view_at_end(d, d->fuji_text);
+    follow = force || d->fuji_count < 0 || edit_at_end(d, d->fuji_text);
     d->fuji_count = n;
     d->fuji_last = n > 0 ? p[n - 1].serial : 0;
     t[0] = '\0';
     for (i = 0; i < n; i++) {
         int k;
         len = addf(t, len, sizeof t, "%s%s", i ? "\n" : "", p[i].text);
-        if (p[i].repeat > 1) len = addf(t, len, sizeof t, " \xc3\x97%u", p[i].repeat);
+        if (p[i].repeat > 1) len = addf(t, len, sizeof t, " \xc3\x97%u", (unsigned)p[i].repeat);
         len = addf(t, len, sizeof t, "\n     ");
         for (k = 0; k < p[i].nbytes && k < (int)sizeof p[i].data; k++)
             len = addf(t, len, sizeof t, "%02X ", p[i].data[k]);
         if (p[i].nbytes > (int)sizeof p[i].data) len = addf(t, len, sizeof t, "\xe2\x80\xa6");
     }
     if (n == 0) len = addf(t, len, sizeof t, "(no FujiBus packets since the trace was cleared)");
-    view_set_at(d->fuji_text, t, follow);
+    set_text_at(d->fuji_text, t, follow);
 }
 
-/* The page showing: its refresher, with `slow` standing for the heavier
- * parts (the sections of the Video tab) while the machine runs. */
-static void refresh_page(debugger *d, int slow)
+/* One tab's contents. */
+static void refresh_tab(debugger *d, int page)
 {
-    switch (d->page) {
-    case PAGE_CPU: refresh_cpu(d); break;
-    case PAGE_DISASM: dbg_refresh_disasm(d); break;
-    case PAGE_VIDEO: refresh_video(d, slow); break;
-    case PAGE_IO: refresh_io(d); break;
-    case PAGE_BREAKS: refresh_bps(d); break;
-    case PAGE_CART: refresh_cart(d); break;
-    case PAGE_FUJINET: refresh_fujinet(d, 0); break;
+    switch (page) {
+    case TAB_DISASM: refresh_disasm(d); break;
+    case TAB_MEMORY: refresh_mem(d); break;
+    case TAB_BREAKS: refresh_bps(d); break;
+    case TAB_WATCHES: refresh_watches(d); break;
+    case TAB_CART: refresh_cart(d); break;
+    case TAB_TRACE: hist_refresh(d, 0, 0); break;
+    case TAB_HISTORY: hist_refresh(d, 1, 0); break;
+    case TAB_VIDEO: if (d->video) dbg_video_refresh(d->video, 0); break;
+    case TAB_SOUND: refresh_sound(d); break;
+    case TAB_SYMBOLS: refresh_symbols(d); break;
+    case TAB_FUJINET: refresh_fujinet(d, 0); break;
     default: break;
     }
 }
 
-static void refresh_all(debugger *d)
+/* The registers strip, and every tab on screen (the one the tab control
+ * shows and the popped-out ones); the others catch up when they are shown. */
+static void refresh_visible(debugger *d)
 {
+    int p;
+    refresh_cpu(d);
+    for (p = 0; p < TAB_COUNT; p++)
+        if (page_visible(d, p)) refresh_tab(d, p);
+}
+
+/* At a stop the console says why, as the other frontends' do. */
+static void console_stop(debugger *d)
+{
+    char reason[160], line[200];
+    int addr;
+    reason[0] = '\0';
+    chfdebug_stop_reason(d->dbg, reason, sizeof reason, &addr);
+    if (!reason[0]) return;
+    snprintf(line, sizeof line, "\xe2\x80\x94 %s", reason);
+    console_output(d, line);
+}
+
+/* After anything that may have moved the engine: the status and the tab
+ * showing follow it. */
+static void resync(debugger *d)
+{
+    const int stopped = chfdebug_is_stopped(d->dbg) != 0;
+    if (stopped && !d->was_stopped) console_stop(d);
+    d->was_stopped = stopped;
+    d->seen_gen = chfdebug_generation(d->dbg);
+    d->running_ticks = 0;
+    d->h_ticks = 0;
+    {
+        /* a new stop brings every view to the spot: the Disassembly back to
+         * the PC, wherever it was scrolled, the Memory dump to the PC's row,
+         * Trace and History to their newest line (they follow the end of
+         * their text when rebuilt) */
+        const uint64_t serial = chfdebug_stop_serial(d->dbg);
+        if (serial != d->stop_serial) {
+            d->stop_serial = serial;
+            d->recentre = 1;
+            d->mem_recentre = 1;
+            d->h_ok[0] = d->h_ok[1] = 0;
+        }
+    }
     refresh_status(d);
-    refresh_page(d, 1);
+    refresh_visible(d);
+}
+
+/* A step takes microseconds: a moment's wait for the stop keeps the window
+ * from flashing "Running" in between. */
+static void settle_and_sync(debugger *d, int expect_stop)
+{
+    int i;
+    d->notice[0] = '\0';        /* the machine moved: its new state replaces a notice */
+    for (i = 0; expect_stop && i < 40 && !chfdebug_is_stopped(d->dbg); i++)
+        Sleep(1);
+    resync(d);
+}
+
+static void tick(debugger *d)
+{
+    unsigned gen;
+    int stopped;
+    if (!IsWindowVisible(d->hwnd)) return;
+    if (d->notice[0] && !notice_showing(d)) {
+        d->notice[0] = '\0';
+        refresh_status(d);
+    }
+    gen = chfdebug_generation(d->dbg);
+    stopped = chfdebug_is_stopped(d->dbg) != 0;
+    if (gen != d->seen_gen || stopped != d->was_stopped) {
+        if (stopped != d->was_stopped) d->notice[0] = '\0';   /* a stop (or a go) says so at once */
+        resync(d);
+    } else if (!stopped) {
+        int p;
+        if (++d->running_ticks >= 5) {
+            /* running: the live values of the tabs showing, twice a second
+             * (History waits for a stop; Trace has its own, faster, beat) */
+            d->running_ticks = 0;
+            refresh_status(d);
+            refresh_cpu(d);
+            for (p = 0; p < TAB_COUNT; p++)
+                if (page_visible(d, p) && p != TAB_HISTORY && p != TAB_TRACE) refresh_tab(d, p);
+        }
+        if (++d->h_ticks >= HIST_TICKS) {
+            d->h_ticks = 0;
+            if (page_visible(d, TAB_TRACE)) hist_refresh(d, 0, 0);
+        }
+    }
 }
 
 /* ---- actions ------------------------------------------------------------------ */
 
-static void toggle_run(debugger *d)
+static void on_run(debugger *d)
 {
-    if (chfdebug_is_stopped(d->dbg)) chfdebug_resume(d->dbg);
+    const int stopped = chfdebug_is_stopped(d->dbg);
+    if (stopped) chfdebug_resume(d->dbg);
     else chfdebug_stop(d->dbg);
-    refresh_all(d);
+    settle_and_sync(d, !stopped);
 }
 
-static void run_prompt(debugger *d)
+static void on_run_to(debugger *d)
+{
+    if (d->selected < 0) {
+        toast(d, "Select a line in the Disassembly to run to");
+        return;
+    }
+    chfdebug_run_to(d->dbg, (uint16_t)d->selected);
+    settle_and_sync(d, 1);
+}
+
+static void toggle_breakpoint(debugger *d, int addr)
+{
+    chfdebug_breakpoint_toggle(d->dbg, (uint16_t)addr);
+    resync(d);
+}
+
+/* F9: the breakpoint on the selected disassembly line. */
+static void on_toggle_bp(debugger *d)
+{
+    if (d->selected < 0) {
+        toast(d, "Select a line in the Disassembly first");
+        return;
+    }
+    toggle_breakpoint(d, d->selected);
+}
+
+static void on_console(debugger *d)
 {
     static char out[65536];
-    char cmd[256], echo[300];
-    edit_text(d->prompt_in, cmd, sizeof cmd);
-    if (!cmd[0]) return;
+    char buf[256], line[300], *cmd;
+    const int was = chfdebug_is_stopped(d->dbg);
+
+    edit_text(d->con_in, buf, sizeof buf);
+    cmd = strip(buf);
+    if (!*cmd) return;
     /* history: the newest last, no repeats of the one before */
     if (d->nhistory == 0 || strcmp(d->history[d->nhistory - 1], cmd) != 0) {
         if (d->nhistory == HISTORY_MAX) {
@@ -1042,1137 +1834,1709 @@ static void run_prompt(debugger *d)
         snprintf(d->history[d->nhistory++], sizeof d->history[0], "%s", cmd);
     }
     d->history_pos = d->nhistory;
-    snprintf(echo, sizeof echo, "> %s\n", cmd);
-    view_append(d->prompt_out, echo);
+    snprintf(line, sizeof line, "> %s\n", cmd);
+    edit_to_end(d->con_out);     /* a command brings the reader back down */
+    console_append(d, line);
+
+    out[0] = '\0';
     chfdebug_command(d->dbg, cmd, out, sizeof out);
-    view_append(d->prompt_out, out);
-    view_append(d->prompt_out, "\n");
-    SetWindowTextW(d->prompt_in, L"");
-    refresh_all(d);
+    SetWindowTextA(d->con_in, "");
+    console_output(d, out);
+    settle_and_sync(d, was);
 }
 
-/* Up / Down in the prompt walk the commands already run; past the newest is
- * an empty line again. */
+/* Up and Down walk the commands already run; past the newest is an empty
+ * line again. */
 static void history_step(debugger *d, int newer)
 {
-    wchar_t w[256];
     int len;
     if (d->nhistory == 0) return;
     d->history_pos += newer ? 1 : -1;
     if (d->history_pos < 0) d->history_pos = 0;
     if (d->history_pos >= d->nhistory) {
         d->history_pos = d->nhistory;
-        SetWindowTextW(d->prompt_in, L"");
+        SetWindowTextA(d->con_in, "");
         return;
     }
-    dbg_wide_from(d->history[d->history_pos], w, 256);
-    SetWindowTextW(d->prompt_in, w);
-    len = GetWindowTextLengthW(d->prompt_in);
-    SendMessageW(d->prompt_in, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SetWindowTextA(d->con_in, d->history[d->history_pos]);
+    len = GetWindowTextLengthA(d->con_in);
+    SendMessageA(d->con_in, EM_SETSEL, (WPARAM)len, (LPARAM)len);
 }
 
-static void complete_prompt(debugger *d)
+/* Tab: the engine completes the end of the line; one answer takes its
+ * place, several are listed (and the part they share is typed). */
+static void complete_console(debugger *d)
 {
-    char text[256], comps[4096];
-    const char *word;
-    char *sp;
-    int n;
-    edit_text(d->prompt_in, text, sizeof text);
+    char text[256], comps[4096], common[256] = "", line[256];
+    char *sp, *cur, *nl;
+    int n, first = 1;
+    edit_text(d->con_in, text, sizeof text);
+    n = chfdebug_completions(d->dbg, text, comps, sizeof comps);
+    if (n <= 0) return;
+    for (cur = comps; *cur; cur = nl ? nl + 1 : cur + strlen(cur)) {
+        int k = 0;
+        nl = strchr(cur, '\n');
+        snprintf(line, sizeof line, "%.*s", nl ? (int)(nl - cur) : (int)strlen(cur), cur);
+        if (!line[0]) continue;
+        if (first) {
+            snprintf(common, sizeof common, "%s", line);
+            first = 0;
+        } else {
+            while (common[k] && line[k] && common[k] == line[k]) k++;
+            common[k] = '\0';
+        }
+    }
+    if (n > 1) console_append(d, comps);
     sp = strrchr(text, ' ');
-    word = sp ? sp + 1 : text;
-    n = chfdebug_completions(d->dbg, word, comps, sizeof comps);
-    if (n == 1) {
-        char line[256], joined[520];
-        wchar_t w[520];
-        char *nl;
-        snprintf(line, sizeof line, "%.255s", comps);
-        nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        if (sp) sp[1] = '\0'; else text[0] = '\0';
-        snprintf(joined, sizeof joined, "%s%s ", text, line);
-        dbg_wide_from(joined, w, 520);
-        SetWindowTextW(d->prompt_in, w);
-        SendMessageW(d->prompt_in, EM_SETSEL, (WPARAM)wcslen(w), (LPARAM)wcslen(w));
-    } else if (n > 1) {
-        view_append(d->prompt_out, comps);
+    if ((int)strlen(common) < (int)strlen(sp ? sp + 1 : text))
+        snprintf(common, sizeof common, "%s", sp ? sp + 1 : text);   /* never shorter than typed */
+    if (sp) sp[1] = '\0'; else text[0] = '\0';
+    {
+        char joined[600];
+        snprintf(joined, sizeof joined, "%s%s%s", text, common, n == 1 ? " " : "");
+        SetWindowTextA(d->con_in, joined);
+        SendMessageA(d->con_in, EM_SETSEL, (WPARAM)strlen(joined), (LPARAM)strlen(joined));
     }
 }
 
-static void jump_to(debugger *d, const char *text)
+/* A register or flip-flop box. Refused, with a notice, unless stopped. */
+static void on_reg(debugger *d, int i)
 {
-    const int addr = resolve_addr(d, text);
+    char buf[32];
+    long v;
+    edit_text(d->reg[i], buf, sizeof buf);
+    if (!(i == 2 ? parse_isar(d, buf, &v) : parse_hexish(d, buf, &v)))
+        toast(d, i == 2 ? "Not a number (octal, or an expression)" : "Not a number (hex, or an expression)");
+    else if (!chfdebug_is_stopped(d->dbg))
+        toast(d, "Stop the machine first to change a register");
+    else
+        chfdebug_cpu_set(d->dbg, k_reg_ids[i], (int)v);
+    SetFocus(d->hwnd);
+    resync(d);
+}
+
+static void on_check(debugger *d, int i)
+{
+    if (d->updating) return;
+    if (!chfdebug_is_stopped(d->dbg)) {
+        toast(d, "Stop the machine first to change a flag");
+        refresh_cpu(d);     /* the box goes back to the CPU's */
+        return;
+    }
+    chfdebug_cpu_set(d->dbg, k_chk_ids[i], SendMessageA(d->chk[i], BM_GETCHECK, 0, 0) == BST_CHECKED);
+    resync(d);
+}
+
+/* Go to: an address, label or range in the space showing; the dump from
+ * just above it, the bytes found highlighted and scrolled to. */
+static void on_mem_goto(debugger *d)
+{
+    char buf[64], err[96];
+    uint32_t lo, hi;
+    edit_text(d->mem_goto, buf, sizeof buf);
+    if (!parse_in_space(d, d->mem_sp, buf, &lo, &hi, err, sizeof err)) {
+        d->mem_hl = 0;
+        refresh_mem(d);
+        toast(d, err);
+        return;
+    }
+    if (lo >= (uint32_t)d->mem_size) {
+        toast(d, "That is past the end of the space");
+        return;
+    }
+    show_in_memory(d, d->mem_sp, lo, hi);
+}
+
+/* Find Next / Find Previous: from the highlighted bytes on (or back), else
+ * from the top of the space; the machine must be stopped. */
+static void on_search(debugger *d, int backward)
+{
+    char text[200];
+    uint8_t pat[CHFSEARCH_MAX], mask;
+    uint32_t found;
+    int n = 0, flags = 0, r;
+    uint32_t from;
+    edit_text(d->srch_entry, text, sizeof text);
+    if (!chfsearch_parse((int)SendMessageA(d->srch_kind, CB_GETCURSEL, 0, 0), text, pat, &n, &mask, &flags) ||
+        n <= 0) {
+        set_label(d->srch_note, "Type hex bytes (3F 00) or some text.");
+        return;
+    }
+    if (!chfdebug_is_stopped(d->dbg)) {
+        set_label(d->srch_note, "Stop the machine first");
+        return;
+    }
+    from = d->mem_hl && d->mem_hl_space == d->mem_sp ? (backward ? d->mem_hl_lo : d->mem_hl_lo + 1) : 0;
+    r = chfdebug_search_next(d->dbg, d->mem_sp, pat, n, mask, flags, from, backward, &found);
+    if (r > 0) {
+        char note[64];
+        if (d->mem_sp == CHF_SPACE_SCRATCH) snprintf(note, sizeof note, "Found at r%u", found);
+        else snprintf(note, sizeof note, "Found at $%0*X", d->mem_digits, found);
+        set_label(d->srch_note, note);
+        show_in_memory(d, d->mem_sp, found, found + (uint32_t)n - 1);
+    } else {
+        set_label(d->srch_note, r < 0 ? "Stop the machine first" : "Not found");
+    }
+}
+
+/* "address value [value...]": bytes into the space showing from the address on. */
+static void on_mem_write(debugger *d)
+{
+    char buf[256], err[96], *tok, *save = NULL, msg[96];
+    uint32_t addr, lo, hi;
+    int n = 0;
+    edit_text(d->mem_write, buf, sizeof buf);
+    tok = strtok_s(buf, " \t,", &save);
+    if (!tok) return;
+    if (!parse_in_space(d, d->mem_sp, tok, &lo, &hi, err, sizeof err)) {
+        toast(d, err);
+        return;
+    }
+    addr = lo;
+    while ((tok = strtok_s(NULL, " \t,", &save)) != NULL) {
+        long v;
+        if (!parse_hexish(d, tok, &v) || v < 0 || v > 0xFF) {
+            toast(d, "A value is a byte (00-FF)");
+            return;
+        }
+        if (addr + (uint32_t)n >= (uint32_t)d->mem_size) {
+            toast(d, "That is past the end of the space");
+            return;
+        }
+        chfdebug_write(d->dbg, d->mem_sp, addr + (uint32_t)n, (uint8_t)v);
+        n++;
+    }
+    if (!n) {
+        toast(d, "Type: address value [value...]");
+        return;
+    }
+    if (d->mem_sp == CHF_SPACE_SCRATCH)
+        snprintf(msg, sizeof msg, "Wrote %d byte%s at r%u in SCRATCH", n, n == 1 ? "" : "s", addr);
+    else
+        snprintf(msg, sizeof msg, "Wrote %d byte%s at $%0*X in %s", n, n == 1 ? "" : "s", d->mem_digits, addr,
+                 k_space_names[d->mem_sp]);
+    toast(d, msg);
+    resync(d);
+}
+
+/* A scratchpad grid cell: the Memory tab's Poke box ready to take the register's new value. */
+static void on_scratch_pick(debugger *d, int reg)
+{
+    char text[24];
+    snprintf(text, sizeof text, "r%d ", reg);
+    SetWindowTextA(d->mem_write, text);
+    SetFocus(d->mem_write);
+    SendMessageA(d->mem_write, EM_SETSEL, (WPARAM)strlen(text), (LPARAM)strlen(text));
+    snprintf(text, sizeof text, "r%d = $%02X (o%02o)", reg, d->cpu.r[reg & 63], d->cpu.r[reg & 63]);
+    set_label(d->srch_note, text);
+}
+
+static void on_jump(debugger *d)
+{
+    char buf[64], err[96];
+    int addr;
+    edit_text(d->jump, buf, sizeof buf);
+    addr = resolve_addr(d, buf, err, sizeof err);
     if (addr < 0) {
-        view_append(d->prompt_out, "No such label or address.\n");
+        toast(d, err);
         return;
     }
-    SendMessageW(d->follow_pc, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageA(d->follow_pc, BM_SETCHECK, BST_UNCHECKED, 0);
     d->disasm_top = addr;
-    dbg_refresh_disasm(d);
+    d->selected = addr;
+    refresh_disasm(d);
 }
 
-/* Memory view: Go to puts the address in the first row (a multiple of 16);
- * the buttons page through the space. */
-static void mem_goto(debugger *d, const char *text)
+/* The selected breakpoint row's index, or -1. */
+static int bp_selected(debugger *d)
 {
-    const int space = mem_space_now(d);
-    const int size = chfdebug_space_size(d->dbg, space);
-    const int addr = resolve_addr(d, text);
-    if (addr < 0 || addr >= size) {
-        view_append(d->prompt_out, addr < 0 ? "No such label or address.\n" : "Past the end of that space.\n");
+    const int i = (int)SendMessageA(d->bp_list, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+    return i >= 0 && i < d->nbps ? i : -1;
+}
+
+static void on_bp_remove(debugger *d)
+{
+    const int i = bp_selected(d);
+    if (i < 0) {
+        set_label(d->bp_msg, "Select a breakpoint to remove");
         return;
     }
-    d->mem_base = (uint32_t)addr & ~0xfu;
-    refresh_mem(d);
+    set_label(d->bp_msg, "");
+    chfdebug_breakpoint_remove(d->dbg, d->bps[i].id);
+    resync(d);
 }
 
-static void mem_page(debugger *d, int dir)
+static void on_bp_add(debugger *d)
 {
-    const int size = chfdebug_space_size(d->dbg, mem_space_now(d));
-    const int next = (int)d->mem_base + dir * 16 * MEM_ROWS;
-    d->mem_base = next < 0 ? 0 : next >= size ? d->mem_base : (uint32_t)next;
-    refresh_mem(d);
+    static const uint32_t limits[NSPACES] = { 0x10000u, 64u, 8192u, 0u, 256u };
+    char a[64], b[64], cond[256], err[160];
+    uint32_t start, end, lo, hi;
+    int sel, id, space;
+    edit_text(d->bp_start, a, sizeof a);
+    edit_text(d->bp_end, b, sizeof b);
+    edit_text(d->bp_cond, cond, sizeof cond);
+    sel = (int)SendMessageA(d->bp_type, CB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= NBPTYPES) sel = 0;
+    space = k_bp_spaces[sel];
+    if (!parse_in_space(d, space, a, &lo, &hi, err, sizeof err)) {
+        set_label(d->bp_msg, err);
+        return;
+    }
+    start = lo;
+    end = hi;
+    if (strip(b)[0]) {
+        if (!parse_in_space(d, space, b, &lo, &hi, err, sizeof err)) {
+            set_label(d->bp_msg, err);
+            return;
+        }
+        end = lo;
+    }
+    if (end < start) end = start;
+    if (end >= limits[space]) {
+        set_label(d->bp_msg, space == CHF_SPACE_IO ? "A port is 0-255"
+                             : space == CHF_SPACE_VRAM ? "A VRAM cell is row 0-63, column 0-127"
+                             : space == CHF_SPACE_SCRATCH ? "A scratchpad register is r0-r63" : "That is past the end of the space");
+        return;
+    }
+    id = chfdebug_breakpoint_add(d->dbg, k_bp_type_ids[sel], space, (uint16_t)start, (uint16_t)end, strip(cond));
+    if (id < 0) {
+        set_label(d->bp_msg, "The condition does not parse");
+        return;
+    }
+    set_label(d->bp_msg, "");
+    SetWindowTextA(d->bp_start, "");
+    SetWindowTextA(d->bp_end, "");
+    SetWindowTextA(d->bp_cond, "");
+    resync(d);
 }
 
-static int pick_file(debugger *d, int save, const char *title, const wchar_t *filter, wchar_t *path, DWORD pathsz)
+/* The type decides what the boxes take. */
+static void on_bp_type(debugger *d)
 {
-    OPENFILENAMEW ofn;
-    wchar_t wtitle[128];
+    const int sel = (int)SendMessageA(d->bp_type, CB_GETCURSEL, 0, 0);
+    const int space = sel >= 0 && sel < NBPTYPES ? k_bp_spaces[sel] : CHF_SPACE_PROG;
+    const wchar_t *first = L"0802 / label", *last = L"(end)";
+    if (space == CHF_SPACE_IO) {
+        first = L"port (hex) / name";
+        last = L"(last port)";
+    } else if (space == CHF_SPACE_VRAM) {
+        first = L"row,col (12,40)";
+        last = L"(row,col to)";
+    } else if (space == CHF_SPACE_SCRATCH) {
+        first = L"r59 / 59 / j";
+        last = L"(last register)";
+    }
+    SendMessageW(d->bp_start, EM_SETCUEBANNER, TRUE, (LPARAM)first);
+    SendMessageW(d->bp_end, EM_SETCUEBANNER, TRUE, (LPARAM)last);
+}
+
+static int pick_file(debugger *d, int save, const char *title, const char *filter, char *path, DWORD pathsz)
+{
+    OPENFILENAMEA ofn;
     memset(&ofn, 0, sizeof ofn);
-    path[0] = 0;
-    dbg_wide_from(title, wtitle, 128);
+    path[0] = '\0';
     ofn.lStructSize = sizeof ofn;
     ofn.hwndOwner = d->hwnd;
     ofn.lpstrFile = path;
     ofn.nMaxFile = pathsz;
-    ofn.lpstrTitle = wtitle;
+    ofn.lpstrTitle = title;
     ofn.lpstrFilter = filter;
     if (save) {
         ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        return GetSaveFileNameW(&ofn) ? 1 : 0;
+        return GetSaveFileNameA(&ofn) ? 1 : 0;
     }
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    return GetOpenFileNameW(&ofn) ? 1 : 0;
+    return GetOpenFileNameA(&ofn) ? 1 : 0;
 }
 
-static void save_file(debugger *d, int which)
+static void goto_tab(debugger *d, int page);
+
+static void on_symbols(debugger *d)
 {
-    wchar_t wpath[MAX_PATH];
-    char path[MAX_PATH * 3], msg[512], title[96];
-    snprintf(title, sizeof title, "Save %s", kSaveTitles[which]);
-    if (!pick_file(d, 1, title, L"All files\0*.*\0\0", wpath, MAX_PATH)) return;
-    WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof path, NULL, NULL);
-    chfdebug_save(d->dbg, kSaveKinds[which], path, msg, sizeof msg);
-    view_append(d->prompt_out, msg);
-    view_append(d->prompt_out, "\n");
+    char path[MAX_PATH], msg[512];
+    if (!pick_file(d, 0, "Load symbols",
+                   "Symbol files (*.sym;*.map;*.noi;*.txt)\0*.sym;*.map;*.noi;*.txt\0All files\0*.*\0\0",
+                   path, sizeof path))
+        return;
+    msg[0] = '\0';
+    if (chfdebug_load_symbols(d->dbg, path, msg, sizeof msg) < 0 && !msg[0])
+        snprintf(msg, sizeof msg, "No symbols found in %s", base_name(path));
+    d->sym_force = 1;
+    say(d, msg);
+    resync(d);
 }
 
-static void popup_below(debugger *d, HWND button, HMENU m)
+static void on_clear_symbols(debugger *d)
 {
-    RECT r;
-    GetWindowRect(button, &r);
-    TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN, r.left, r.bottom, 0, d->hwnd, NULL);
-    DestroyMenu(m);
+    chfdebug_clear_symbols(d->dbg);
+    d->sym_force = 1;
+    d->bp_sig_ok = 0;
+    say(d, "Symbols cleared (the built-in ones stay)");
+    resync(d);
+}
+
+static void on_clear_breakpoints(debugger *d)
+{
+    chfdebug_breakpoint_clear(d->dbg);
+    set_label(d->bp_msg, "");
+    resync(d);
+}
+
+/* "Break at:" -- a symbol or an address, Enter: an execute breakpoint. */
+static void on_break_at(debugger *d)
+{
+    char text[96], err[96], msg[160];
+    int address;
+    edit_text(d->break_at, text, sizeof text);
+    address = resolve_addr(d, text, err, sizeof err);
+    if (address < 0) {
+        toast(d, err);
+        return;
+    }
+    if (!chfdebug_breakpoint_check(d->dbg, (uint16_t)address))
+        chfdebug_breakpoint_add(d->dbg, CHFDEBUG_BP_EXEC, CHF_SPACE_PROG, (uint16_t)address, (uint16_t)address, "");
+    snprintf(msg, sizeof msg, "Breakpoint at $%04X", address);
+    SetWindowTextA(d->break_at, "");
+    toast(d, msg);
+    resync(d);
+}
+
+/* A symbol row (double-click, Enter) goes to its address in the Disassembly. */
+static void on_symbol_activate(debugger *d)
+{
+    const int row = (int)SendMessageA(d->sym_list, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+    uint16_t address = 0;
+    char name[96], text[128];
+    int bank;
+    if (row < 0 || row >= d->sym_shown) return;
+    if (!chfdebug_symbols_get(d->dbg, d->sym_indices[row], &address, name, sizeof name, &bank)) return;
+    if (bank == CHFDEBUG_SYM_PORT) {
+        snprintf(text, sizeof text, "%s is port $%02X", name, address);
+        toast(d, text);
+        return;
+    }
+    snprintf(text, sizeof text, "$%04X", address);
+    goto_tab(d, TAB_DISASM);
+    SetWindowTextA(d->jump, text);
+    on_jump(d);
+}
+
+static void on_save(debugger *d, int which)
+{
+    char path[MAX_PATH], msg[512], title[64];
+    size_t n;
+    snprintf(title, sizeof title, "Save %s", k_save_titles[which]);
+    n = strlen(title);
+    while (n > 0 && title[n - 1] == '.') title[--n] = '\0';
+    if (!pick_file(d, 1, title, "All files\0*.*\0\0", path, sizeof path)) return;
+    msg[0] = '\0';
+    chfdebug_save(d->dbg, k_save_kinds[which], path, msg, sizeof msg);
+    if (!msg[0]) snprintf(msg, sizeof msg, "Saved %s", base_name(path));
+    say(d, msg);
 }
 
 static void save_menu(debugger *d)
 {
     HMENU m = CreatePopupMenu();
-    wchar_t w[96];
+    RECT r;
     int i;
-    for (i = 0; i < NSAVE; i++) {
-        dbg_wide_from(kSaveTitles[i], w, 96);
-        AppendMenuW(m, MF_STRING, (UINT_PTR)(IDC_SAVE_KIND0 + i), w);
+    for (i = 0; i < NSAVE; i++) AppendMenuA(m, MF_STRING, (UINT_PTR)(IDC_SAVE_KIND0 + i), k_save_titles[i]);
+    GetWindowRect(d->save_btn, &r);
+    TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN, r.left, r.bottom, 0, d->hwnd, NULL);
+    DestroyMenu(m);
+}
+
+/* ---- watches, trace and history ---------------------------------------------------- */
+
+static int watch_space_chosen(debugger *d)
+{
+    const int sel = (int)SendMessageA(d->wt_space, CB_GETCURSEL, 0, 0);
+    return sel >= 0 && sel < NSPACES ? sel : CHF_SPACE_PROG;
+}
+
+static void on_watch_add(debugger *d)
+{
+    char text[96];
+    edit_text(d->wt_entry, text, sizeof text);
+    if (chfwatch_add(watch_space_chosen(d), strip(text)) < 0) {
+        set_label(d->wt_msg, chfwatch_count() >= CHFWATCH_MAX ? "The watch list is full"
+                                                                  : "Type an address, label or expression");
+        return;
     }
-    popup_below(d, d->save, m);
+    set_label(d->wt_msg, "");
+    SetWindowTextA(d->wt_entry, "");
+    refresh_watches(d);
 }
 
-/* Symbols come from a file the user picks, or from the one beside the
- * opened cartridge (game.map / .lst next to game.bin). */
-static void symbols_menu(debugger *d)
+static int watch_selected(debugger *d)
 {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDC_SYMS_FILE, L"From a file...");
-    AppendMenuW(m, MF_STRING, IDC_SYMS_CART, L"Beside the cartridge");
-    popup_below(d, d->load_symbols, m);
+    const int i = (int)SendMessageA(d->wt_list, LB_GETCURSEL, 0, 0);
+    return i >= 0 && i < chfwatch_count() ? i : -1;
 }
 
-static void load_symbols(debugger *d, int beside_cart)
+static void on_watch_remove(debugger *d)
 {
-    wchar_t wpath[MAX_PATH];
-    char path[MAX_PATH * 3], msg[512];
-    if (!beside_cart) {
-        if (!pick_file(d, 0, "Load symbols",
-                       L"Symbol files (*.map;*.lst;*.sym;*.txt)\0*.map;*.lst;*.sym;*.txt\0All files\0*.*\0\0",
-                       wpath, MAX_PATH))
-            return;
-        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof path, NULL, NULL);
+    const int i = watch_selected(d);
+    if (i < 0) {
+        set_label(d->wt_msg, "Select a watch to remove");
+        return;
     }
-    chfdebug_load_symbols(d->dbg, beside_cart ? NULL : path, msg, sizeof msg);
-    view_append(d->prompt_out, msg);
-    view_append(d->prompt_out, "\n");
-    refresh_all(d);
+    set_label(d->wt_msg, "");
+    chfwatch_remove(i);
+    refresh_watches(d);
 }
 
-/* One end of a breakpoint range, by the type's own notation. -1 when the text
- * is not one. */
-static int bp_point(debugger *d, int type, const char *text)
+static void goto_tab(debugger *d, int page);
+
+/* The selected watch's bytes in the Memory tab, in the space it was made in. */
+static void on_watch_memory(debugger *d)
 {
-    long v;
-    int row, col;
-    const char *p = text;
-    while (*p == ' ') p++;
-    if (!*p) return -1;
-    switch (type) {
-    case 5:
-        if (sscanf(p, "%d , %d", &row, &col) != 2 && sscanf(p, "%d %d", &row, &col) != 2) return -1;
-        if (row < 0 || row > 63 || col < 0 || col > 127) return -1;
-        return row * 128 + col;
-    case 6:
-        if (*p == 'r' || *p == 'R') p++;
-        if (!*p || (v = strtol(p, (char **)&p, 10), *p != '\0') || v < 0 || v > 63) return -1;
-        return (int)v;
-    case 3: case 4:
-        if (!parse_num(text, &v) || v < 0 || v > 255) return -1;
-        return (int)v;
+    uint32_t lo, hi;
+    const int i = watch_selected(d);
+    if (i < 0) {
+        set_label(d->wt_msg, "Select a watch first");
+        return;
+    }
+    if (!chfwatch_range(d->dbg, i, &lo, &hi)) {
+        set_label(d->wt_msg, "That watch does not resolve to an address");
+        return;
+    }
+    set_label(d->wt_msg, "");
+    goto_tab(d, TAB_MEMORY);
+    show_in_memory(d, chfwatch_space(i), lo, hi);
+}
+
+/* A write breakpoint over a range of a space that stops only when the value
+ * changes. */
+static int break_on_change(debugger *d, int space, uint32_t lo, uint32_t hi, char *err, int errsz)
+{
+    int type, id;
+    switch (space) {
+    case CHF_SPACE_PROG: type = CHFDEBUG_BP_WRITE; break;
+    case CHF_SPACE_IO: type = CHFDEBUG_BP_OUT; break;
+    case CHF_SPACE_VRAM: type = CHFDEBUG_BP_VRAM; break;
+    case CHF_SPACE_SCRATCH: type = CHFDEBUG_BP_SCRATCH; break;
     default:
-        return resolve_addr(d, text);
+        snprintf(err, (size_t)errsz, "The cartridge's memory has no write breakpoint");
+        return -1;
     }
+    id = chfdebug_breakpoint_add(d->dbg, type, space, (uint16_t)lo, (uint16_t)hi, "value != old");
+    if (id < 0) snprintf(err, (size_t)errsz, "That breakpoint could not be set");
+    return id;
 }
 
-static void add_breakpoint(debugger *d)
+static void on_watch_break(debugger *d)
 {
-    static const int types[NBPTYPES] = { CHFDEBUG_BP_EXEC, CHFDEBUG_BP_READ, CHFDEBUG_BP_WRITE, CHFDEBUG_BP_IN,
-                                         CHFDEBUG_BP_OUT, CHFDEBUG_BP_VRAM, CHFDEBUG_BP_SCRATCH };
-    static const int spaces[NBPTYPES] = { CHF_SPACE_PROG, CHF_SPACE_PROG, CHF_SPACE_PROG, CHF_SPACE_IO,
-                                          CHF_SPACE_IO, CHF_SPACE_VRAM, CHF_SPACE_SCRATCH };
-    char a[64], b[64], cond[256];
-    int start, end, sel, id;
-    edit_text(d->bp_start, a, sizeof a);
-    edit_text(d->bp_end, b, sizeof b);
-    edit_text(d->bp_cond, cond, sizeof cond);
-    sel = (int)SendMessageW(d->bp_type, CB_GETCURSEL, 0, 0);
-    if (sel < 0 || sel >= NBPTYPES) sel = 0;
-    start = bp_point(d, sel, a);
-    if (start < 0) {
-        chf_message(d->hwnd, kBpHints[sel], "Breakpoint", MB_ICONWARNING | MB_OK);
+    uint32_t lo, hi;
+    char err[160];
+    const int i = watch_selected(d);
+    if (i < 0) {
+        set_label(d->wt_msg, "Select a watch first");
         return;
     }
-    end = b[0] ? bp_point(d, sel, b) : start;
-    if (end < 0) {
-        chf_message(d->hwnd, kBpHints[sel], "Breakpoint", MB_ICONWARNING | MB_OK);
+    if (!chfwatch_range(d->dbg, i, &lo, &hi)) {
+        set_label(d->wt_msg, "That watch does not resolve to an address");
         return;
     }
-    if (end < start) end = start;
-    id = chfdebug_breakpoint_add(d->dbg, types[sel], spaces[sel], (uint16_t)start, (uint16_t)end, cond);
-    if (id < 0) {
-        chf_message(d->hwnd, "The condition does not parse, or the range is outside its space.", "Breakpoint",
-                    MB_ICONWARNING | MB_OK);
+    err[0] = '\0';
+    if (break_on_change(d, chfwatch_space(i), lo, hi, err, sizeof err) < 0) {
+        set_label(d->wt_msg, err[0] ? err : "That breakpoint could not be set");
         return;
     }
-    SetWindowTextW(d->bp_start, L"");
-    SetWindowTextW(d->bp_end, L"");
-    SetWindowTextW(d->bp_cond, L"");
-    refresh_bps(d);
-    dbg_refresh_disasm(d);
+    set_label(d->wt_msg, "Breaking when it changes (see Breakpoints)");
+    resync(d);
 }
 
-/* Run to the line selected in the Disassembly. */
-static void run_to_cursor(debugger *d)
+/* Record on either tab toggles the one recorder. */
+static void on_record(debugger *d, int idx)
 {
-    if (d->sel_addr < 0) {
-        chf_message(d->hwnd, "Select a line in the Disassembly first (click it).", "Run to Cursor",
-                    MB_ICONINFORMATION | MB_OK);
-        return;
-    }
-    chfdebug_run_to(d->dbg, (uint16_t)d->sel_addr);
-    refresh_all(d);
+    chfdebug_trace_enable(d->dbg, SendMessageA(d->h_rec[idx], BM_GETCHECK, 0, 0) == BST_CHECKED);
+    d->h_ok[0] = d->h_ok[1] = 0;
+    resync(d);
 }
 
-static void write_scratch(debugger *d)
+static void on_hist_clear(debugger *d, int idx)
 {
-    char a[16], b[16];
-    long reg, val;
-    char *end;
-    edit_text(d->scr_reg, a, sizeof a);
-    edit_text(d->scr_val, b, sizeof b);
-    reg = strtol(a, &end, 8);
-    if (!a[0] || *end || reg < 0 || reg > 63 || !parse_num(b, &val) || val < 0 || val > 255) {
-        chf_message(d->hwnd, "The register is its octal number (00-77), the value a byte in hex.", "Scratchpad",
-                    MB_ICONWARNING | MB_OK);
-        return;
-    }
-    chfdebug_write(d->dbg, CHF_SPACE_SCRATCH, (uint32_t)reg, (uint8_t)val);
-    refresh_all(d);
+    (void)idx;
+    chfdebug_trace_clear(d->dbg);
+    d->h_ok[0] = d->h_ok[1] = 0;
+    if (page_visible(d, TAB_TRACE)) hist_refresh(d, 0, 1);
+    if (page_visible(d, TAB_HISTORY)) hist_refresh(d, 1, 1);
+}
+
+static void on_hist_filter(debugger *d, int idx)
+{
+    EnableWindow(d->h_range[idx], SendMessageA(d->h_filter[idx], CB_GETCURSEL, 0, 0) == 2);
+    hist_refresh(d, idx, 1);
 }
 
 static void on_accept(debugger *d, int id)
 {
-    char buf[512];
-    long v;
-
-    if (id >= IDC_FIELD0 && id <= IDC_FIELD_LAST) {
-        const cpu_field *f = &kFields[id - IDC_FIELD0];
-        edit_text(d->fld[id - IDC_FIELD0], buf, sizeof buf);
-        if (f->octal ? parse_isar(buf, &v) : parse_num(buf, &v)) chfdebug_cpu_set(d->dbg, f->reg, (int)v);
-        SetFocus(d->hwnd);
-        refresh_all(d);
+    if (id >= IDC_REG0 && id <= IDC_REG_LAST) {
+        on_reg(d, id - IDC_REG0);
         return;
     }
     switch (id) {
-    case IDC_PROMPT_IN: run_prompt(d); break;
-    case IDC_RAM_GOTO:
-        edit_text(d->ram_goto, buf, sizeof buf);
-        mem_goto(d, buf);
-        break;
-    case IDC_RAM_ADDR:
-    case IDC_RAM_VAL: {
-        char abuf[64];
-        const int space = mem_space_now(d);
-        int a;
-        edit_text(d->ram_addr, abuf, sizeof abuf);
-        edit_text(d->ram_val, buf, sizeof buf);
-        a = resolve_addr(d, abuf);
-        if (a >= 0 && a < chfdebug_space_size(d->dbg, space) && parse_num(buf, &v))
-            chfdebug_write(d->dbg, space, (uint32_t)a, (uint8_t)v);
-        refresh_all(d);
-        break;
-    }
-    case IDC_SCR_REG:
-    case IDC_SCR_VAL: write_scratch(d); break;
-    case IDC_JUMP:
-        edit_text(d->jump, buf, sizeof buf);
-        jump_to(d, buf);
-        break;
+    case IDC_CON_IN: on_console(d); break;
+    case IDC_MEM_GOTO: on_mem_goto(d); break;
+    case IDC_SRCH_ENTRY: on_search(d, 0); break;
+    case IDC_WT_ENTRY: on_watch_add(d); break;
+    case IDC_H_RANGE0: hist_refresh(d, 0, 1); break;
+    case IDC_H_RANGE1: hist_refresh(d, 1, 1); break;
+    case IDC_MEM_WRITE: on_mem_write(d); break;
+    case IDC_JUMP: on_jump(d); break;
+    case IDC_BREAK_AT: on_break_at(d); break;
     case IDC_BP_START:
     case IDC_BP_END:
-    case IDC_BP_COND:
-        add_breakpoint(d);
-        break;
-    case IDC_WR_ROW0: case IDC_WR_ROW1: case IDC_WR_COL0: case IDC_WR_COL1:
-        refresh_writes(d);
+    case IDC_BP_COND: on_bp_add(d); break;
+    default: break;
+    }
+}
+
+/* ---- the disassembly -------------------------------------------------------------- */
+
+/* One run of a row's text at a column. */
+static void put(debugger *d, HDC dc, int col, int ty, COLORREF fg, const char *text, int len)
+{
+    SetTextColor(dc, fg);
+    TextOutA(dc, S(d, GUTTER_W) + d->mono_w * col, ty, text, len);
+}
+
+/* Drawn by hand, one row per line: the breakpoint gutter (a red dot when the
+ * breakpoint is enabled, grey when disabled), address, bytes, label,
+ * instruction, and the comment (a jump target's label, a port's name); the
+ * label and the comment in grey. The selected line takes the system
+ * selection colours, the PC's line (applied last, so it wins) is filled with
+ * the accent and drawn in white. */
+static void paint_disasm(debugger *d, HWND hwnd, HDC dc)
+{
+    RECT c;
+    int i;
+    GetClientRect(hwnd, &c);
+    FillRect(dc, &c, GetSysColorBrush(COLOR_WINDOW));
+    SelectObject(dc, d->mono);
+    SetBkMode(dc, TRANSPARENT);
+    if (d->line_count == 0) {
+        put(d, dc, 0, 0, GetSysColor(COLOR_GRAYTEXT), "(no disassembly)", 16);
+        return;
+    }
+    for (i = 0; i < d->line_count && i * d->line_h < c.bottom; i++) {
+        const chfdebug_line *l = &d->lines[i];
+        const int y = i * d->line_h, ty = y + (d->line_h - d->mono_h) / 2;
+        const int is_pc = l->is_pc, sel = l->address == d->selected;
+        COLORREF fg = GetSysColor(COLOR_WINDOWTEXT), dim = GetSysColor(COLOR_GRAYTEXT);
+        RECT row;
+        char text[240];
+        int len;
+        SetRect(&row, 0, y, c.right, y + d->line_h);
+        if (sel) {
+            FillRect(dc, &row, GetSysColorBrush(COLOR_HIGHLIGHT));
+            fg = dim = GetSysColor(COLOR_HIGHLIGHTTEXT);
+        }
+        if (is_pc) {
+            FillRect(dc, &row, chf_accent_brush());
+            fg = dim = CHF_ACCENT_TEXT;
+        }
+        if (l->has_breakpoint || l->bp_disabled) {
+            /* a red dot for an enabled breakpoint, a grey hollow one for a disabled one */
+            const int size = d->line_h - S(d, 6) > 4 ? d->line_h - S(d, 6) : 4;
+            HGDIOBJ oldb = SelectObject(dc, l->has_breakpoint ? d->bp_on
+                                                              : GetStockObject(NULL_BRUSH));
+            HPEN grey_pen = CreatePen(PS_SOLID, 2, is_pc ? RGB(0x5a, 0x58, 0x55) : RGB(0x9a, 0x99, 0x96));
+            HGDIOBJ oldp = SelectObject(dc, l->has_breakpoint ? GetStockObject(NULL_PEN) : grey_pen);
+            Ellipse(dc, S(d, 4), y + (d->line_h - size) / 2, S(d, 4) + size + 1, y + (d->line_h - size) / 2 + size + 1);
+            SelectObject(dc, oldp);
+            SelectObject(dc, oldb);
+            DeleteObject(grey_pen);
+        }
+        len = snprintf(text, sizeof text, "%04X", l->address);
+        put(d, dc, 0, ty, fg, text, len);
+        len = snprintf(text, sizeof text, "%.12s", l->bytes);
+        put(d, dc, COL_BYTES, ty, fg, text, len);
+        len = snprintf(text, sizeof text, "%.*s", LABEL_W, l->label);
+        if (len > 0) put(d, dc, COL_LABEL, ty, dim, text, len);
+        len = snprintf(text, sizeof text, "%s", l->disasm);
+        if (len > (int)sizeof text - 1) len = (int)sizeof text - 1;
+        if (len > 0) put(d, dc, COL_DISASM, ty, fg, text, len);
+        if (l->comment[0]) {
+            len = snprintf(text, sizeof text, "; %s", l->comment);
+            if (len > (int)sizeof text - 1) len = (int)sizeof text - 1;
+            put(d, dc, COMMENT_COL, ty, dim, text, len);
+        }
+    }
+}
+
+/* A click selects a line (it works while the machine runs, too); a click on
+ * the gutter, or a double-click, toggles its breakpoint. The wheel and the
+ * keys browse by instructions (and turn Follow PC off). */
+static LRESULT CALLBACK disasm_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    debugger *d = g_dbg;
+    if (!d) return DefWindowProcA(hwnd, msg, wp, lp);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT c;
+        HDC mem;
+        HBITMAP bmp;
+        HGDIOBJ oldbmp, oldfont;
+        GetClientRect(hwnd, &c);
+        mem = CreateCompatibleDC(dc);
+        bmp = CreateCompatibleBitmap(dc, c.right > 0 ? c.right : 1, c.bottom > 0 ? c.bottom : 1);
+        oldbmp = SelectObject(mem, bmp);
+        oldfont = SelectObject(mem, d->mono);
+        paint_disasm(d, hwnd, mem);
+        BitBlt(dc, 0, 0, c.right, c.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldfont);
+        SelectObject(mem, oldbmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+        paint_disasm(d, hwnd, (HDC)wp);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        /* more or fewer rows fit now */
+        if (d->disasm == hwnd && page_visible(d, TAB_DISASM)) refresh_disasm(d);
+        return 0;
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        const int line = d->line_h > 0 ? GET_Y_LPARAM(lp) / d->line_h : -1;
+        const int gutter = GET_X_LPARAM(lp) < S(d, GUTTER_W);
+        SetFocus(hwnd);
+        if (line < 0 || line >= d->line_count) return 0;
+        d->selected = d->lines[line].address;
+        if (gutter ? msg == WM_LBUTTONDOWN : msg == WM_LBUTTONDBLCLK)
+            toggle_breakpoint(d, d->lines[line].address);
+        else
+            InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        int rows = -delta * 3 / WHEEL_DELTA;
+        if (!rows) rows = delta > 0 ? -1 : 1;
+        SendMessageA(d->follow_pc, BM_SETCHECK, BST_UNCHECKED, 0);
+        d->disasm_top = row_address(d, d->disasm_top, rows);
+        refresh_disasm(d);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wp == VK_PRIOR || wp == VK_NEXT || wp == VK_UP || wp == VK_DOWN) {
+            const int half = disasm_rows(d) / 2 > 0 ? disasm_rows(d) / 2 : 1;
+            const int rows = wp == VK_PRIOR ? -half : wp == VK_NEXT ? half : wp == VK_UP ? -1 : 1;
+            SendMessageA(d->follow_pc, BM_SETCHECK, BST_UNCHECKED, 0);
+            d->disasm_top = row_address(d, d->disasm_top, rows);
+            refresh_disasm(d);
+            return 0;
+        }
         break;
     default: break;
     }
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
 /* ---- edit subclassing ------------------------------------------------------------- */
 
 static WNDPROC g_edit_proc;
 
-/* Enter in a single-line field means "apply this value"; Tab in the prompt
+/* Enter in a single-line field means "apply this value"; Tab in the console
  * completes and Up/Down recall. None may beep its way through the default
  * handler. */
 static LRESULT CALLBACK edit_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     const int id = (int)GetWindowLongPtrW(hwnd, GWLP_ID);
     if (msg == WM_KEYDOWN && wp == VK_RETURN) {
-        PostMessageW(GetAncestor(hwnd, GA_ROOT), WM_DBG_ACCEPT, (WPARAM)id, 0);
+        PostMessageA(g_dbg->hwnd, WM_DBG_ACCEPT, (WPARAM)id, 0);
         return 0;
     }
-    if (msg == WM_CHAR && wp == VK_RETURN) return 0;
-    if (id == IDC_PROMPT_IN && msg == WM_KEYDOWN && wp == VK_TAB) {
-        PostMessageW(GetAncestor(hwnd, GA_ROOT), WM_DBG_TAB, 0, 0);
-        return 0;
+    if (msg == WM_CHAR && (wp == '\r' || wp == '\n')) return 0;
+    if (id == IDC_CON_IN) {
+        if (msg == WM_KEYDOWN && wp == VK_TAB) {
+            PostMessageA(g_dbg->hwnd, WM_DBG_TAB, 0, 0);
+            return 0;
+        }
+        if (msg == WM_KEYDOWN && (wp == VK_UP || wp == VK_DOWN)) {
+            PostMessageA(g_dbg->hwnd, WM_DBG_HISTORY, wp == VK_DOWN, 0);
+            return 0;
+        }
+        if (msg == WM_CHAR && wp == VK_TAB) return 0;
+        if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
     }
-    if (id == IDC_PROMPT_IN && msg == WM_KEYDOWN && (wp == VK_UP || wp == VK_DOWN)) {
-        PostMessageW(GetAncestor(hwnd, GA_ROOT), WM_DBG_HISTORY, wp == VK_DOWN, 0);
-        return 0;
-    }
-    if (id == IDC_PROMPT_IN && msg == WM_CHAR && wp == VK_TAB) return 0;
-    if (id == IDC_PROMPT_IN && msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
     return CallWindowProcW(g_edit_proc, hwnd, msg, wp, lp);
 }
 
-/* ---- construction ------------------------------------------------------------------ */
+/* ---- construction ----------------------------------------------------------------- */
 
-static HWND mk(debugger *d, DWORD ex, const wchar_t *cls, const wchar_t *text, DWORD style, int id, int page,
-               int sec, int mono)
+/* The standard controls are made as Unicode windows, so the engine's UTF-8
+ * (the arrows and dashes of its text) shows as it is. */
+static HWND child_ex(debugger *d, DWORD ex, const char *cls, const char *text, DWORD style, int id, HFONT font)
 {
-    HWND h = CreateWindowExW(ex, cls, text, WS_CHILD | style, 0, 0, 10, 10, d->hwnd, (HMENU)(INT_PTR)id,
-                             d->inst, NULL);
-    if (d->nctl < MAX_CTL) {
-        d->ctl[d->nctl].h = h;
-        d->ctl[d->nctl].page = page;
-        d->ctl[d->nctl].sec = sec;
-        d->ctl[d->nctl].mono = mono;
-        d->nctl++;
-    }
-    SendMessageW(h, WM_SETFONT, (WPARAM)(mono ? d->mono : d->ui), TRUE);
+    wchar_t wcls[64], wtext[512];
+    HWND h;
+    wide(cls, wcls, 64);
+    wide(text, wtext, 512);
+    h = CreateWindowExW(ex, wcls, wtext, WS_CHILD | (d->new_parent ? WS_VISIBLE : 0) | style, 0, 0, 10, 10,
+                        d->new_parent ? d->new_parent : d->hwnd,
+                        (HMENU)(INT_PTR)id,
+                        (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE), NULL);
+    SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
     return h;
 }
 
-/* A read-only mono text view: bars 0 has no scroll bars (a fixed dump), 1 a
- * vertical one (the lines wrap), 2 both (a log). */
-static HWND view(debugger *d, int id, int page, int sec, int bars)
+static HWND child(debugger *d, const char *cls, const char *text, DWORD style, int id, HFONT font)
 {
-    HWND h = mk(d, WS_EX_CLIENTEDGE, L"EDIT", L"",
-                (bars >= 1 ? WS_VSCROLL : 0) | (bars >= 2 ? WS_HSCROLL : 0) | ES_MULTILINE | ES_READONLY |
-                    ES_AUTOVSCROLL | ES_NOHIDESEL,
-                id, page, sec, 1);
-    SendMessageW(h, EM_SETLIMITTEXT, 0, 0);
+    return child_ex(d, 0, cls, text, style, id, font);
+}
+
+/* A read-only monospace text view. */
+static HWND view(debugger *d, int id, DWORD extra)
+{
+    HWND h = child(d, "EDIT", "", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | extra,
+                   id, d->mono);
+    SendMessageA(h, EM_SETLIMITTEXT, 0, 0);
+    if (d->nviews < (int)(sizeof d->views / sizeof d->views[0])) d->views[d->nviews++] = h;
     return h;
 }
 
-static HWND field(debugger *d, int id, int page, int sec, int mono, int maxlen)
+static HWND field(debugger *d, int id, const wchar_t *cue)
 {
-    HWND h = mk(d, WS_EX_CLIENTEDGE, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, id, page, sec, mono);
+    HWND h = child(d, "EDIT", "", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, id, d->mono);
     g_edit_proc = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)edit_subclass);
-    if (maxlen > 0) SendMessageW(h, EM_SETLIMITTEXT, (WPARAM)maxlen, 0);
+    if (cue) SendMessageW(h, EM_SETCUEBANNER, TRUE, (LPARAM)cue);
     return h;
 }
 
-static HWND label(debugger *d, const char *text, int page, int sec)
+static HWND label(debugger *d, const char *text, HFONT font, DWORD style)
 {
-    wchar_t w[160];
-    dbg_wide_from(text, w, 160);
-    return mk(d, 0, L"STATIC", w, SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, page, sec, 0);
+    return child(d, "STATIC", text, style | SS_NOPREFIX, IDC_LABEL_FIRST + d->nlabels++, font);
 }
 
-static HWND button(debugger *d, const wchar_t *text, int id, int page, int sec)
+/* A caption or hint, drawn grey. */
+static HWND dim_label(debugger *d, const char *text, DWORD style)
 {
-    return mk(d, 0, L"BUTTON", text, BS_PUSHBUTTON | WS_TABSTOP, id, page, sec, 0);
+    HWND h = label(d, text, d->ui, style);
+    if (d->ndim < (int)(sizeof d->dim / sizeof d->dim[0])) d->dim[d->ndim++] = h;
+    return h;
 }
 
-static HWND checkbox(debugger *d, const wchar_t *text, int id, int page, int sec)
+static HWND button(debugger *d, const char *text, int id)
 {
-    return mk(d, 0, L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, id, page, sec, 0);
+    return child(d, "BUTTON", text, BS_PUSHBUTTON | WS_TABSTOP, id, d->ui);
 }
 
-static HWND combo(debugger *d, int id, const wchar_t *const *items, int n, int page, int sec)
+static HWND checkbox(debugger *d, const char *text, int id)
 {
-    HWND c = mk(d, 0, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, id, page, sec, 0);
+    return child(d, "BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, id, d->ui);
+}
+
+static void size_columns(debugger *d)
+{
+    static const int widths[3] = { 60, 700, 80 };
     int i;
-    for (i = 0; i < n; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)items[i]);
-    SendMessageW(c, CB_SETCURSEL, 0, 0);
-    return c;
+    for (i = 0; i < 3; i++)
+        SendMessageA(d->bp_list, LVM_SETCOLUMNWIDTH, (WPARAM)i, S(d, widths[i]));
+}
+
+/* Starts a tab: its container, which the controls made next are children of. */
+static void begin_page(debugger *d, int page)
+{
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE);
+    d->pg[page] = CreateWindowExA(0, PAGE_CLASS, "", WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 10, 10,
+                                  d->hwnd, NULL, inst, NULL);
+    SetWindowLongPtrA(d->pg[page], GWLP_USERDATA, (LONG_PTR)d->hwnd);
+    d->new_parent = d->pg[page];
+}
+
+/* A tab's label for the tab control ("&" would underline the next letter). */
+static void tab_text(int page, char *text, size_t n)
+{
+    const char *s;
+    size_t o = 0;
+    for (s = k_tabs[page].label; *s && o < n - 2; s++) {
+        if (*s == '&') text[o++] = '&';
+        text[o++] = *s;
+    }
+    text[o] = '\0';
 }
 
 static void build_controls(debugger *d)
 {
-    TCITEMW item;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE);
+    TCITEMA item;
     int i;
 
-    d->tabs = mk(d, 0, WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, IDC_TABS, -1, -1, 0);
+    d->tabs = child(d, "SysTabControl32", "", WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP, IDC_TABS, d->ui);
     memset(&item, 0, sizeof item);
     item.mask = TCIF_TEXT;
-    for (i = 0; i < PAGE_COUNT; i++) {
-        item.pszText = (wchar_t *)kPageTitles[i];
-        SendMessageW(d->tabs, TCM_INSERTITEMW, (WPARAM)i, (LPARAM)&item);
+    for (i = 0; i < TAB_COUNT; i++) {
+        char text[32];
+        tab_text(i, text, sizeof text);
+        item.pszText = text;
+        SendMessageA(d->tabs, TCM_INSERTITEMA, (WPARAM)i, (LPARAM)&item);
+        d->tab_page[i] = i;
+    }
+    d->ntabs = TAB_COUNT;
+
+    /* The toolbar. Run/Stop is owner-drawn so it can wear the accent colour
+     * while the machine is stopped. */
+    d->run_btn = child(d, "BUTTON", "Stop (F5)", BS_OWNERDRAW | WS_TABSTOP, IDC_RUN, d->ui);
+    d->step_btn = button(d, "Step (F7)", IDC_STEP);
+    d->over_btn = button(d, "Step Over (F8)", IDC_OVER);
+    d->out_btn = button(d, "Step Out (Shift+F8)", IDC_OUT);
+    d->run_to_btn = button(d, "Run to Cursor", IDC_RUN_TO);
+    d->scan_btn = button(d, "Scanline+1", IDC_SCANLINE);
+    d->frame_btn = button(d, "Frame+1 (Shift+F7)", IDC_FRAME);
+    d->clear_bps_btn = button(d, "Clear Breakpoints", IDC_CLEAR_BPS);
+    d->break_at_label = dim_label(d, "Break at:", SS_RIGHT);
+    d->break_at = field(d, IDC_BREAK_AT, L"symbol or hex");
+    d->sym_btn = button(d, "Load Symbols...", IDC_SYMBOLS);
+    d->clear_sym_btn = button(d, "Clear Symbols", IDC_CLEAR_SYMBOLS);
+    d->save_btn = button(d, "Save...", IDC_SAVE);
+    d->popout_btn = button(d, "Pop Out", IDC_POPOUT);
+    d->help_btn = button(d, "Help", IDC_HELP_BTN);
+    d->status = child(d, "STATIC", "", SS_RIGHT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_STATUS, d->ui);
+    if (d->ndim < (int)(sizeof d->dim / sizeof d->dim[0])) d->dim[d->ndim++] = d->status;
+    {
+        HWND bar[16] = { d->run_btn, d->step_btn, d->over_btn, d->out_btn, d->run_to_btn, d->scan_btn, d->frame_btn,
+                         d->clear_bps_btn, d->break_at_label, d->break_at, d->sym_btn, d->clear_sym_btn,
+                         d->save_btn, d->popout_btn, d->status, d->help_btn };
+        for (i = 0; i < 16; i++) ShowWindow(bar[i], SW_SHOW);
     }
 
-    /* Toolbar: the stepping buttons, the symbol and save menus (they matter
-     * on every page), Help for the tab showing, then the stop reason. Run/Stop
-     * is owner-drawn so it can wear the accent while the machine is stopped. */
-    d->run_btn = mk(d, 0, L"BUTTON", L"Stop (F5)", BS_OWNERDRAW | WS_TABSTOP, IDC_RUN, -1, -1, 0);
-    d->step_btn = button(d, L"Step (F7)", IDC_STEP, -1, -1);
-    d->over_btn = button(d, L"Step Over (F8)", IDC_OVER, -1, -1);
-    d->out_btn = button(d, L"Step Out (Shift+F8)", IDC_OUT, -1, -1);
-    d->frame_btn = button(d, L"Frame", IDC_FRAME, -1, -1);
-    d->scan_btn = button(d, L"Scanline", IDC_SCAN, -1, -1);
-    d->torun_btn = button(d, L"Run to Cursor", IDC_TORUN, -1, -1);
-    d->load_symbols = button(d, L"Symbols...", IDC_LOAD_SYMBOLS, -1, -1);
-    d->save = button(d, L"Save...", IDC_SAVE, -1, -1);
-    d->help_btn = button(d, L"Help", IDC_HELP_BTN, -1, -1);
-    d->status = mk(d, 0, L"STATIC", L"Running", SS_RIGHT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_STATUS, -1, -1, 0);
-
-    /* Prompt */
-    d->prompt_out = view(d, IDC_PROMPT_OUT, PAGE_PROMPT, -1, 1);
-    SetWindowTextW(d->prompt_out,
-                   L"Fairchild Channel F debugger prompt (F3850 CPU, 128 x 64 video RAM). Type 'help' for every command.\r\n");
-    d->prompt_in = field(d, IDC_PROMPT_IN, PAGE_PROMPT, -1, 1, 0);
-    SendMessageW(d->prompt_in, EM_SETCUEBANNER, TRUE,
-                 (LPARAM)L"command (help, step, break, bpv, bpi, print, mem, scratch, kstack, vram, pal, ...) - Tab completes, Up/Down recall");
-
-    /* CPU & RAM */
-    for (i = 0; i < NFIELDS; i++) {
-        d->fld_label[i] = label(d, kFields[i].name, PAGE_CPU, -1);
-        d->fld[i] = field(d, IDC_FIELD0 + i, PAGE_CPU, -1, 1, kFields[i].digits);
+    /* The registers strip, under the tabs (children of the window itself) */
+    for (i = 0; i < NREGS; i++) {
+        d->reg_label[i] = dim_label(d, k_reg_names[i], SS_RIGHT);
+        d->reg[i] = field(d, IDC_REG0 + i, NULL);
+        SendMessageA(d->reg[i], EM_SETLIMITTEXT, 12, 0);
+        ShowWindow(d->reg_label[i], SW_SHOW);
+        ShowWindow(d->reg[i], SW_SHOW);
     }
-    for (i = 0; i < NFLAGS; i++) {
-        wchar_t w[24];
-        dbg_wide_from(kFlagNames[i], w, 24);
-        d->flag[i] = checkbox(d, w, IDC_FLAG0 + i, PAGE_CPU, -1);
+    for (i = 0; i < NCHECKS; i++) {
+        d->chk[i] = checkbox(d, k_chk_names[i], IDC_CHK0 + i);
+        ShowWindow(d->chk[i], SW_SHOW);
     }
-    d->cpu_state = view(d, IDC_CPU_STATE, PAGE_CPU, -1, 0);
-    d->scr_head = label(d, "Scratchpad r0-r63 (octal: row.column; shaded = K stack r40-r59)", PAGE_CPU, -1);
-    d->scr_grid = mk(d, WS_EX_CLIENTEDGE, L"ChfDbgScratch", L"", 0, IDC_SCR_GRID, PAGE_CPU, -1, 1);
-    d->scr_reg_label = label(d, "Write r", PAGE_CPU, -1);
-    d->scr_reg = field(d, IDC_SCR_REG, PAGE_CPU, -1, 1, 2);
-    d->scr_val_label = label(d, "(octal) =", PAGE_CPU, -1);
-    d->scr_val = field(d, IDC_SCR_VAL, PAGE_CPU, -1, 1, 3);
-    d->kstack_head = label(d, "K stack", PAGE_CPU, -1);
-    d->kstack = view(d, IDC_KSTACK, PAGE_CPU, -1, 1);
-    d->mem_label = label(d, "Memory", PAGE_CPU, -1);
-    d->mem_view = view(d, IDC_MEM_VIEW, PAGE_CPU, -1, 0);
-    d->ram_space = combo(d, IDC_RAM_SPACE, kSpaceNames, NSPACES, PAGE_CPU, -1);
-    d->ram_prev = button(d, L"\x25C0 256", IDC_RAM_PREV, PAGE_CPU, -1);
-    d->ram_next = button(d, L"256 \x25B6", IDC_RAM_NEXT, PAGE_CPU, -1);
-    d->ram_goto_label = label(d, "Go to", PAGE_CPU, -1);
-    d->ram_goto = field(d, IDC_RAM_GOTO, PAGE_CPU, -1, 1, 0);
-    d->ram_addr_label = label(d, "Write", PAGE_CPU, -1);
-    d->ram_addr = field(d, IDC_RAM_ADDR, PAGE_CPU, -1, 1, 0);
-    d->ram_val_label = label(d, "=", PAGE_CPU, -1);
-    d->ram_val = field(d, IDC_RAM_VAL, PAGE_CPU, -1, 1, 0);
+    d->kdepth = label(d, "", d->ui, SS_LEFT | SS_ENDELLIPSIS);
+    d->beam = label(d, "", d->ui, SS_LEFT | SS_ENDELLIPSIS);
+    ShowWindow(d->kdepth, SW_SHOW);
+    ShowWindow(d->beam, SW_SHOW);
 
-    /* Disassembly */
-    d->follow_pc = checkbox(d, L"Follow PC", IDC_FOLLOW_PC, PAGE_DISASM, -1);
-    SendMessageW(d->follow_pc, BM_SETCHECK, BST_CHECKED, 0);
-    d->jump_label = label(d, "Go to", PAGE_DISASM, -1);
-    d->jump = field(d, IDC_JUMP, PAGE_DISASM, -1, 1, 0);
-    d->disasm_hint = label(d, "Click the margin or double-click a line to toggle its breakpoint; click a line to select it; scroll to browse", PAGE_DISASM, -1);
-    d->disasm = mk(d, WS_EX_CLIENTEDGE, L"ChfDbgDisasm", L"", WS_TABSTOP, IDC_DISASM, PAGE_DISASM, -1, 1);
+    /* Console */
+    begin_page(d, TAB_CONSOLE);
+    d->con_out = view(d, IDC_CON_OUT, 0);
+    SetWindowTextA(d->con_out, "Channel F debugger console. Type 'help' for every command; Tab completes, Up/Down "
+                               "recall. Numbers are decimal; $ (or 0x) for hex, o17 for octal.\r\n");
+    d->con_prompt = child(d, "STATIC", ">", SS_LEFT, IDC_CON_PROMPT, d->mono);
+    d->con_in = field(d, IDC_CON_IN, L"help, step, over, break $0802, bpw $8010, bpv 12,40, mem scratch, disasm, regs, ...");
 
-    /* Video: the picture and what controls it ... */
-    d->view_label = label(d, "View", PAGE_VIDEO, -1);
-    d->view_mode = combo(d, IDC_VIEW_MODE, kViewNames, NVIEWS, PAGE_VIDEO, -1);
-    d->scale_label = label(d, "Scale", PAGE_VIDEO, -1);
-    d->scale_mode = combo(d, IDC_SCALE_MODE, kScaleNames, NSCALES, PAGE_VIDEO, -1);
-    d->overlays_label = label(d, "Overlays", PAGE_VIDEO, -1);
-    for (i = 0; i < NOVERLAYS; i++) {
-        d->overlay[i] = checkbox(d, kOverlayNames[i], IDC_OVL0 + i, PAGE_VIDEO, -1);
-        if (i == 0) SendMessageW(d->overlay[i], BM_SETCHECK, BST_CHECKED, 0);
-    }
-    d->vpic = mk(d, WS_EX_CLIENTEDGE, L"ChfDbgVideo", L"", 0, IDC_VPIC, PAGE_VIDEO, -1, 0);
-    d->vstatus = label(d, "Hover over the picture for the cell under the pointer.", PAGE_VIDEO, -1);
-    /* ... and the sections beside it. The strip is a tab control used as a
-     * strip alone, the sections below it controls of their own. */
-    d->vtabs = mk(d, 0, WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, IDC_VTABS, PAGE_VIDEO, -1, 0);
-    for (i = 0; i < SEC_COUNT; i++) {
-        item.pszText = (wchar_t *)kSectionTitles[i];
-        SendMessageW(d->vtabs, TCM_INSERTITEMW, (WPARAM)i, (LPARAM)&item);
-    }
-    d->hover_head = label(d, "Under the pointer", PAGE_VIDEO, SEC_CELL);
-    d->hover_text = view(d, IDC_HOVER_TEXT, PAGE_VIDEO, SEC_CELL, 0);
-    d->pin_head = label(d, "Pinned (click a cell)", PAGE_VIDEO, SEC_CELL);
-    d->pin_text = view(d, IDC_PIN_TEXT, PAGE_VIDEO, SEC_CELL, 0);
-    d->pin_break = button(d, L"Break on its writes", IDC_PIN_BREAK, PAGE_VIDEO, SEC_CELL);
-    d->pin_clear = button(d, L"Unpin", IDC_PIN_CLEAR, PAGE_VIDEO, SEC_CELL);
-    d->rows_head = label(d, "Row palettes (from columns 125 and 126)", PAGE_VIDEO, SEC_ROWS);
-    d->rows_view = mk(d, WS_EX_CLIENTEDGE, L"ChfDbgRows", L"", 0, IDC_ROWS_VIEW, PAGE_VIDEO, SEC_ROWS, 1);
-    d->pal_head = label(d, "The four palettes", PAGE_VIDEO, SEC_ROWS);
-    d->pal_text = view(d, IDC_PAL_TEXT, PAGE_VIDEO, SEC_ROWS, 1);
-    d->ports_text = view(d, IDC_PORTS_TEXT, PAGE_VIDEO, SEC_PORTS, 1);
-    d->wr_row_label = label(d, "Rows", PAGE_VIDEO, SEC_WRITES);
-    d->wr_row0 = field(d, IDC_WR_ROW0, PAGE_VIDEO, SEC_WRITES, 1, 3);
-    d->wr_row1 = field(d, IDC_WR_ROW1, PAGE_VIDEO, SEC_WRITES, 1, 3);
-    d->wr_col_label = label(d, "Columns", PAGE_VIDEO, SEC_WRITES);
-    d->wr_col0 = field(d, IDC_WR_COL0, PAGE_VIDEO, SEC_WRITES, 1, 3);
-    d->wr_col1 = field(d, IDC_WR_COL1, PAGE_VIDEO, SEC_WRITES, 1, 3);
-    d->wr_changes = checkbox(d, L"Changes only", IDC_WR_CHANGES, PAGE_VIDEO, SEC_WRITES);
-    d->wr_frame = checkbox(d, L"This frame", IDC_WR_FRAME, PAGE_VIDEO, SEC_WRITES);
-    d->wr_palcols = checkbox(d, L"Palette columns", IDC_WR_PALCOLS, PAGE_VIDEO, SEC_WRITES);
-    d->wr_clear = button(d, L"Clear log", IDC_WR_CLEAR, PAGE_VIDEO, SEC_WRITES);
-    d->wr_counts = label(d, "", PAGE_VIDEO, SEC_WRITES);
-    d->wr_text = view(d, IDC_WR_TEXT, PAGE_VIDEO, SEC_WRITES, 2);
-    SetWindowTextW(d->wr_row0, L"0");
-    SetWindowTextW(d->wr_row1, L"63");
-    SetWindowTextW(d->wr_col0, L"0");
-    SetWindowTextW(d->wr_col1, L"127");
+    /* Disassembly. Follow PC is a toggle button: the accent while it is on. */
+    begin_page(d, TAB_DISASM);
+    d->follow_pc = child(d, "BUTTON", "Follow PC", BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, IDC_FOLLOW_PC,
+                         d->ui);
+    SendMessageA(d->follow_pc, BM_SETCHECK, BST_CHECKED, 0);
+    d->jump_label = dim_label(d, "Jump to", SS_LEFT);
+    d->jump = field(d, IDC_JUMP, L"0802 or a label");
+    d->disasm_hint = dim_label(d, "Click a line to select it (Run to Cursor); click the gutter, double-click or "
+                                  "press F9 for a breakpoint; scroll to browse",
+                               SS_LEFT | SS_ENDELLIPSIS);
+    d->disasm = CreateWindowExA(WS_EX_CLIENTEDGE, DISASM_CLASS, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10,
+                                d->pg[TAB_DISASM], (HMENU)(INT_PTR)IDC_DISASM, inst, NULL);
 
-    /* Sound & I/O */
-    d->io_draw = mk(d, 0, L"ChfDbgIo", L"", 0, IDC_IO_DRAW, PAGE_IO, -1, 0);
-    d->io_state = view(d, IDC_IO_STATE, PAGE_IO, -1, 0);
-    d->snd_head = label(d, "Beeper mode changes", PAGE_IO, -1);
-    d->snd_log = view(d, IDC_SND_LOG, PAGE_IO, -1, 2);
-    d->iolog_head = label(d, "Port accesses (IN / OUT)", PAGE_IO, -1);
-    d->io_log = view(d, IDC_IO_LOG, PAGE_IO, -1, 2);
-    d->io_clear = button(d, L"Clear", IDC_IO_CLEAR, PAGE_IO, -1);
+    /* Memory: the space selector, the dump (and the scratchpad grid), Go to, Poke, and the search bar */
+    begin_page(d, TAB_MEMORY);
+    d->mem_title = label(d, k_space_titles[0], d->ui_bold, SS_LEFT);
+    d->mem_space = child(d, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_MEM_SPACE, d->ui);
+    for (i = 0; i < NSPACES; i++) SendMessageA(d->mem_space, CB_ADDSTRING, 0, (LPARAM)k_space_names[i]);
+    SendMessageA(d->mem_space, CB_SETCURSEL, 0, 0);
+    d->scratch = dbg_scratch_create(d->pg[TAB_MEMORY], IDC_SCRATCH);
+    ShowWindow(d->scratch, SW_HIDE);
+    d->kstack_head = label(d, "BIOS K stack", d->ui_bold, SS_LEFT);
+    ShowWindow(d->kstack_head, SW_HIDE);
+    d->kstack = view(d, IDC_KSTACK, 0);
+    ShowWindow(d->kstack, SW_HIDE);
+    d->mem_view = CreateWindowExA(WS_EX_CLIENTEDGE, MEMVIEW_CLASS, "", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP, 0, 0,
+                                  10, 10, d->pg[TAB_MEMORY], (HMENU)(INT_PTR)IDC_MEM_VIEW, inst, NULL);
+    d->goto_label = dim_label(d, "Go to", SS_LEFT);
+    d->mem_goto = field(d, IDC_MEM_GOTO, L"0802 / label / lo-hi / expression");
+    d->write_label = dim_label(d, "Poke", SS_LEFT);
+    d->mem_write = field(d, IDC_MEM_WRITE, L"0810 3F 00 (address, hex bytes)");
+    d->srch_kind = child(d, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_SRCH_KIND, d->ui);
+    SendMessageA(d->srch_kind, CB_ADDSTRING, 0, (LPARAM)"Hex");
+    SendMessageA(d->srch_kind, CB_ADDSTRING, 0, (LPARAM)"Text");
+    SendMessageA(d->srch_kind, CB_SETCURSEL, 0, 0);
+    d->srch_entry = field(d, IDC_SRCH_ENTRY, L"3F 00 (hex bytes) or text");
+    d->srch_next = button(d, "Find Next", IDC_SRCH_NEXT);
+    d->srch_prev = button(d, "Find Previous", IDC_SRCH_PREV);
+    d->srch_note = dim_label(d, "", SS_LEFT | SS_ENDELLIPSIS);
 
     /* Breakpoints */
-    d->bp_list = mk(d, WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
-                    IDC_BP_LIST, PAGE_BREAKS, -1, 1);
-    d->bp_type = combo(d, IDC_BP_TYPE, kBpTypes, NBPTYPES, PAGE_BREAKS, -1);
-    d->bp_start_label = label(d, "From", PAGE_BREAKS, -1);
-    d->bp_start = field(d, IDC_BP_START, PAGE_BREAKS, -1, 1, 0);
-    d->bp_end_label = label(d, "to", PAGE_BREAKS, -1);
-    d->bp_end = field(d, IDC_BP_END, PAGE_BREAKS, -1, 1, 0);
-    d->bp_cond_label = label(d, "if", PAGE_BREAKS, -1);
-    d->bp_cond = field(d, IDC_BP_COND, PAGE_BREAKS, -1, 1, 0);
-    SendMessageW(d->bp_cond, EM_SETCUEBANNER, TRUE, (LPARAM)L"optional condition, e.g. value == 2");
-    d->bp_hint = label(d, kBpHints[0], PAGE_BREAKS, -1);
-    d->bp_add = button(d, L"Add", IDC_BP_ADD, PAGE_BREAKS, -1);
-    d->bp_remove = button(d, L"Remove", IDC_BP_REMOVE, PAGE_BREAKS, -1);
-    d->bp_enable = button(d, L"Enable/Disable", IDC_BP_ENABLE, PAGE_BREAKS, -1);
-    d->bp_clear = button(d, L"Clear all", IDC_BP_CLEAR, PAGE_BREAKS, -1);
-
-    /* Cart */
-    d->cart_text = view(d, IDC_CART_TEXT, PAGE_CART, -1, 1);
-    d->cart_mailbox_label = label(d, "The mailbox page the console reads ($F800-$FFFF)", PAGE_CART, -1);
-    d->cart_mailbox = view(d, IDC_CART_MAILBOX, PAGE_CART, -1, 1);
-    d->cart_ev_label = label(d, "Cartridge events (register writes, bytes sent, page selects, swaps)", PAGE_CART, -1);
-    d->cart_events = view(d, IDC_CART_EVENTS, PAGE_CART, -1, 2);
-
-    /* FujiNet: the note and the log are Unicode (the engine's text has arrows
-     * and a times sign) */
-    d->fuji_title = label(d, "FujiBus packets (SLIP-decoded)", PAGE_FUJINET, -1);
-    d->fuji_note = mk(d, 0, L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_FUJI_NOTE, PAGE_FUJINET, -1, 0);
-    d->fuji_clear = button(d, L"Clear", IDC_FUJI_CLEAR, PAGE_FUJINET, -1);
-    d->fuji_text = view(d, IDC_FUJI_TEXT, PAGE_FUJINET, -1, 2);
-    d->state_title = label(d, "The cartridge's mailbox", PAGE_FUJINET, -1);
-    d->fuji_state = view(d, IDC_FUJI_STATE, PAGE_FUJINET, -1, 1);
-
-    /* The tab controls were created first, so every page control sits below
-     * them in z-order and their bodies would paint over labels that have not
-     * repainted since; at the bottom (with WS_CLIPSIBLINGS) they never do. */
-    SetWindowPos(d->tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    SetWindowPos(d->vtabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-}
-
-/* ---- showing a page ---------------------------------------------------------------- */
-
-static int ctl_wanted(const debugger *d, const ctl_t *c)
-{
-    if (c->page < 0) return 1;
-    if (c->page != d->page) return 0;
-    if (c->sec < 0) return 1;
-    if (c->page == PAGE_VIDEO) return c->sec == d->vsec;
-    return 1;
-}
-
-static void apply_visibility(debugger *d)
-{
-    int i;
-    for (i = 0; i < d->nctl; i++)
-        if (!ctl_wanted(d, &d->ctl[i])) ShowWindow(d->ctl[i].h, SW_HIDE);
-    for (i = 0; i < d->nctl; i++)
-        if (ctl_wanted(d, &d->ctl[i])) ShowWindow(d->ctl[i].h, SW_SHOWNA);
-}
-
-/* ---- layout --------------------------------------------------------------------------- */
-
-static void put(HWND h, int x, int y, int w, int hgt)
-{
-    MoveWindow(h, x, y, w > 1 ? w : 1, hgt > 1 ? hgt : 1, TRUE);
-}
-
-/* A control's text width in the UI font. */
-static int text_width(debugger *d, HWND h)
-{
-    wchar_t t[160];
-    SIZE sz = { 0, 0 };
-    HDC dc = GetDC(d->hwnd);
-    HGDIOBJ old = SelectObject(dc, d->ui);
-    GetWindowTextW(h, t, 160);
-    GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
-    SelectObject(dc, old);
-    ReleaseDC(d->hwnd, dc);
-    return sz.cx;
-}
-
-static int btn_w(debugger *d, HWND h)
-{
-    return text_width(d, h) + S(24);
-}
-
-/* Checkboxes (or any text controls) flowing left to right from x0 and
- * wrapping at `right`; returns the y of the row below. */
-static int flow(debugger *d, HWND *h, int n, int x0, int y, int right)
-{
-    int x = x0, i;
-    for (i = 0; i < n; i++) {
-        const int w = text_width(d, h[i]) + S(28);
-        if (x + w > right && x > x0) { x = x0; y += d->row_h; }
-        put(h[i], x, y, w, d->row_h);
-        x += w + S(6);
-    }
-    return y + d->row_h + S(4);
-}
-
-static void layout_cpu(debugger *d, int px, int py, int pw, int ph)
-{
-    const int rh = d->row_h, gap = S(4), lw = S(468);
-    const int fcol = S(152), flab = S(44), fed = S(70);
-    int y = py, i, sw, sh, sx, kx, kw, top_h, mem_y, view_w, view_h;
-    HWND flags[NFLAGS];
-
-    /* the top zone: registers, the scratchpad, the K stack */
-    dbg_scratch_size(d, &sw, &sh);
-    for (i = 0; i < NFIELDS; i++) {
-        const int cx = px + (i % 3) * fcol, cy = y + (i / 3) * (rh + gap);
-        put(d->fld_label[i], cx, cy + (rh - d->ui_h) / 2, flab, d->ui_h + 2);
-        put(d->fld[i], cx + flab, cy, fed, rh);
-    }
-    y += ((NFIELDS + 2) / 3) * (rh + gap) + S(2);
-    for (i = 0; i < NFLAGS; i++) flags[i] = d->flag[i];
-    y = flow(d, flags, NFLAGS, px, y, px + lw);
-    top_h = sh + d->ui_h + S(10) + rh + S(8);          /* the scratchpad's zone */
-    put(d->cpu_state, px, y, lw, py + top_h - y > 5 * d->mono_h ? py + top_h - y : 5 * d->mono_h);
-
-    sx = px + lw + S(14);
-    put(d->scr_head, sx, py, sw + S(60), d->ui_h + 2);
-    put(d->scr_grid, sx, py + d->ui_h + S(6), sw + 4, sh + 4);
+    begin_page(d, TAB_BREAKS);
+    d->bp_stop = label(d, "Running.", d->ui_bold, SS_LEFT | SS_ENDELLIPSIS);
+    d->bp_hint = dim_label(d, "Click a disassembly line's gutter to set an execute breakpoint; the box enables it.",
+                           SS_LEFT | SS_ENDELLIPSIS);
+    d->bp_remove = button(d, "Remove", IDC_BP_REMOVE);
+    d->bp_clear = button(d, "Clear All", IDC_BP_CLEAR);
+    d->bp_clear_hits = button(d, "Clear Hits", IDC_BP_CLEAR_HITS);
+    d->bp_list = child_ex(d, WS_EX_CLIENTEDGE, "SysListView32", "",
+                          WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_NOSORTHEADER,
+                          IDC_BP_LIST, d->mono);
+    SendMessageA(d->bp_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
     {
-        const int wy = py + d->ui_h + S(6) + sh + 4 + S(6);
-        put(d->scr_reg_label, sx, wy + (rh - d->ui_h) / 2, S(54), d->ui_h + 2);
-        put(d->scr_reg, sx + S(56), wy, S(38), rh);
-        put(d->scr_val_label, sx + S(100), wy + (rh - d->ui_h) / 2, S(60), d->ui_h + 2);
-        put(d->scr_val, sx + S(162), wy, S(48), rh);
-    }
-    kx = sx + sw + S(18);
-    kw = px + pw - kx;
-    put(d->kstack_head, kx, py, kw > S(60) ? kw : S(60), d->ui_h + 2);
-    put(d->kstack, kx, py + d->ui_h + S(6), kw > S(60) ? kw : S(60), sh + 4 - S(2));
-
-    /* the memory below */
-    mem_y = py + top_h + S(10);
-    put(d->mem_label, px, mem_y, pw, d->ui_h + 2);
-    mem_y += d->ui_h + S(6);
-    view_w = (8 + 16 * 3) * d->mono_w + S(18);
-    view_h = ph - (mem_y - py);
-    if (view_h < 6 * d->mono_h) view_h = 6 * d->mono_h;
-    if (view_h > (MEM_ROWS + 1) * d->mono_h + S(8)) view_h = (MEM_ROWS + 1) * d->mono_h + S(8);
-    put(d->mem_view, px, mem_y, view_w, view_h);
-    {
-        int x = px + view_w + S(16), yy = mem_y;
-        put(d->ram_space, x, yy, S(170), rh + S(120));
-        yy += rh + S(8);
-        put(d->ram_prev, x, yy, S(74), rh + 2);
-        put(d->ram_next, x + S(82), yy, S(74), rh + 2);
-        yy += rh + S(10);
-        put(d->ram_goto_label, x, yy + (rh - d->ui_h) / 2, S(44), d->ui_h + 2);
-        put(d->ram_goto, x + S(48), yy, S(90), rh);
-        yy += rh + S(8);
-        put(d->ram_addr_label, x, yy + (rh - d->ui_h) / 2, S(44), d->ui_h + 2);
-        put(d->ram_addr, x + S(48), yy, S(90), rh);
-        put(d->ram_val_label, x + S(144), yy + (rh - d->ui_h) / 2, S(14), d->ui_h + 2);
-        put(d->ram_val, x + S(160), yy, S(50), rh);
-    }
-}
-
-static void layout_video(debugger *d, int px, int py, int pw, int ph)
-{
-    const int rh = d->row_h, gap = S(8);
-    int rw = pw * 40 / 100, lw, y = py, cap_w, th, rx, sx, sy, sw, sh;
-    if (rw < S(400)) rw = S(400);
-    if (rw > S(560)) rw = S(560);
-    lw = pw - rw - gap;
-    cap_w = S(64);
-
-    put(d->view_label, px, y + (rh - d->ui_h) / 2, S(40), d->ui_h + 2);
-    put(d->view_mode, px + S(42), y, S(250), rh + S(160));
-    put(d->scale_label, px + S(304), y + (rh - d->ui_h) / 2, S(42), d->ui_h + 2);
-    put(d->scale_mode, px + S(348), y, S(70), rh + S(120));
-    y += rh + S(4);
-    put(d->overlays_label, px, y + (rh - d->ui_h) / 2, cap_w, d->ui_h + 2);
-    y = flow(d, d->overlay, NOVERLAYS, px + cap_w, y, px + lw);
-    put(d->vstatus, px, py + ph - rh, lw, rh);
-    put(d->vpic, px, y, lw, py + ph - rh - S(4) - y);
-
-    rx = px + lw + gap;
-    th = chf_place_tab_strip(d->vtabs, rx, py, rw);
-    sx = rx;
-    sy = py + th + S(4);
-    sw = rw;
-    sh = ph - th - S(4);
-
-    /* Cell */
-    {
-        const int half = (sh - 2 * (d->ui_h + S(6)) - rh - S(16)) / 2;
-        int cy = sy;
-        put(d->hover_head, sx, cy, sw, d->ui_h + 2);
-        cy += d->ui_h + S(4);
-        put(d->hover_text, sx, cy, sw, half > 5 * d->mono_h ? half : 5 * d->mono_h);
-        cy += (half > 5 * d->mono_h ? half : 5 * d->mono_h) + S(8);
-        put(d->pin_head, sx, cy, sw, d->ui_h + 2);
-        cy += d->ui_h + S(4);
-        put(d->pin_text, sx, cy, sw, half > 5 * d->mono_h ? half : 5 * d->mono_h);
-        cy += (half > 5 * d->mono_h ? half : 5 * d->mono_h) + S(8);
-        put(d->pin_break, sx, cy, btn_w(d, d->pin_break), rh + 2);
-        put(d->pin_clear, sx + btn_w(d, d->pin_break) + S(8), cy, btn_w(d, d->pin_clear), rh + 2);
-    }
-    /* Rows & palettes */
-    {
-        int rwid, rhgt;
-        dbg_rows_size(d, &rwid, &rhgt);
-        put(d->rows_head, sx, sy, sw, d->ui_h + 2);
-        put(d->rows_view, sx, sy + d->ui_h + S(4), rwid + 4, rhgt + 4 < sh - d->ui_h - S(4) ? rhgt + 4 : sh - d->ui_h - S(4));
-        put(d->pal_head, sx + rwid + S(14), sy, sw - rwid - S(14), d->ui_h + 2);
-        put(d->pal_text, sx + rwid + S(14), sy + d->ui_h + S(4), sw - rwid - S(14), sh - d->ui_h - S(4));
-    }
-    /* Ports */
-    put(d->ports_text, sx, sy, sw, sh);
-    /* Writes */
-    {
-        int wy = sy, x = sx;
-        put(d->wr_row_label, x, wy + (rh - d->ui_h) / 2, S(40), d->ui_h + 2);
-        put(d->wr_row0, x + S(42), wy, S(44), rh);
-        put(d->wr_row1, x + S(90), wy, S(44), rh);
-        put(d->wr_col_label, x + S(150), wy + (rh - d->ui_h) / 2, S(60), d->ui_h + 2);
-        put(d->wr_col0, x + S(212), wy, S(44), rh);
-        put(d->wr_col1, x + S(260), wy, S(44), rh);
-        put(d->wr_clear, x + sw - btn_w(d, d->wr_clear), wy - 1, btn_w(d, d->wr_clear), rh + 2);
-        wy += rh + S(4);
-        {
-            HWND cb[3];
-            cb[0] = d->wr_changes; cb[1] = d->wr_frame; cb[2] = d->wr_palcols;
-            wy = flow(d, cb, 3, sx, wy, sx + sw);
+        static const char *const cols[3] = { "#", "Breakpoint", "Hits" };
+        LVCOLUMNA col;
+        memset(&col, 0, sizeof col);
+        col.mask = LVCF_TEXT;
+        for (i = 0; i < 3; i++) {
+            col.pszText = (char *)cols[i];
+            SendMessageA(d->bp_list, LVM_INSERTCOLUMNA, (WPARAM)i, (LPARAM)&col);
         }
-        put(d->wr_counts, sx, wy, sw, d->ui_h + 2);
-        wy += d->ui_h + S(6);
-        put(d->wr_text, sx, wy, sw, sy + sh - wy);
+        size_columns(d);
     }
-}
+    d->bp_empty = dim_label(d, "No breakpoints. Click the gutter of a disassembly line, or add one below.", SS_CENTER);
+    d->bp_type = child(d, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_BP_TYPE, d->ui);
+    for (i = 0; i < NBPTYPES; i++) SendMessageA(d->bp_type, CB_ADDSTRING, 0, (LPARAM)k_bp_types[i]);
+    SendMessageA(d->bp_type, CB_SETCURSEL, 0, 0);
+    d->bp_start = field(d, IDC_BP_START, NULL);
+    d->bp_end = field(d, IDC_BP_END, NULL);
+    d->bp_cond = field(d, IDC_BP_COND, L"condition, e.g. value != old  (value, old, addr, a, isar, ...)");
+    d->bp_add = button(d, "Add", IDC_BP_ADD);
+    d->bp_msg = label(d, "", d->ui, SS_LEFT | SS_ENDELLIPSIS);
+    on_bp_type(d);
 
-static void layout_io(debugger *d, int px, int py, int pw, int ph)
-{
-    int dw, dh, lw, rx, rw;
-    dbg_io_draw_size(d, &dw, &dh);
-    lw = dw + S(8);
-    if (lw < S(360)) lw = S(360);
-    rx = px + lw + S(16);
-    rw = px + pw - rx;
-    put(d->io_draw, px, py, lw, dh);
+    /* Watches */
+    begin_page(d, TAB_WATCHES);
+    d->wt_label = dim_label(d, "Watch", SS_LEFT);
+    d->wt_space = child(d, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_WT_SPACE, d->ui);
+    for (i = 0; i < NSPACES; i++) SendMessageA(d->wt_space, CB_ADDSTRING, 0, (LPARAM)k_space_names[i]);
+    SendMessageA(d->wt_space, CB_SETCURSEL, 0, 0);
+    d->wt_entry = field(d, IDC_WT_ENTRY, L"an address, label or expression, or lo-hi for a range");
+    d->wt_add = button(d, "Add", IDC_WT_ADD);
+    d->wt_remove = button(d, "Remove", IDC_WT_REMOVE);
+    d->wt_mem = button(d, "Memory", IDC_WT_MEM);
+    d->wt_brk = button(d, "Break on change", IDC_WT_BRK);
+    d->wt_list = child_ex(d, WS_EX_CLIENTEDGE, "LISTBOX", "",
+                          WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_WT_LIST, d->mono);
+    d->wt_msg = label(d, "", d->ui, SS_LEFT | SS_ENDELLIPSIS);
+
+    /* Cart & I/O: the cartridge, its mailbox page, the controllers, the ports and the logs */
+    begin_page(d, TAB_CART);
+    d->cart_text = view(d, IDC_CART_TEXT, WS_HSCROLL);
+    d->cart_mailbox_label = dim_label(d, "Mailbox page $F800-$FFFF (FujiNet cartridge)", SS_LEFT);
+    d->cart_mailbox = view(d, IDC_CART_MAILBOX, WS_HSCROLL);
+    d->lamps = dbg_lamps_create(d->pg[TAB_CART], IDC_LAMPS);
+    d->ports_label = dim_label(d, "Ports 0, 1, 4, 5 (the output latches), and the 2102 RAM latch", SS_LEFT);
+    d->ports_text = view(d, IDC_CART_PORTS, WS_HSCROLL);
+    d->cart_ev_label = dim_label(d, "Cartridge events", SS_LEFT);
+    d->cart_events = view(d, IDC_CART_EVENTS, WS_HSCROLL);
+    d->io_log_label = dim_label(d, "Port accesses (OUTS / OUT / INS / IN)", SS_LEFT);
+    d->io_log = view(d, IDC_IO_LOG, WS_HSCROLL);
+
+    /* Trace (0) and History (1) */
+    for (i = 0; i < 2; i++) {
+        begin_page(d, i ? TAB_HISTORY : TAB_TRACE);
+        d->h_rec[i] = child(d, "BUTTON", "Record", BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, IDC_H_REC0 + i, d->ui);
+        d->h_clear[i] = button(d, "Clear", IDC_H_CLEAR0 + i);
+        d->h_filter[i] = child(d, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_H_FILTER0 + i, d->ui);
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"All");
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"Branches");
+        SendMessageA(d->h_filter[i], CB_ADDSTRING, 0, (LPARAM)"Range");
+        SendMessageA(d->h_filter[i], CB_SETCURSEL, 0, 0);
+        d->h_range[i] = field(d, IDC_H_RANGE0 + i, L"0000-3FFF or a label");
+        EnableWindow(d->h_range[i], FALSE);
+        d->h_note[i] = dim_label(d, "recording off", SS_LEFT | SS_ENDELLIPSIS);
+        d->h_text[i] = view(d, IDC_H_TEXT0 + i, WS_HSCROLL);
+    }
+
+    /* Video: one child page with its own controls and controller */
+    begin_page(d, TAB_VIDEO);
+    d->video = dbg_video_create(d->pg[TAB_VIDEO], d->dbg, d->ui, d->mono, d->dpi);
+
+    /* Sound: the beeper */
+    begin_page(d, TAB_SOUND);
+    d->sound_text = view(d, IDC_SOUND_TEXT, WS_HSCROLL);
+    d->sound_level = child(d, PROGRESS_CLASSA, "", PBS_SMOOTH, IDC_SOUND_LEVEL, d->ui);
+    SendMessageA(d->sound_level, PBM_SETRANGE32, 0, 32767);
+    d->sound_log_label = dim_label(d, "Sound-mode changes (port 5 bits 7-6), newest last", SS_LEFT);
+    d->sound_log = view(d, IDC_SOUND_LOG, WS_HSCROLL);
+
+    /* Symbols: a filter over the table, a row opens the Disassembly there */
+    begin_page(d, TAB_SYMBOLS);
+    d->sym_filter_label = dim_label(d, "Filter", SS_LEFT);
+    d->sym_filter = field(d, IDC_SYM_FILTER, L"part of a name");
+    d->sym_count = dim_label(d, "", SS_LEFT | SS_ENDELLIPSIS);
+    d->sym_list = child_ex(d, WS_EX_CLIENTEDGE, "SysListView32", "",
+                           WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL, IDC_SYM_LIST, d->mono);
+    SendMessageA(d->sym_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT);
     {
-        const int sy = py + dh + S(6), sth = 6 * d->mono_h + S(8);
-        put(d->io_state, px, sy, lw, sth);
-        put(d->snd_head, px, sy + sth + S(8), lw, d->ui_h + 2);
-        put(d->snd_log, px, sy + sth + S(8) + d->ui_h + S(4), lw, py + ph - (sy + sth + S(8) + d->ui_h + S(4)));
+        static const char *const symbol_columns[3] = { "Address", "Name", "Kind" };
+        LVCOLUMNA symbol_column;
+        memset(&symbol_column, 0, sizeof symbol_column);
+        symbol_column.mask = LVCF_TEXT | LVCF_WIDTH;
+        for (i = 0; i < 3; i++) {
+            symbol_column.pszText = (char *)symbol_columns[i];
+            symbol_column.cx = S(d, i == 1 ? 360 : 80);
+            SendMessageA(d->sym_list, LVM_INSERTCOLUMNA, (WPARAM)i, (LPARAM)&symbol_column);
+        }
     }
-    put(d->iolog_head, rx, py + (d->row_h - d->ui_h) / 2, rw - S(80), d->ui_h + 2);
-    put(d->io_clear, rx + rw - btn_w(d, d->io_clear), py, btn_w(d, d->io_clear), d->row_h);
-    put(d->io_log, rx, py + d->row_h + S(6), rw, ph - d->row_h - S(6));
+    d->sym_shown = -1;
+
+    /* FujiNet: the note and the log are UTF-8 (see wide_view_text) */
+    begin_page(d, TAB_FUJINET);
+    d->fuji_title = label(d, "FujiBus packets over BoIP", d->ui_bold, SS_LEFT);
+    d->fuji_note = dim_label(d, "", SS_LEFT | SS_ENDELLIPSIS);
+    d->fuji_clear = button(d, "Clear", IDC_FUJI_CLEAR);
+    d->fuji_text = view(d, IDC_FUJI_TEXT, WS_HSCROLL);
+    d->fuji_state_title = label(d, "BoIP link", d->ui_bold, SS_LEFT);
+    d->fuji_state = view(d, IDC_FUJI_STATE, WS_HSCROLL);
+    d->new_parent = NULL;
 }
 
-static void layout_breaks(debugger *d, int px, int py, int pw, int ph)
-{
-    const int rh = d->row_h;
-    int ry = py + ph - 3 * rh - S(22), x = px, cond_w;
-    put(d->bp_list, px, py, pw, ry - py - S(6));
-    put(d->bp_type, x, ry, S(150), rh + S(160));
-    x += S(160);
-    put(d->bp_start_label, x, ry + (rh - d->ui_h) / 2, S(36), d->ui_h + 2);
-    put(d->bp_start, x + S(40), ry, S(110), rh);
-    x += S(158);
-    put(d->bp_end_label, x, ry + (rh - d->ui_h) / 2, S(18), d->ui_h + 2);
-    put(d->bp_end, x + S(20), ry, S(110), rh);
-    x += S(138);
-    put(d->bp_cond_label, x, ry + (rh - d->ui_h) / 2, S(14), d->ui_h + 2);
-    cond_w = px + pw - S(76) - (x + S(18));
-    put(d->bp_cond, x + S(18), ry, cond_w > S(80) ? cond_w : S(80), rh);
-    put(d->bp_add, px + pw - S(68), ry - 1, S(68), rh + 2);
-    ry += rh + S(6);
-    put(d->bp_hint, px, ry, pw, d->ui_h + 2);
-    ry += d->ui_h + S(10);
-    put(d->bp_remove, px, ry, S(96), rh + 2);
-    put(d->bp_enable, px + S(104), ry, S(130), rh + 2);
-    put(d->bp_clear, px + S(242), ry, S(96), rh + 2);
-}
+/* Help's contexts (data/help/help.md), one per tab */
+static const char *const k_tab_contexts[TAB_COUNT] = {
+    "debugger/console", "debugger/disassembly", "debugger/memory", "debugger/breakpoints", "debugger/watches",
+    "debugger/cart", "debugger/trace", "debugger/history", "debugger/video", "debugger/sound",
+    "debugger/symbols", "debugger/fujinet",
+};
 
-static void layout_cart(debugger *d, int px, int py, int pw, int ph)
+/* The tab control's index for a tab, or -1 when it is in a window of its own. */
+static int tab_index(debugger *d, int page)
 {
-    const int lw = pw * 44 / 100, rx = px + lw + S(14), rw = pw - lw - S(14);
-    const int top = (ph - 2 * (d->ui_h + S(6)) - S(8)) * 58 / 100;
-    put(d->cart_text, px, py, lw, ph);
-    put(d->cart_mailbox_label, rx, py, rw, d->ui_h + 2);
-    put(d->cart_mailbox, rx, py + d->ui_h + S(6), rw, top);
-    put(d->cart_ev_label, rx, py + d->ui_h + S(6) + top + S(8), rw, d->ui_h + 2);
-    put(d->cart_events, rx, py + 2 * (d->ui_h + S(6)) + top + S(8), rw, ph - (2 * (d->ui_h + S(6)) + top + S(8)));
-}
-
-static void layout_fujinet(debugger *d, int px, int py, int pw, int ph)
-{
-    const int rh = d->row_h;
-    int rw = pw / 3 > S(340) ? S(340) : pw / 3 > S(240) ? pw / 3 : S(240);
-    const int lw = pw - rw - S(12);
-    put(d->fuji_title, px, py, lw, d->ui_h + 2);
-    put(d->fuji_clear, px + lw - S(76), py + d->ui_h + S(4), S(76), rh);
-    put(d->fuji_note, px, py + d->ui_h + S(4) + (rh - d->ui_h) / 2, lw - S(84), d->ui_h + 2);
-    put(d->fuji_text, px, py + d->ui_h + rh + S(10), lw, ph - (d->ui_h + rh + S(10)));
-    put(d->state_title, px + lw + S(12), py, rw, d->ui_h + 2);
-    put(d->fuji_state, px + lw + S(12), py + d->ui_h + S(6), rw, ph - (d->ui_h + S(6)));
-}
-
-/* The toolbar and tabs, then the page that is showing. */
-static void layout(debugger *d)
-{
-    RECT client, page, tr;
-    int y = S(8), bx = S(8), px, py, pw, ph, tab_top, tabs_w, sx;
-    const int rh = d->row_h;
-    HWND bar[10];
     int i;
-
-    GetClientRect(d->hwnd, &client);
-    bar[0] = d->run_btn; bar[1] = d->step_btn; bar[2] = d->over_btn; bar[3] = d->out_btn; bar[4] = d->frame_btn;
-    bar[5] = d->scan_btn; bar[6] = d->torun_btn; bar[7] = d->load_symbols; bar[8] = d->save; bar[9] = d->help_btn;
-    for (i = 0; i < 10; i++) {
-        const int w = bar[i] == d->run_btn ? S(88) : btn_w(d, bar[i]);
-        put(bar[i], bx, y, w, rh + 2);
-        bx += w + S(6);
-    }
-
-    /* The tabs are a strip alone: the pages sit on the window's own face,
-     * where the labels' background is the same grey. The stop reason sits
-     * at the strip's right. */
-    tab_top = y + rh + S(10);
-    page.top = tab_top + chf_place_tab_strip(d->tabs, S(8), tab_top, client.right - S(16)) + S(8);
-    SendMessageW(d->tabs, TCM_GETITEMRECT, PAGE_COUNT - 1, (LPARAM)&tr);
-    tabs_w = tr.right + S(6);
-    if (tabs_w > client.right - S(16)) tabs_w = client.right - S(16);
-    MoveWindow(d->tabs, S(8), tab_top, tabs_w, page.top - S(8) - tab_top, TRUE);
-    sx = S(8) + tabs_w + S(12);
-    put(d->status, sx, tab_top + S(3), client.right - sx - S(8) > S(40) ? client.right - sx - S(8) : S(40), d->ui_h + 2);
-    page.left = S(8);
-    page.right = client.right - S(8);
-    page.bottom = client.bottom - S(8);
-    px = page.left + S(2);
-    py = page.top;
-    pw = page.right - page.left - S(4);
-    ph = page.bottom - page.top;
-    if (pw < S(200)) pw = S(200);
-    if (ph < S(200)) ph = S(200);
-
-    switch (d->page) {
-    case PAGE_PROMPT:
-        put(d->prompt_out, px, py, pw, ph - rh - S(8));
-        put(d->prompt_in, px, py + ph - rh - S(2), pw, rh);
-        break;
-    case PAGE_CPU: layout_cpu(d, px, py, pw, ph); break;
-    case PAGE_DISASM:
-        put(d->follow_pc, px, py + 2, S(96), rh);
-        put(d->jump_label, px + S(104), py + (rh - d->ui_h) / 2 + 2, S(46), d->ui_h + 2);
-        put(d->jump, px + S(152), py, S(150), rh);
-        put(d->disasm_hint, px + S(312), py + (rh - d->ui_h) / 2 + 2, pw - S(312) > S(40) ? pw - S(312) : S(40),
-            d->ui_h + 2);
-        put(d->disasm, px, py + rh + S(8), pw, ph - rh - S(8));
-        break;
-    case PAGE_VIDEO: layout_video(d, px, py, pw, ph); break;
-    case PAGE_IO: layout_io(d, px, py, pw, ph); break;
-    case PAGE_BREAKS: layout_breaks(d, px, py, pw, ph); break;
-    case PAGE_CART: layout_cart(d, px, py, pw, ph); break;
-    case PAGE_FUJINET: layout_fujinet(d, px, py, pw, ph); break;
-    default: break;
-    }
+    for (i = 0; i < d->ntabs; i++)
+        if (d->tab_page[i] == page) return i;
+    return -1;
 }
 
 static void show_page(debugger *d, int page)
 {
+    int p;
     d->page = page;
     /* Help, F1 and Ctrl+Shift+H open the tab's section */
-    chf_help_set_context(d->hwnd, kHelpContexts[page], 1);
-    apply_visibility(d);
+    if (page >= 0 && page < TAB_COUNT) chf_help_set_context(d->hwnd, k_tab_contexts[page], 1);
+    for (p = 0; p < TAB_COUNT; p++)   /* a tab's controls follow its container */
+        ShowWindow(d->pg[p], d->popped[p] || p == page ? SW_SHOW : SW_HIDE);
+    show_bp_list(d);
+    if (page == TAB_VIDEO && d->video) dbg_video_refresh(d->video, 1);
+}
+
+static void place(HWND h, int x, int y, int w, int hgt)
+{
+    MoveWindow(h, x, y, w > 1 ? w : 1, hgt > 1 ? hgt : 1, TRUE);
+}
+
+/* One tab's controls inside its container, which is pw x ph. */
+static void layout_page(debugger *d, int page, int pw, int ph)
+{
+    const int bh = S(d, 26), eh = S(d, 24), lh = S(d, 18), gap = S(d, 6);
+    const int px = 0, py = 0;
+    int x, y, w, i;
+
+    switch (page) {
+    case TAB_CONSOLE:
+        /* the transcript, then the prompt and its line */
+        w = d->mono_w + S(d, 6);
+        place(d->con_out, px, py, pw, ph - eh - S(d, 8));
+        place(d->con_prompt, px, py + ph - eh + (eh - d->mono_h) / 2, w, d->mono_h);
+        place(d->con_in, px + w + S(d, 2), py + ph - eh, pw - w - S(d, 2), eh);
+        break;
+
+    case TAB_DISASM:
+        /* Follow PC and Jump to over the lines */
+        w = btn_w(d, "Follow PC");
+        place(d->follow_pc, px, py - S(d, 1), w, bh);
+        x = px + w + S(d, 12);
+        w = text_w(d, d->ui, "Jump to") + S(d, 6);
+        place(d->jump_label, x, py + (eh - lh) / 2, w, lh);
+        x += w;
+        place(d->jump, x, py, S(d, 150), eh);
+        x += S(d, 162);
+        place(d->disasm_hint, x, py + (eh - lh) / 2, px + pw - x, lh);
+        place(d->disasm, px, py + eh + S(d, 6), pw, ph - eh - S(d, 6));
+        break;
+
+    case TAB_MEMORY: {
+        /* the space and its title, the scratchpad grid and K stack (SCRATCH), the dump, then Go to / Poke,
+         * then the search bar */
+        const int row2 = py + ph - eh, row1 = row2 - eh - S(d, 8);
+        int top = py + eh + S(d, 4);
+        place(d->mem_space, px, py, S(d, 100), S(d, 200));
+        place(d->mem_title, px + S(d, 112), py + (eh - lh) / 2, pw - S(d, 112), lh);
+        if (d->mem_sp == CHF_SPACE_SCRATCH) {
+            int gw, gh;
+            dbg_scratch_size(d->mono_w, d->mono_h, d->dpi, &gw, &gh);
+            place(d->scratch, px, top, gw, gh);
+            place(d->kstack_head, px + gw + S(d, 16), top, S(d, 300), lh);
+            place(d->kstack, px + gw + S(d, 16), top + lh + S(d, 4), S(d, 300), gh - lh - S(d, 4));
+            top += gh + S(d, 6);
+        }
+        place(d->mem_view, px, top, pw, row1 - S(d, 6) - top);
+        y = row1 + (eh - lh) / 2;
+        x = px;
+        w = text_w(d, d->ui, "Go to") + S(d, 6);
+        place(d->goto_label, x, y, w, lh);
+        x += w;
+        place(d->mem_goto, x, row1, S(d, 190), eh);
+        x += S(d, 196);
+        x += S(d, 24);
+        w = text_w(d, d->ui, "Poke") + S(d, 6);
+        place(d->write_label, x, y, w, lh);
+        x += w;
+        place(d->mem_write, x, row1, S(d, 260), eh);
+
+        x = px;
+        place(d->srch_kind, x, row2, S(d, 70), S(d, 120));
+        x += S(d, 76);
+        place(d->srch_entry, x, row2, S(d, 250), eh);
+        x += S(d, 256);
+        w = btn_w(d, "Find Next");
+        place(d->srch_next, x, row2 - S(d, 1), w, bh);
+        x += w + S(d, 4);
+        w = btn_w(d, "Find Previous");
+        place(d->srch_prev, x, row2 - S(d, 1), w, bh);
+        x += w + S(d, 12);
+        place(d->srch_note, x, row2 + (eh - lh) / 2, px + pw - x, lh);
+        break;
+    }
+
+    case TAB_BREAKS: {
+        /* "Stopped: ..." over the hint and the buttons; the list; the add row
+         * and a message under it */
+        const int msg_y = py + ph - lh, add_y = msg_y - S(d, 8) - eh;
+        const int row_y = py + lh + S(d, 4), list_y = row_y + bh + S(d, 6);
+        int bw = btn_w(d, "Clear All"), hw = btn_w(d, "Clear Hits"), rbw = btn_w(d, "Remove");
+        place(d->bp_stop, px, py, pw, lh);
+        place(d->bp_clear, px + pw - bw, row_y, bw, bh);
+        place(d->bp_clear_hits, px + pw - bw - gap - hw, row_y, hw, bh);
+        place(d->bp_remove, px + pw - bw - hw - 2 * gap - rbw, row_y, rbw, bh);
+        place(d->bp_hint, px, row_y + (bh - lh) / 2, pw - bw - hw - rbw - 4 * gap, lh);
+        place(d->bp_list, px, list_y, pw, add_y - gap - list_y);
+        {
+            RECT lc;
+            int cw;
+            GetClientRect(d->bp_list, &lc);
+            cw = lc.right - S(d, 60) - S(d, 80) - GetSystemMetrics(SM_CXVSCROLL);
+            SendMessageA(d->bp_list, LVM_SETCOLUMNWIDTH, 1, cw > S(d, 200) ? cw : S(d, 200));
+        }
+        place(d->bp_empty, px, list_y + S(d, 12), pw, lh);
+        x = px;
+        place(d->bp_type, x, add_y, S(d, 120), S(d, 240));
+        x += S(d, 126);
+        place(d->bp_start, x, add_y, S(d, 140), eh);
+        x += S(d, 146);
+        place(d->bp_end, x, add_y, S(d, 110), eh);
+        x += S(d, 116);
+        bw = btn_w(d, "Add");
+        place(d->bp_cond, x, add_y, px + pw - x - bw - gap, eh);
+        place(d->bp_add, px + pw - bw, add_y - S(d, 1), bw, bh);
+        place(d->bp_msg, px, msg_y, pw, lh);
+        break;
+    }
+
+    case TAB_WATCHES: {
+        const int msg_y = py + ph - lh, row_y = py + eh + S(d, 8);
+        int bw = btn_w(d, "Add");
+        w = text_w(d, d->ui, "Watch") + S(d, 6);
+        place(d->wt_label, px, py + (eh - lh) / 2, w, lh);
+        place(d->wt_space, px + w, py, S(d, 100), S(d, 200));
+        place(d->wt_entry, px + w + S(d, 108), py, pw - w - S(d, 108) - bw - gap, eh);
+        place(d->wt_add, px + pw - bw, py - S(d, 1), bw, bh);
+        x = px;
+        bw = btn_w(d, "Remove");
+        place(d->wt_remove, x, row_y, bw, bh);
+        x += bw + gap;
+        bw = btn_w(d, "Memory");
+        place(d->wt_mem, x, row_y, bw, bh);
+        x += bw + gap;
+        bw = btn_w(d, "Break on change");
+        place(d->wt_brk, x, row_y, bw, bh);
+        place(d->wt_list, px, row_y + bh + S(d, 6), pw, msg_y - gap - (row_y + bh + S(d, 6)));
+        place(d->wt_msg, px, msg_y, pw, lh);
+        break;
+    }
+
+    case TAB_CART: {
+        /* the cartridge's state and its mailbox page left; the controllers, the ports and the two logs right */
+        const int lw = pw * 46 / 100, rx = px + lw + S(d, 12), rw = pw - lw - S(d, 12);
+        const int text_h = ph * 55 / 100, half = (rw - gap) / 2;
+        int lamps_w, lamps_h, ports_h = d->mono_h * 8 + S(d, 10), ry = py;
+        place(d->cart_text, px, py, lw, text_h);
+        place(d->cart_mailbox_label, px, py + text_h + S(d, 6), lw, lh);
+        place(d->cart_mailbox, px, py + text_h + S(d, 10) + lh, lw, ph - text_h - S(d, 10) - lh);
+        dbg_lamps_size(d->mono_w, d->mono_h, d->dpi, &lamps_w, &lamps_h);
+        place(d->lamps, rx, ry, rw < lamps_w ? rw : lamps_w, lamps_h);
+        ry += lamps_h + S(d, 8);
+        place(d->ports_label, rx, ry, rw, lh);
+        place(d->ports_text, rx, ry + lh + S(d, 4), rw, ports_h);
+        ry += lh + S(d, 8) + ports_h;
+        place(d->cart_ev_label, rx, ry, half, lh);
+        place(d->cart_events, rx, ry + lh + S(d, 4), half, py + ph - (ry + lh + S(d, 4)));
+        place(d->io_log_label, rx + half + gap, ry, half, lh);
+        place(d->io_log, rx + half + gap, ry + lh + S(d, 4), half, py + ph - (ry + lh + S(d, 4)));
+        break;
+    }
+
+    case TAB_TRACE:
+    case TAB_HISTORY: {
+        const int k = page == TAB_HISTORY;
+        x = px;
+        w = btn_w(d, "Record");
+        place(d->h_rec[k], x, py - S(d, 1), w, bh);
+        x += w + gap;
+        w = btn_w(d, "Clear");
+        place(d->h_clear[k], x, py - S(d, 1), w, bh);
+        x += w + S(d, 16);
+        place(d->h_filter[k], x, py, S(d, 100), S(d, 120));
+        x += S(d, 106);
+        place(d->h_range[k], x, py, S(d, 190), eh);
+        x += S(d, 202);
+        place(d->h_note[k], x, py + (eh - lh) / 2, px + pw - x, lh);
+        place(d->h_text[k], px, py + bh + S(d, 6), pw, ph - bh - S(d, 6));
+        break;
+    }
+
+    case TAB_VIDEO:
+        if (d->video) place(d->video, px, py, pw, ph);
+        break;
+
+    case TAB_SOUND: {
+        const int text_h = d->mono_h * 9 + S(d, 10);
+        place(d->sound_text, px, py, pw, text_h);
+        place(d->sound_level, px, py + text_h + S(d, 8), pw, S(d, 20));
+        place(d->sound_log_label, px, py + text_h + S(d, 36), pw, lh);
+        place(d->sound_log, px, py + text_h + S(d, 40) + lh, pw, ph - text_h - S(d, 40) - lh);
+        break;
+    }
+
+    case TAB_SYMBOLS: {
+        w = text_w(d, d->ui, "Filter") + S(d, 6);
+        place(d->sym_filter_label, px, py + (eh - lh) / 2, w, lh);
+        place(d->sym_filter, px + w, py, S(d, 260), eh);
+        place(d->sym_count, px + w + S(d, 272), py + (eh - lh) / 2, pw - w - S(d, 272), lh);
+        place(d->sym_list, px, py + eh + S(d, 6), pw, ph - eh - S(d, 6));
+        break;
+    }
+
+    case TAB_FUJINET: {
+        /* the packets left (a note and Clear over them), the link's state and
+         * counts right */
+        const int rw = pw / 3 > S(d, 340) ? S(d, 340) : pw / 3 > S(d, 220) ? pw / 3 : S(d, 220);
+        const int lw = pw - rw - S(d, 12) > S(d, 120) ? pw - rw - S(d, 12) : S(d, 120);
+        const int cw = btn_w(d, "Clear");
+        place(d->fuji_title, px, py, lw, lh);
+        place(d->fuji_clear, px + lw - cw, py + lh + S(d, 4), cw, bh);
+        place(d->fuji_note, px, py + lh + S(d, 4) + (bh - lh) / 2, lw - cw - gap, lh);
+        place(d->fuji_text, px, py + lh + bh + S(d, 10), lw, ph - lh - bh - S(d, 10));
+        place(d->fuji_state_title, px + lw + S(d, 12), py, rw, lh);
+        place(d->fuji_state, px + lw + S(d, 12), py + lh + S(d, 4), rw, ph - lh - S(d, 4));
+        break;
+    }
+    default: break;
+    }
+    (void)i;
+}
+
+/* The registers strip: A W ISAR PC0 PC1 DC0 DC1 (one line, or two when
+ * narrow), then the flags, the K stack depth and the beam. Returns its
+ * height. */
+static int strip_height(debugger *d, int width, int *rows)
+{
+    const int eh = S(d, 24), gap = S(d, 6);
+    const int lw = text_w(d, d->ui, "ISAR") + S(d, 4), rw = d->mono_w * 5 + S(d, 10);
+    const int cell = lw + S(d, 4) + rw + S(d, 8);
+    int per_row = (width + S(d, 8)) / cell;
+    if (per_row < 1) per_row = 1;
+    *rows = (NREGS + per_row - 1) / per_row;
+    return *rows * (eh + gap) + S(d, 22) + gap;
+}
+
+static void layout_strip(debugger *d, int x0, int y0, int width)
+{
+    const int eh = S(d, 24), gap = S(d, 6), lh = S(d, 18);
+    const int lw = text_w(d, d->ui, "ISAR") + S(d, 4), rw = d->mono_w * 5 + S(d, 10);
+    const int cell = lw + S(d, 4) + rw + S(d, 8);
+    int rows, per_row, i, x, y;
+    strip_height(d, width, &rows);
+    /* the same number of registers on every row */
+    per_row = (NREGS + rows - 1) / rows;
+    for (i = 0; i < NREGS; i++) {
+        const int row = i / per_row, col = i % per_row;
+        const int ry = y0 + row * (eh + gap);
+        place(d->reg_label[i], x0 + col * cell, ry + (eh - lh) / 2, lw, lh);
+        place(d->reg[i], x0 + col * cell + lw + S(d, 4), ry, rw, eh);
+    }
+    d->strip_rows = rows;
+    y = y0 + rows * (eh + gap);
+    x = x0;
+    for (i = 0; i < NCHECKS; i++) {
+        const int w = text_w(d, d->ui, k_chk_names[i]) + S(d, 28);
+        place(d->chk[i], x, y, w, S(d, 22));
+        x += w + S(d, 6);
+    }
+    {
+        const int kw = text_w(d, d->ui, "K depth 10  (r59 = 58)") + S(d, 12);
+        place(d->kdepth, x + S(d, 16), y + (S(d, 22) - lh) / 2, kw, lh);
+        x += S(d, 16) + kw;
+    }
+    place(d->beam, x + S(d, 8), y + (S(d, 22) - lh) / 2, x0 + width - x - S(d, 8), lh);
+}
+
+static void layout(debugger *d)
+{
+    RECT client, page;
+    int x, y, w, i, px, py, pw, ph, srows, sh;
+    const int bh = S(d, 26), eh = S(d, 24), lh = S(d, 18), gap = S(d, 6);
+
+    if (!d->tabs) return;
+    GetClientRect(d->hwnd, &client);
+
+    /* The toolbar, two rows: stepping, then breakpoints, symbols, save and
+     * pop out; the status after the first row, or (too narrow for the whole
+     * stop reason beside it) on a line of its own. */
+    {
+        HWND stepping[7] = { d->run_btn, d->step_btn, d->over_btn, d->out_btn, d->run_to_btn, d->scan_btn,
+                             d->frame_btn };
+        const char *stepping_text[7] = { "Stop (F5)", "Step (F7)", "Step Over (F8)", "Step Out (Shift+F8)",
+                                         "Run to Cursor", "Scanline+1", "Frame+1 (Shift+F7)" };
+        HWND tools[4] = { d->clear_bps_btn, d->sym_btn, d->clear_sym_btn, d->save_btn };
+        const char *tools_text[4] = { "Clear Breakpoints", "Load Symbols...", "Clear Symbols", "Save..." };
+        char status_text[220];
+        int status_w, status_own_line;
+        x = S(d, 8);
+        for (i = 0; i < 7; i++) {
+            w = btn_w(d, stepping_text[i]);
+            place(stepping[i], x, S(d, 8), w, bh);
+            x += w + gap + (i == 4 ? S(d, 14) : 0);
+        }
+        {
+            const int hw = btn_w(d, "Help");
+            const int sright = client.right - hw - gap - S(d, 8);
+            place(d->help_btn, client.right - S(d, 8) - hw, S(d, 8), hw, bh);
+            GetWindowTextA(d->status, status_text, sizeof status_text);
+            status_w = text_w(d, d->ui, status_text) + S(d, 16);
+            if (status_w < S(d, 220)) status_w = S(d, 220);
+            y = S(d, 8) + bh + S(d, 6);
+            status_own_line = sright - x < status_w;
+            if (!status_own_line) place(d->status, x, S(d, 8) + (bh - lh) / 2, sright - x, lh);
+        }
+        x = S(d, 8);
+        for (i = 0; i < 4; i++) {
+            if (i == 1) {
+                const int label_w = text_w(d, d->ui, "Break at:") + S(d, 6);
+                place(d->break_at_label, x, y + (eh - lh) / 2, label_w, lh);
+                x += label_w;
+                place(d->break_at, x, y, S(d, 130), eh);
+                x += S(d, 130) + S(d, 14);
+            }
+            w = btn_w(d, tools_text[i]);
+            place(tools[i], x, y - S(d, 1), w, bh);
+            x += w + gap;
+        }
+        w = btn_w(d, "Pop Out");
+        place(d->popout_btn, x, y - S(d, 1), w, bh);
+        y += bh + S(d, 6);
+        if (status_own_line) {          /* too narrow for the whole stop reason beside the buttons */
+            place(d->status, S(d, 8), y, client.right - S(d, 16), lh);
+            y += lh + S(d, 4);
+        }
+    }
+
+    /* The tab control is the strip alone: the pages sit on the window's own
+     * background, which their captions are drawn on. */
+    SetRect(&page, 0, 0, S(d, 400), S(d, 400));
+    SendMessageA(d->tabs, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);
+    place(d->tabs, S(d, 8), y, client.right - S(d, 16), page.top);
+    px = S(d, 12);
+    py = y + page.top + S(d, 6);
+    pw = client.right - 2 * px;
+
+    /* the registers strip under the pages, on every tab */
+    sh = strip_height(d, pw, &srows);
+    ph = client.bottom - S(d, 6) - sh - S(d, 6) - py;
+    if (pw < S(d, 300)) pw = S(d, 300);
+    if (ph < S(d, 200)) ph = S(d, 200);
+    layout_strip(d, px, py + ph + S(d, 6), pw);
+
+    for (i = 0; i < TAB_COUNT; i++) {
+        int cw = pw, ch = ph;
+        if (d->popped[i]) {
+            RECT pc;
+            GetClientRect(d->popped[i], &pc);
+            cw = pc.right - S(d, 16);
+            ch = pc.bottom - S(d, 46);
+            place(d->pg[i], S(d, 8), S(d, 38), cw, ch);
+        } else {
+            place(d->pg[i], px, py, pw, ph);
+        }
+        layout_page(d, i, cw > 1 ? cw : 1, ch > 1 ? ch : 1);
+    }
+
+    /* everything again: what the controls left behind where they were */
+    RedrawWindow(d->hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    for (i = 0; i < TAB_COUNT; i++)
+        if (d->popped[i]) RedrawWindow(d->popped[i], NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+/* ---- peeling a tab off into a window of its own, and putting it back ------------------ */
+
+static void goto_tab(debugger *d, int page)
+{
+    const int i = tab_index(d, page);
+    if (d->popped[page]) {
+        SetForegroundWindow(d->popped[page]);
+        return;
+    }
+    if (i >= 0) {
+        SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)i, 0);
+        show_page(d, page);
+        layout(d);
+        refresh_visible(d);
+    }
+}
+
+static void dock_page(debugger *d, int page)
+{
+    TCITEMA item;
+    char text[32];
+    HWND pop = d->popped[page];
+    int pos = 0, p, i;
+
+    if (!pop) return;
+    d->popped[page] = NULL;
+    SetParent(d->pg[page], d->hwnd);
+    for (p = 0; p < page; p++)   /* back where it was in the order */
+        if (!d->popped[p]) pos++;
+    for (i = d->ntabs; i > pos; i--) d->tab_page[i] = d->tab_page[i - 1];
+    d->tab_page[pos] = page;
+    d->ntabs++;
+    memset(&item, 0, sizeof item);
+    item.mask = TCIF_TEXT;
+    tab_text(page, text, sizeof text);
+    item.pszText = text;
+    SendMessageA(d->tabs, TCM_INSERTITEMA, (WPARAM)pos, (LPARAM)&item);
+    DestroyWindow(pop);
+    SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)pos, 0);
+    show_page(d, page);
+    SetWindowPos(d->tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     layout(d);
-    refresh_page(d, 1);
+    refresh_visible(d);
 }
 
-/* ---- fonts and DPI --------------------------------------------------------------------- */
-
-static void make_fonts(debugger *d)
+static void pop_out(debugger *d, int page)
 {
-    SIZE cell;
-    d->ui = chf_make_font(d->dpi, 0, FW_NORMAL, NULL);
-    d->bold = chf_make_font(d->dpi, 0, FW_BOLD, NULL);
-    d->mono = chf_make_font(d->dpi, 13, FW_NORMAL, CHF_MONO_FACE);
-    cell = chf_font_cell(d->hwnd, d->mono);
-    d->mono_w = cell.cx;
-    d->mono_h = cell.cy;
-    cell = chf_font_cell(d->hwnd, d->ui);
-    d->ui_h = cell.cy;
-    d->row_h = S(24) > d->ui_h + S(8) ? S(24) : d->ui_h + S(8);
+    HWND pop, dock;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrA(d->hwnd, GWLP_HINSTANCE);
+    char title[96];
+    int idx, i, next;
+
+    if (page < 0 || page >= TAB_COUNT || d->popped[page] || d->ntabs <= 1) {
+        if (d->ntabs <= 1) toast(d, "One tab always stays in the main window");
+        return;
+    }
+    idx = tab_index(d, page);
+    if (idx < 0) return;
+    SendMessageA(d->tabs, TCM_DELETEITEM, (WPARAM)idx, 0);
+    for (i = idx; i < d->ntabs - 1; i++) d->tab_page[i] = d->tab_page[i + 1];
+    d->ntabs--;
+
+    snprintf(title, sizeof title, "Channel F Debugger - %s", k_tabs[page].label);
+    pop = CreateWindowExA(0, POP_CLASS, title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+                          S(d, 900), S(d, 620), d->hwnd, NULL, inst, NULL);
+    SetWindowLongPtrA(pop, GWLP_USERDATA, page);
+    dock = CreateWindowExA(0, "BUTTON", "Dock", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, S(d, 8), S(d, 6),
+                           btn_w(d, "Dock"), S(d, 26), pop, (HMENU)(INT_PTR)IDC_DOCK, inst, NULL);
+    SendMessageA(dock, WM_SETFONT, (WPARAM)d->ui, TRUE);
+    chf_help_set_context(pop, k_tab_contexts[page], 1);
+    SetParent(d->pg[page], pop);
+    d->popped[page] = pop;
+    /* the tab shown stays (when it was the popped one, its neighbour takes over) */
+    next = d->page == page ? (idx < d->ntabs ? idx : d->ntabs - 1) : tab_index(d, d->page);
+    if (next < 0) next = 0;
+    SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)next, 0);
+    show_page(d, d->tab_page[next]);
+    layout(d);
+    ShowWindow(pop, SW_SHOW);
+    refresh_visible(d);
 }
 
-static void apply_fonts(debugger *d)
+/* A tab container: its controls' messages go to the debugger window. */
+static LRESULT CALLBACK page_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    int i;
-    for (i = 0; i < d->nctl; i++)
-        SendMessageW(d->ctl[i].h, WM_SETFONT, (WPARAM)(d->ctl[i].mono ? d->mono : d->ui), TRUE);
+    HWND main = (HWND)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_DBG_SCRATCH_PICK:
+    case WM_COMMAND:
+    case WM_NOTIFY:
+    case WM_DRAWITEM:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        if (main && g_dbg) return SendMessageA(main, msg, wp, lp);
+        break;
+    case WM_ERASEBKGND: {
+        RECT c;
+        GetClientRect(hwnd, &c);
+        FillRect((HDC)wp, &c, GetSysColorBrush(COLOR_BTNFACE));
+        return 1;
+    }
+    default: break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-/* ---- attach / detach -------------------------------------------------------------- */
-
-static void attach(debugger *d)
+/* The window a popped-out tab lives in. */
+static LRESULT CALLBACK pop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    chfdebug_attach(d->dbg);
-    d->seen_gen = chfdebug_generation(d->dbg);
-    d->was_stopped = 1;
-    d->hover_row = d->hover_col = -1;
-    d->prev_valid = 0;
-    d->prev_row_valid = 0;
-    d->changed_mask = 0;
-    refresh_all(d);
-    SetTimer(d->hwnd, TIMER_REFRESH, 100, NULL);
+    const int page = (int)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_SIZE:
+        if (g_dbg) layout(g_dbg);
+        return 0;
+    case WM_GETMINMAXINFO:
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = 400;
+        ((MINMAXINFO *)lp)->ptMinTrackSize.y = 300;
+        return 0;
+    case WM_COMMAND:
+        if (g_dbg && LOWORD(wp) == IDC_DOCK) dock_page(g_dbg, page);
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (g_dbg) return SendMessageA(g_dbg->hwnd, msg, wp, lp);
+        break;
+    case WM_CLOSE:
+        if (g_dbg) dock_page(g_dbg, page);
+        else DestroyWindow(hwnd);
+        return 0;
+    default: break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-static void detach_and_hide(debugger *d)
+/* ---- the window ------------------------------------------------------------------- */
+
+static void hide_window(debugger *d)
 {
     KillTimer(d->hwnd, TIMER_REFRESH);
-    chfdebug_detach(d->dbg);
+    chfdebug_detach(d->dbg);    /* lets the machine run */
     ShowWindow(d->hwnd, SW_HIDE);
 }
 
-/* ---- window proc -------------------------------------------------------------------- */
+static void attach_and_refresh(debugger *d)
+{
+    chfdebug_attach(d->dbg);    /* stops the machine */
+    d->was_stopped = 0;
+    d->seen_gen = chfdebug_generation(d->dbg);
+    SetTimer(d->hwnd, TIMER_REFRESH, 100, NULL);
+    settle_and_sync(d, 1);
+}
 
-/* Stopped, Run wears the accent with dark text on it. */
+/* Stop/Run: the accent with white text while the machine is stopped (the
+ * button that will start it), the stock look while it runs. */
 static void draw_run_button(debugger *d, const DRAWITEMSTRUCT *di)
 {
-    wchar_t text[32];
+    char text[32];
     const int stopped = chfdebug_is_stopped(d->dbg);
     RECT r = di->rcItem;
     if (stopped) {
-        FillRect(di->hDC, &r, d->accent);
+        FillRect(di->hDC, &r, chf_accent_brush());
         FrameRect(di->hDC, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
-        SetTextColor(di->hDC, RGB(0x14, 0x14, 0x14));
+        SetTextColor(di->hDC, CHF_ACCENT_TEXT);
     } else {
         DrawFrameControl(di->hDC, &r, DFC_BUTTON, DFCS_BUTTONPUSH | ((di->itemState & ODS_SELECTED) ? DFCS_PUSHED : 0));
         SetTextColor(di->hDC, GetSysColor(COLOR_BTNTEXT));
     }
     SetBkMode(di->hDC, TRANSPARENT);
+    GetWindowTextA(di->hwndItem, text, sizeof text);
     SelectObject(di->hDC, d->ui);
-    GetWindowTextW(di->hwndItem, text, 32);
-    DrawTextW(di->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextA(di->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (di->itemState & ODS_FOCUS) {
         InflateRect(&r, -3, -3);
         DrawFocusRect(di->hDC, &r);
     }
 }
 
-static void on_command(debugger *d, int id, int code, HWND src)
+
+static LRESULT on_notify(debugger *d, NMHDR *nh)
 {
-    (void)src;
-    if (id >= IDC_FLAG0 && id <= IDC_FLAG_LAST && code == BN_CLICKED) {
-        if (chfdebug_is_stopped(d->dbg))
-            chfdebug_cpu_set(d->dbg, kFlagIds[id - IDC_FLAG0],
-                            SendMessageW(d->flag[id - IDC_FLAG0], BM_GETCHECK, 0, 0) == BST_CHECKED);
-        refresh_cpu(d);
-        return;
-    }
-    if (id >= IDC_SAVE_KIND0 && id <= IDC_SAVE_KIND_LAST) { save_file(d, id - IDC_SAVE_KIND0); return; }
-    if (id >= IDC_OVL0 && id <= IDC_OVL_LAST) {
-        if (code == BN_CLICKED) refresh_video(d, 0);
-        return;
-    }
-    switch (id) {
-    case IDC_RUN: toggle_run(d); break;
-    case IDC_STEP: chfdebug_step(d->dbg); refresh_all(d); break;
-    case IDC_OVER: chfdebug_step_over(d->dbg); refresh_all(d); break;
-    case IDC_OUT: chfdebug_step_out(d->dbg); refresh_all(d); break;
-    case IDC_SCAN: chfdebug_scanline(d->dbg, 1); refresh_all(d); break;
-    case IDC_FRAME: chfdebug_frame(d->dbg, 1); refresh_all(d); break;
-    case IDC_TORUN: run_to_cursor(d); break;
-    case IDC_LOAD_SYMBOLS: symbols_menu(d); break;
-    case IDC_SYMS_FILE: load_symbols(d, 0); break;
-    case IDC_SYMS_CART: load_symbols(d, 1); break;
-    case IDC_SAVE: save_menu(d); break;
-    case IDC_HELP_BTN: chf_help_for(d->hwnd); break;
-    case IDC_FOLLOW_PC: dbg_refresh_disasm(d); break;
-    case IDC_VIEW_MODE:
-    case IDC_SCALE_MODE:
-        if (code == CBN_SELCHANGE) { dbg_hover_changed(d, -1, -1); refresh_video(d, 0); }
-        break;
-    case IDC_PIN_BREAK:
-        if (d->pin_row >= 0) dbg_break_on_cell(d, d->pin_row, d->pin_col);
-        break;
-    case IDC_PIN_CLEAR: dbg_pin_cell(d, -1, -1); break;
-    case IDC_WR_CHANGES: case IDC_WR_FRAME: case IDC_WR_PALCOLS: refresh_writes(d); break;
-    case IDC_WR_CLEAR: chfdebug_vram_writes_clear(d->dbg); refresh_writes(d); break;
-    case IDC_IO_CLEAR: chfdebug_io_events_clear(d->dbg); refresh_io(d); break;
-    case IDC_RAM_SPACE:
-        if (code == CBN_SELCHANGE) { d->mem_base = 0; refresh_mem(d); }
-        break;
-    case IDC_RAM_PREV: mem_page(d, -1); break;
-    case IDC_RAM_NEXT: mem_page(d, 1); break;
-    case IDC_BP_TYPE:
-        if (code == CBN_SELCHANGE) {
-            const int sel = (int)SendMessageW(d->bp_type, CB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < NBPTYPES) dbg_label_set(d->bp_hint, kBpHints[sel]);
+    if (nh->hwndFrom == d->tabs && nh->code == (UINT)TCN_SELCHANGE) {
+        const int sel = (int)SendMessageA(d->tabs, TCM_GETCURSEL, 0, 0);
+        if (sel >= 0 && sel < d->ntabs) {
+            show_page(d, d->tab_page[sel]);
+            refresh_visible(d);
         }
-        break;
-    case IDC_BP_ADD: add_breakpoint(d); break;
-    case IDC_BP_REMOVE:
-    case IDC_BP_ENABLE: {
-        const int sel = (int)SendMessageW(d->bp_list, LB_GETCURSEL, 0, 0);
-        if (sel >= 0 && sel < d->nbps) {
-            if (id == IDC_BP_REMOVE) chfdebug_breakpoint_remove(d->dbg, d->bps[sel].id);
-            else chfdebug_breakpoint_enable(d->dbg, d->bps[sel].id, !d->bps[sel].enabled);
-            refresh_bps(d);
-            dbg_refresh_disasm(d);
-        }
-        break;
+        return 0;
     }
-    case IDC_BP_LIST:
-        if (code == LBN_DBLCLK) {
-            const int sel = (int)SendMessageW(d->bp_list, LB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < d->nbps && (d->bps[sel].type & CHFDEBUG_BP_EXEC)) {
-                char a[16];
-                snprintf(a, sizeof a, "$%04X", d->bps[sel].start);
-                TabCtrl_SetCurSel(d->tabs, PAGE_DISASM);
-                show_page(d, PAGE_DISASM);
-                jump_to(d, a);
+    if (nh->hwndFrom == d->follow_pc && nh->code == (UINT)NM_CUSTOMDRAW)
+        return chf_accent_customdraw((const NMCUSTOMDRAW *)nh, following(d));
+    if (nh->code == (UINT)NM_CUSTOMDRAW) {
+        /* the Record toggles: the accent while recording */
+        int k;
+        for (k = 0; k < 2; k++)
+            if (nh->hwndFrom == d->h_rec[k])
+                return chf_accent_customdraw((const NMCUSTOMDRAW *)nh,
+                                               SendMessageA(d->h_rec[k], BM_GETCHECK, 0, 0) == BST_CHECKED);
+    }
+    if (nh->hwndFrom == d->sym_list) {
+        if (nh->code == (UINT)NM_DBLCLK || nh->code == (UINT)NM_RETURN) on_symbol_activate(d);
+        else if (nh->code == (UINT)LVN_KEYDOWN && ((const NMLVKEYDOWN *)nh)->wVKey == VK_RETURN) on_symbol_activate(d);
+        return 0;
+    }
+    if (nh->hwndFrom != d->bp_list) return 0;
+    if (nh->code == (UINT)LVN_ITEMCHANGED) {
+        const NMLISTVIEW *nm = (const NMLISTVIEW *)nh;
+        /* a row's box: its breakpoint on or off (the list follows after) */
+        if (!d->updating && nm->iItem >= 0 && nm->iItem < d->nbps && (nm->uChanged & LVIF_STATE) &&
+            ((nm->uNewState ^ nm->uOldState) & LVIS_STATEIMAGEMASK) && (nm->uOldState & LVIS_STATEIMAGEMASK)) {
+            const int on = ((nm->uNewState & LVIS_STATEIMAGEMASK) >> 12) == 2;
+            if (on != (d->bps[nm->iItem].enabled != 0)) {
+                chfdebug_breakpoint_enable(d->dbg, d->bps[nm->iItem].id, on);
+                PostMessageA(d->hwnd, WM_DBG_SYNC, 0, 0);
             }
         }
-        break;
-    case IDC_BP_CLEAR:
-        chfdebug_breakpoint_clear(d->dbg);
-        refresh_bps(d);
-        dbg_refresh_disasm(d);
-        break;
-    case IDC_FUJI_CLEAR:
-        chfdebug_fujinet_trace_clear(d->dbg);
-        refresh_fujinet(d, 1);
-        break;
-    case IDCANCEL: detach_and_hide(d); break;
-    default: break;
+    } else if (nh->code == (UINT)LVN_KEYDOWN) {
+        /* after the list's own handling: removing rebuilds it */
+        if (((const NMLVKEYDOWN *)nh)->wVKey == VK_DELETE)
+            PostMessageA(d->hwnd, WM_COMMAND, MAKEWPARAM(IDC_BP_REMOVE, BN_CLICKED), 0);
+    } else if (nh->code == (UINT)NM_DBLCLK) {
+        /* an address breakpoint's row opens the disassembly there */
+        const int i = bp_selected(d);
+        if (i >= 0 && !(d->bps[i].type & (CHFDEBUG_BP_IN | CHFDEBUG_BP_OUT))) {
+            char a[16];
+            snprintf(a, sizeof a, "$%04X", d->bps[i].start);
+            goto_tab(d, TAB_DISASM);
+            SetWindowTextA(d->jump, a);
+            on_jump(d);
+        }
     }
-}
-
-/* The timer: while stopped, only a changed generation (or a stop or go)
- * refreshes; while running, the Video and Sound & I/O tabs follow every tick
- * (ten a second) and the other pages twice a second. A minimised window
- * refreshes nothing, and only the tab showing is read. */
-static void on_timer(debugger *d)
-{
-    unsigned gen;
-    int stopped;
-    if (!IsWindowVisible(d->hwnd) || IsIconic(d->hwnd)) return;
-    gen = chfdebug_generation(d->dbg);
-    stopped = chfdebug_is_stopped(d->dbg);
-    if (gen != d->seen_gen || stopped != d->was_stopped) {
-        d->seen_gen = gen;
-        d->was_stopped = stopped;
-        d->running_ticks = 0;
-        refresh_all(d);
-        return;
-    }
-    if (stopped) return;
-    d->running_ticks++;
-    if (d->page == PAGE_VIDEO || d->page == PAGE_IO) {
-        const int slow = d->running_ticks >= TICKS_SLOW;
-        refresh_page(d, slow);
-        if (slow) { d->running_ticks = 0; refresh_status(d); }
-    } else if (d->running_ticks >= TICKS_SLOW) {
-        d->running_ticks = 0;
-        refresh_status(d);
-        refresh_page(d, 1);
-    }
+    return 0;
 }
 
 static LRESULT CALLBACK dbg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    debugger *d = g_debugger;
-    if (!d || d->hwnd != hwnd) return DefWindowProcW(hwnd, msg, wp, lp);
+    debugger *d = g_dbg;
+    if (msg == WM_GETMINMAXINFO) {
+        const int dpi = d && d->dpi ? d->dpi : 96;
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = MulDiv(860, dpi, 96);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.y = MulDiv(560, dpi, 96);
+        return 0;
+    }
+    if (!d || d->hwnd != hwnd) return DefWindowProcA(hwnd, msg, wp, lp);
 
     switch (msg) {
     case WM_SIZE:
-        if (d->nctl > 0 && d->vtabs) {
-            layout(d);
-            /* Fit scales the picture to its window: redraw it at the new size */
-            if (d->page == PAGE_VIDEO && IsWindowVisible(hwnd) && chfdebug_is_attached(d->dbg)) refresh_video(d, 0);
-        }
+        layout(d);
         return 0;
-    case WM_GETMINMAXINFO: {
-        MINMAXINFO *mm = (MINMAXINFO *)lp;
-        mm->ptMinTrackSize.x = S(960);
-        mm->ptMinTrackSize.y = S(620);
-        return 0;
-    }
     case WM_DPICHANGED: {
         const RECT *r = (const RECT *)lp;
-        HFONT old_ui = d->ui, old_bold = d->bold, old_mono = d->mono;
         d->dpi = HIWORD(wp);
-        make_fonts(d);
-        apply_fonts(d);
-        DeleteObject(old_ui);
-        DeleteObject(old_bold);
-        DeleteObject(old_mono);
+        make_fonts(d);       /* (also the controls of popped-out tabs) */
+        size_columns(d);
         SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         layout(d);
@@ -2180,188 +3544,422 @@ static LRESULT CALLBACK dbg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_TIMER:
-        if (wp == TIMER_REFRESH) on_timer(d);
+        if (wp == TIMER_REFRESH) tick(d);
         return 0;
     case WM_DBG_ACCEPT:
         on_accept(d, (int)wp);
         return 0;
     case WM_DBG_TAB:
-        complete_prompt(d);
+        complete_console(d);
         return 0;
     case WM_DBG_HISTORY:
         history_step(d, (int)wp);
         return 0;
-    case WM_NOTIFY: {
-        const NMHDR *h = (const NMHDR *)lp;
-        if (h->idFrom == IDC_TABS && h->code == (UINT)TCN_SELCHANGE) {
-            show_page(d, (int)SendMessageW(d->tabs, TCM_GETCURSEL, 0, 0));
-            return 0;
-        }
-        if (h->idFrom == IDC_VTABS && h->code == (UINT)TCN_SELCHANGE) {
-            d->vsec = (int)SendMessageW(d->vtabs, TCM_GETCURSEL, 0, 0);
-            apply_visibility(d);
-            layout(d);
-            refresh_video(d, 1);
-            return 0;
-        }
-        break;
-    }
+    case WM_DBG_SYNC:
+        resync(d);
+        return 0;
+    case WM_DBG_SCRATCH_PICK:
+        on_scratch_pick(d, (int)wp);
+        return 0;
+    case WM_NOTIFY:
+        return on_notify(d, (NMHDR *)lp);
     case WM_DRAWITEM:
-        if (wp == IDC_RUN) { draw_run_button(d, (const DRAWITEMSTRUCT *)lp); return TRUE; }
+        if (wp == IDC_RUN) {
+            draw_run_button(d, (const DRAWITEMSTRUCT *)lp);
+            return TRUE;
+        }
         break;
-    case WM_CTLCOLORSTATIC:
-        if ((HWND)lp == d->status || (HWND)lp == d->disasm_hint || (HWND)lp == d->fuji_note ||
-            (HWND)lp == d->vstatus || (HWND)lp == d->bp_hint || (HWND)lp == d->wr_counts) {
-            SetTextColor((HDC)wp, GetSysColor(COLOR_GRAYTEXT));
-            SetBkColor((HDC)wp, GetSysColor(COLOR_BTNFACE));
+    case WM_CTLCOLORSTATIC: {
+        HWND h = (HWND)lp;
+        HDC dc = (HDC)wp;
+        if (in_list(h, d->views, d->nviews)) {
+            /* read-only views on the window colour, as text views are */
+            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+            SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        }
+        if (h == d->bp_msg || h == d->wt_msg) {
+            SetTextColor(dc, RGB(0xc0, 0x1c, 0x28));
+            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        if (h == d->status && notice_showing(d)) {
+            SetTextColor(dc, GetSysColor(COLOR_BTNTEXT));
+            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        if (in_list(h, d->dim, d->ndim)) {
+            SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
         break;
-    case WM_COMMAND:
-        on_command(d, LOWORD(wp), HIWORD(wp), (HWND)lp);
-        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        /* the disassembly scrolls under the pointer, focused or not */
+        POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT r;
+        GetWindowRect(d->disasm, &r);
+        if (page_visible(d, TAB_DISASM) && PtInRect(&r, p)) return SendMessageA(d->disasm, msg, wp, lp);
+        GetWindowRect(d->mem_view, &r);
+        if (page_visible(d, TAB_MEMORY) && PtInRect(&r, p)) return SendMessageA(d->mem_view, msg, wp, lp);
+        break;
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        if (id == IDC_SYM_FILTER && HIWORD(wp) == EN_CHANGE) {
+            refresh_symbols(d);
+            return 0;
+        }
+        if (id >= IDC_CHK0 && id <= IDC_CHK_LAST && HIWORD(wp) == BN_CLICKED) {
+            on_check(d, id - IDC_CHK0);
+            return 0;
+        }
+        if (id >= IDC_SAVE_KIND0 && id <= IDC_SAVE_KIND_LAST) {
+            on_save(d, id - IDC_SAVE_KIND0);
+            return 0;
+        }
+        switch (id) {
+        case IDC_RUN: on_run(d); return 0;
+        case IDC_STEP: chfdebug_step(d->dbg); settle_and_sync(d, 1); return 0;
+        case IDC_OVER: chfdebug_step_over(d->dbg); settle_and_sync(d, 1); return 0;
+        case IDC_OUT: chfdebug_step_out(d->dbg); settle_and_sync(d, 1); return 0;
+        case IDC_SCANLINE: chfdebug_scanline(d->dbg, 1); settle_and_sync(d, 1); return 0;
+        case IDC_FRAME: chfdebug_frame(d->dbg, 1); settle_and_sync(d, 1); return 0;
+        case IDC_CLEAR_BPS: on_clear_breakpoints(d); return 0;
+        case IDC_CLEAR_SYMBOLS: on_clear_symbols(d); return 0;
+        case IDC_RUN_TO: on_run_to(d); return 0;
+        case IDC_TOGGLE_BP: on_toggle_bp(d); return 0;
+        case IDC_HELP_BTN: chf_help_for(d->hwnd); return 0;
+        case IDC_SYMBOLS: on_symbols(d); return 0;
+        case IDC_SAVE: save_menu(d); return 0;
+        case IDC_FOLLOW_PC: refresh_disasm(d); return 0;
+        case IDC_POPOUT:
+            pop_out(d, d->page);
+            return 0;
+        case IDC_MEM_SPACE:
+            if (HIWORD(wp) == CBN_SELCHANGE && !d->updating)
+                set_mem_space(d, (int)SendMessageA(d->mem_space, CB_GETCURSEL, 0, 0));
+            return 0;
+        case IDC_SRCH_NEXT: on_search(d, 0); return 0;
+        case IDC_SRCH_PREV: on_search(d, 1); return 0;
+        case IDC_WT_ADD: on_watch_add(d); return 0;
+        case IDC_WT_REMOVE: on_watch_remove(d); return 0;
+        case IDC_WT_MEM: on_watch_memory(d); return 0;
+        case IDC_WT_BRK: on_watch_break(d); return 0;
+        case IDC_WT_LIST:
+            if (HIWORD(wp) == LBN_DBLCLK) on_watch_memory(d);
+            return 0;
+        case IDC_H_REC0: on_record(d, 0); return 0;
+        case IDC_H_REC1: on_record(d, 1); return 0;
+        case IDC_H_CLEAR0: on_hist_clear(d, 0); return 0;
+        case IDC_H_CLEAR1: on_hist_clear(d, 1); return 0;
+        case IDC_H_FILTER0:
+            if (HIWORD(wp) == CBN_SELCHANGE) on_hist_filter(d, 0);
+            return 0;
+        case IDC_H_FILTER1:
+            if (HIWORD(wp) == CBN_SELCHANGE) on_hist_filter(d, 1);
+            return 0;
+        case IDC_BP_CLEAR_HITS:
+            chfdebug_breakpoint_clear_hits(d->dbg);
+            d->bp_sig_ok = 0;
+            resync(d);
+            return 0;
+        case IDC_BP_TYPE:
+            if (HIWORD(wp) == CBN_SELCHANGE) on_bp_type(d);
+            return 0;
+        case IDC_BP_ADD: on_bp_add(d); return 0;
+        case IDC_BP_REMOVE: on_bp_remove(d); return 0;
+        case IDC_BP_CLEAR: on_clear_breakpoints(d); return 0;
+        case IDC_FUJI_CLEAR:
+            chfdebug_fujinet_trace_clear(d->dbg);
+            refresh_fujinet(d, 1);
+            return 0;
+        case IDCANCEL: hide_window(d); return 0;
+        default: break;
+        }
+        break;
+    }
     case WM_CLOSE:
         /* Hide and let the machine run; F12 brings it back, stopped. */
-        detach_and_hide(d);
+        hide_window(d);
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_REFRESH);
+        if (chfdebug_is_attached(d->dbg)) chfdebug_detach(d->dbg);
         DeleteObject(d->ui);
-        DeleteObject(d->bold);
+        DeleteObject(d->ui_bold);
         DeleteObject(d->mono);
-        DeleteObject(d->accent);
-        DeleteObject(d->accent_dark);
+        DeleteObject(d->bp_on);
         DestroyAcceleratorTable(d->accel);
-        free(d->vimg.px);
+        free(d->mem_buf);
         free(d);
-        g_debugger = NULL;
+        g_dbg = NULL;
         return 0;
     default: break;
     }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-/* ---- entry points ---------------------------------------------------------------------- */
+/* ---- entry points ----------------------------------------------------------------- */
 
-static void register_class(HINSTANCE inst, const wchar_t *name, WNDPROC proc, HBRUSH background)
+static void register_class(HINSTANCE inst, const char *name, WNDPROC proc, HBRUSH background, UINT style)
 {
-    WNDCLASSW wc;
+    WNDCLASSEXA wc;
     memset(&wc, 0, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.style = style;
     wc.lpfnWndProc = proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = background;
     wc.lpszClassName = name;
-    RegisterClassW(&wc);
+    if (proc == dbg_proc || proc == pop_proc) wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(IDI_APPICON));
+    RegisterClassExA(&wc);
 }
 
-/* CHF_DEBUGGER_TAB: a page number, or its name (prompt, cpu, disassembly,
- * video, io, breakpoints, cart, fujinet). */
-static int page_from_env(void)
+/* CHF_DEBUGGER_TAB: a tab number, or a tab's name or label (any case), or
+ * the start of one, or of a word of a label ("memory", "map", "i/o"...). The
+ * old eight-tab names still work: prompt is the console; cpu and ram are the
+ * Memory tab on the scratchpad (*space), io is Cart & I/O. */
+static int tab_from_env_var(const char *var, int *space)
 {
-    const char *tab = getenv("CHF_DEBUGGER_TAB");
-    int i;
-    if (!tab || !*tab) return PAGE_PROMPT;
-    if (tab[0] >= '0' && tab[0] <= '9') {
-        i = atoi(tab);
-        return (i >= 0 && i < PAGE_COUNT) ? i : PAGE_PROMPT;
+    const char *tab = getenv(var);
+    char *end;
+    long n;
+    size_t len;
+    int i, pass;
+    if (!tab || !*tab) return -1;
+    if (space) *space = -1;
+    if (_stricmp(tab, "io") == 0 || _stricmp(tab, "i/o") == 0) return TAB_CART;
+    if (_stricmp(tab, "prompt") == 0) return TAB_CONSOLE;
+    if (_stricmp(tab, "cpu") == 0 || _stricmp(tab, "ram") == 0 || _stricmp(tab, "scratch") == 0) {
+        if (space) *space = CHF_SPACE_SCRATCH;
+        return TAB_MEMORY;
     }
-    for (i = 0; i < PAGE_COUNT; i++)
-        if (lstrcmpiA(tab, kPageNames[i]) == 0) return i;
-    return PAGE_PROMPT;
+    n = strtol(tab, &end, 10);
+    if (end != tab && *end == '\0')
+        return (n >= 0 && n < TAB_COUNT) ? (int)n : -1;
+    len = strlen(tab);
+    for (pass = 0; pass < 3; pass++)
+        for (i = 0; i < TAB_COUNT; i++) {
+            if (pass == 0 && _strnicmp(tab, k_tabs[i].name, len) == 0) return i;
+            if (pass == 1 && _strnicmp(tab, k_tabs[i].label, len) == 0) return i;
+            if (pass == 2) {
+                const char *p = k_tabs[i].label;
+                while ((p = strchr(p, ' ')) != NULL)
+                    if (_strnicmp(tab, ++p, len) == 0) return i;
+            }
+        }
+    return -1;
+}
+
+/* A space by name (any case, a prefix will do); -1 if none. */
+static int space_from_name(const char *name)
+{
+    int i;
+    if (!name || !*name) return -1;
+    for (i = 0; i < NSPACES; i++)
+        if (_strnicmp(name, k_space_names[i], strlen(name)) == 0) return i;
+    return -1;
+}
+
+static int g_env_space = -1;
+
+static int tab_from_env(void)
+{
+    return tab_from_env_var("CHF_DEBUGGER_TAB", &g_env_space);
+}
+
+/* The env hooks for headless captures, once the window is up: the Memory
+ * space, a watch, a break-on-change, the Memory tab's Go to, recording and a
+ * popped-out tab. */
+static void env_hooks(debugger *d)
+{
+    const char *v;
+    int tab;
+    if ((v = getenv("CHF_MEM_SPACE")) != NULL && *v && space_from_name(v) >= 0) set_mem_space(d, space_from_name(v));
+    else if (g_env_space >= 0) set_mem_space(d, g_env_space);
+    if ((v = getenv("CHF_WATCH")) != NULL && *v) {
+        /* a comma-separated list; each may start prog: scratch: vram: cart: io: */
+        char list[512], *item, *save = NULL;
+        snprintf(list, sizeof list, "%s", v);
+        for (item = strtok_s(list, ",", &save); item; item = strtok_s(NULL, ",", &save)) {
+            char *colon;
+            int space = CHF_SPACE_PROG;
+            item = strip(item);
+            colon = strchr(item, ':');
+            if (colon && colon - item < 8) {
+                *colon = '\0';
+                space = space_from_name(strip(item));
+                if (space < 0) space = CHF_SPACE_PROG;
+                item = strip(colon + 1);
+            }
+            if (*item) chfwatch_add(space, item);
+        }
+    }
+    if ((v = getenv("CHF_WATCH_BREAK")) != NULL && *v) {
+        /* a watch, and a break on change armed over it */
+        const int index = chfwatch_add(CHF_SPACE_PROG, v);
+        uint32_t lo, hi;
+        char err[96];
+        if (index >= 0 && chfwatch_range(d->dbg, index, &lo, &hi)) break_on_change(d, CHF_SPACE_PROG, lo, hi, err, sizeof err);
+    }
+    if ((v = getenv("CHF_MEM_GOTO")) != NULL && *v) {
+        SetWindowTextA(d->mem_goto, v);
+        on_mem_goto(d);
+    }
+    if ((v = getenv("CHF_HISTORY")) != NULL && *v && *v != '0') chfdebug_trace_enable(d->dbg, 1);
+    if ((tab = tab_from_env_var("CHF_POPOUT", NULL)) >= 0) pop_out(d, tab);
+    resync(d);
+}
+
+/* Symbols beside the cartridge (<cart>.sym/.map/.noi), once, when the window
+ * is first made; the engine does not look for them itself. */
+static void load_cart_symbols(debugger *d)
+{
+    char msg[512];
+    msg[0] = '\0';
+    if (chfdebug_load_symbols(d->dbg, NULL, msg, sizeof msg) > 0 && msg[0]) console_output(d, msg);
 }
 
 void chf_debugger_show(HWND parent, chfsession *session)
 {
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES };
+    static int registered;
+    INITCOMMONCONTROLSEX icc;
     HINSTANCE inst;
     debugger *d;
     ACCEL accels[7];
-    SIZE outer;
+    int tab, w, h;
+    MONITORINFO mi;
 
-    if (g_debugger) {
-        if (!IsWindowVisible(g_debugger->hwnd)) {
-            ShowWindow(g_debugger->hwnd, SW_SHOW);
-            attach(g_debugger);
-        } else {
-            chfdebug_stop(g_debugger->dbg);
-            refresh_all(g_debugger);
-        }
-        SetForegroundWindow(g_debugger->hwnd);
+    if (g_dbg) {
+        d = g_dbg;
+        ShowWindow(d->hwnd, IsIconic(d->hwnd) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(d->hwnd);
+        if (!chfdebug_is_attached(d->dbg) || !IsWindowVisible(d->hwnd) || !chfdebug_is_stopped(d->dbg))
+            attach_and_refresh(d);
+        else
+            resync(d);
         return;
     }
 
+    icc.dwSize = sizeof icc;
+    icc.dwICC = ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&icc);
-    inst = (HINSTANCE)GetWindowLongPtrW(parent, GWLP_HINSTANCE);
-    register_class(inst, L"ChfDebuggerWindow", dbg_proc, (HBRUSH)(COLOR_BTNFACE + 1));
-    dbg_views_register(inst);
+    inst = (HINSTANCE)GetWindowLongPtrA(parent, GWLP_HINSTANCE);
+    if (!inst) inst = GetModuleHandleA(NULL);
+    if (!registered) {
+        register_class(inst, DBG_CLASS, dbg_proc, (HBRUSH)(COLOR_BTNFACE + 1), CS_HREDRAW | CS_VREDRAW);
+        register_class(inst, DISASM_CLASS, disasm_proc, NULL, CS_DBLCLKS);
+        register_class(inst, MEMVIEW_CLASS, memview_proc, NULL, 0);
+        register_class(inst, PAGE_CLASS, page_proc, (HBRUSH)(COLOR_BTNFACE + 1), 0);
+        dbg_widgets_register(inst);
+        register_class(inst, POP_CLASS, pop_proc, (HBRUSH)(COLOR_BTNFACE + 1), CS_HREDRAW | CS_VREDRAW);
+        registered = 1;
+    }
 
     d = calloc(1, sizeof *d);
     if (!d) return;
     d->session = session;
     d->dbg = chfsession_debugger(session);
-    d->inst = inst;
+    if (!d->dbg) {
+        free(d);
+        MessageBoxA(parent, "The debugger could not be created for this session.", "Debugger Unavailable",
+                    MB_ICONERROR);
+        return;
+    }
+    d->mem_buf = calloc(1, MEM_BYTES);
+    if (!d->mem_buf) {
+        free(d);
+        return;
+    }
+    d->selected = -1;
+    d->pc_line = -1;
     d->fuji_count = -1;
-    d->vsec = SEC_CELL;
-    d->hover_row = d->hover_col = -1;
-    d->pin_row = d->pin_col = -1;
-    d->sel_addr = -1;
-    d->dpi = chf_window_dpi(parent);
-    g_debugger = d;
+    d->mem_sp = CHF_SPACE_PROG;
+    d->mem_digits = 4;
+    d->mem_size = 0x10000;
+    g_dbg = d;
 
-    d->hwnd = CreateWindowExW(0, L"ChfDebuggerWindow", L"FujiNet Go Channel F Debugger", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 1180, 820, NULL, NULL, inst, NULL);
-    if (!d->hwnd) { free(d); g_debugger = NULL; return; }
-
-    d->dpi = chf_window_dpi(d->hwnd);        /* the monitor it actually opened on */
+    /* the start size, held inside the monitor's work area */
+    d->dpi = window_dpi(parent);
+    w = S(d, START_W);
+    h = S(d, START_H);
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoA(MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST), &mi)) {
+        if (w > mi.rcWork.right - mi.rcWork.left - S(d, 40)) w = mi.rcWork.right - mi.rcWork.left - S(d, 40);
+        if (h > mi.rcWork.bottom - mi.rcWork.top - S(d, 40)) h = mi.rcWork.bottom - mi.rcWork.top - S(d, 40);
+    }
+    /* owned by the main window: over it, and gone with it */
+    d->hwnd = CreateWindowExA(0, DBG_CLASS, "Channel F Debugger", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                              CW_USEDEFAULT, CW_USEDEFAULT, w, h, parent, NULL, inst, NULL);
+    if (!d->hwnd) {
+        free(d->mem_buf);
+        free(d);
+        g_dbg = NULL;
+        return;
+    }
+    if (window_dpi(d->hwnd) != d->dpi) {
+        /* placed on a monitor of another DPI than the parent's */
+        const int was = d->dpi;
+        d->dpi = window_dpi(d->hwnd);
+        SetWindowPos(d->hwnd, NULL, 0, 0, MulDiv(w, d->dpi, was), MulDiv(h, d->dpi, was),
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     make_fonts(d);
-    d->accent = make_brush(CHFSESSION_ACCENT_RGB);
-    d->accent_dark = make_brush(CHFSESSION_ACCENT_DARK_RGB);
-    outer = chf_outer_size(d->hwnd, S(1160), S(800), FALSE);
-    SetWindowPos(d->hwnd, NULL, 0, 0, outer.cx, outer.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    d->bp_on = CreateSolidBrush(RGB(0xe0, 0x1b, 0x24));
 
     build_controls(d);
 
-    /* F5/F7/F8/Shift+F8/F12 work wherever the focus is inside the window. */
+    /* the tab body under every page: its repaints never cover a label or a
+     * pane (the Win32 FujiNet-tab overlap of the 2026-11-01 notes) */
+    SetWindowPos(d->tabs, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    /* F5/F7/F8/Shift+F8/Shift+F7/F9/F12 work wherever the focus is in the
+     * window. */
     accels[0].fVirt = FVIRTKEY;          accels[0].key = VK_F5;  accels[0].cmd = IDC_RUN;
     accels[1].fVirt = FVIRTKEY;          accels[1].key = VK_F7;  accels[1].cmd = IDC_STEP;
     accels[2].fVirt = FVIRTKEY;          accels[2].key = VK_F8;  accels[2].cmd = IDC_OVER;
     accels[3].fVirt = FVIRTKEY | FSHIFT; accels[3].key = VK_F8;  accels[3].cmd = IDC_OUT;
-    accels[4].fVirt = FVIRTKEY;          accels[4].key = VK_F12; accels[4].cmd = IDCANCEL;
-    accels[5].fVirt = FVIRTKEY | FSHIFT; accels[5].key = VK_F7;  accels[5].cmd = IDC_FRAME;
-    accels[6].fVirt = FVIRTKEY | FCONTROL; accels[6].key = VK_F7; accels[6].cmd = IDC_SCAN;
-    d->accel = CreateAcceleratorTableW(accels, 7);
+    accels[4].fVirt = FVIRTKEY | FSHIFT; accels[4].key = VK_F7;  accels[4].cmd = IDC_FRAME;
+    accels[5].fVirt = FVIRTKEY;          accels[5].key = VK_F9;  accels[5].cmd = IDC_TOGGLE_BP;
+    accels[6].fVirt = FVIRTKEY;          accels[6].key = VK_F12; accels[6].cmd = IDCANCEL;
+    d->accel = CreateAcceleratorTableA(accels, 7);
 
-    d->page = page_from_env();
-    {   /* CHF_DEBUGGER_SECTION: the Video tab's section (0-3), for scripted checks */
-        const char *sec = getenv("CHF_DEBUGGER_SECTION");
-        if (sec && *sec >= '0' && *sec < '0' + SEC_COUNT) d->vsec = *sec - '0';
-        SendMessageW(d->vtabs, TCM_SETCURSEL, (WPARAM)d->vsec, 0);
-    }
-    SendMessageW(d->tabs, TCM_SETCURSEL, (WPARAM)d->page, 0);
-    chf_help_set_context(d->hwnd, kHelpContexts[d->page], 1);
-    apply_visibility(d);
+    tab = tab_from_env();
+    d->page = tab >= 0 ? tab : TAB_CONSOLE;
+    SendMessageA(d->tabs, TCM_SETCURSEL, (WPARAM)d->page, 0);
+    show_page(d, d->page);
     layout(d);
+    load_cart_symbols(d);
 
     ShowWindow(d->hwnd, SW_SHOW);
-    attach(d);
-}
-
-int chf_debugger_pretranslate(MSG *msg)
-{
-    if (!g_debugger || !g_debugger->accel) return 0;
-    if (msg->hwnd != g_debugger->hwnd && !IsChild(g_debugger->hwnd, msg->hwnd)) return 0;
-    if (msg->message == WM_KEYDOWN && msg->wParam == VK_F12) { detach_and_hide(g_debugger); return 1; }
-    return TranslateAcceleratorW(g_debugger->hwnd, g_debugger->accel, msg) ? 1 : 0;
+    if (d->page == TAB_CONSOLE) SetFocus(d->con_in);
+    attach_and_refresh(d);
+    env_hooks(d);
 }
 
 int chf_debugger_visible(void)
 {
-    return g_debugger && IsWindowVisible(g_debugger->hwnd);
+    return g_dbg && IsWindowVisible(g_dbg->hwnd);
 }
 
 void chf_debugger_toggle(HWND parent, chfsession *session)
 {
-    if (chf_debugger_visible()) detach_and_hide(g_debugger);
+    if (chf_debugger_visible()) hide_window(g_dbg);
     else chf_debugger_show(parent, session);
+}
+
+int chf_debugger_pretranslate(MSG *msg)
+{
+    if (!g_dbg || !g_dbg->accel) return 0;
+    if (msg->hwnd != g_dbg->hwnd && !IsChild(g_dbg->hwnd, msg->hwnd)) return 0;
+    /* F12 closes without waiting for the accelerator (Windows keeps F12 for
+     * debuggers); its key-up goes with it */
+    if (msg->message == WM_KEYDOWN && msg->wParam == VK_F12) {
+        hide_window(g_dbg);
+        return 1;
+    }
+    return TranslateAcceleratorA(g_dbg->hwnd, g_dbg->accel, msg) ? 1 : 0;
 }

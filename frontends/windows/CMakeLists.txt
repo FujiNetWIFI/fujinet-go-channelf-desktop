@@ -27,7 +27,8 @@ add_executable(fujinet-go-channelf-windows WIN32
   help/help_window.c
   controllers/controllers_window.c
   debugger/dbg_window.c
-  debugger/dbg_views.c
+  debugger/dbg_video.c
+  debugger/dbg_widgets.c
   resource.rc
 )
 target_include_directories(fujinet-go-channelf-windows PRIVATE

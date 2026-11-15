@@ -1,7 +1,7 @@
 /*
  * What the debugger window's files share: the small widget helpers, and the
- * entry points of the tabs that live in their own files (CPU & RAM, Video,
- * Sound & I/O, Cart).
+ * entry points of the parts that live in their own files (the scratchpad grid
+ * of the Memory tab, Video, the I/O half of Cart & I/O, Sound, Cart).
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -63,31 +63,38 @@ void dbg_draw_centred(cairo_t *cr, GtkWidget *w, const char *text, double x, dou
 
 /* ---- the tabs in their own files --------------------------------------------- */
 
-/* Each constructor returns its page in *root. `changed` is called after the
- * tab edited the machine (a register, a byte), so the window can refresh. The
+/* Each constructor returns its widget in *root. `changed` is called after the
+ * part edited the machine (a register, a byte), so the window can refresh. The
  * refresh functions redraw from the machine as it is now; `live` is the
- * machine running. Call them only while the tab is on screen. */
+ * machine running. Call them only while the part is on screen. */
 typedef void (*DbgChanged)(gpointer user_data);
 
-typedef struct DbgCpu DbgCpu;
-DbgCpu *dbg_cpu_new(chfsession *session, chfdebug *dbg, DbgChanged changed, gpointer ud,
-                    GtkWidget **root);
-void dbg_cpu_refresh(DbgCpu *c, gboolean live);
-void dbg_cpu_free(DbgCpu *c);
+/* The scratchpad grid and the BIOS K stack (Memory tab, SCRATCH space). */
+typedef struct DbgScratch DbgScratch;
+DbgScratch *dbg_scratch_new(chfsession *session, chfdebug *dbg, DbgChanged changed, gpointer ud,
+                            GtkWidget **root);
+void dbg_scratch_refresh(DbgScratch *c, gboolean live);
+void dbg_scratch_select(DbgScratch *c, int reg);
+void dbg_scratch_free(DbgScratch *c);
 
-typedef struct DbgVideo DbgVideo;
-DbgVideo *dbg_video_new(chfsession *session, chfdebug *dbg, DbgChanged changed, gpointer ud,
-                        GtkWidget **root);
-void dbg_video_refresh(DbgVideo *v, gboolean live);
-void dbg_video_free(DbgVideo *v);
+/* The Video tab over chfvidtab.h: a page that owns its controller and frees
+ * it when destroyed. The first refresh after the page is mapped, or force,
+ * redraws everything. */
+GtkWidget *dbg_video_new(chfdebug *dbg);
+void dbg_video_refresh(GtkWidget *page, gboolean force);
 
+/* The controllers, ports and 2102 (Cart & I/O) and the beeper (Sound). */
 typedef struct DbgIo DbgIo;
-DbgIo *dbg_io_new(chfsession *session, chfdebug *dbg, GtkWidget **root);
+DbgIo *dbg_io_new(chfsession *session, chfdebug *dbg, GtkWidget **io_root, GtkWidget **sound_root);
 void dbg_io_refresh(DbgIo *io, gboolean live);
+void dbg_sound_refresh(DbgIo *io, gboolean live);
 void dbg_io_free(DbgIo *io);
 
+/* The cartridge, its memory map, the mailbox page and its events. */
 typedef struct DbgCart DbgCart;
-DbgCart *dbg_cart_new(chfsession *session, chfdebug *dbg, GtkWidget **root);
+/* The state and memory map text, and the mailbox page over the events. */
+DbgCart *dbg_cart_new(chfsession *session, chfdebug *dbg, GtkWidget **state_root,
+                      GtkWidget **mailbox_root);
 void dbg_cart_refresh(DbgCart *c, gboolean live);
 void dbg_cart_free(DbgCart *c);
 

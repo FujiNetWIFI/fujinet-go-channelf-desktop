@@ -7,6 +7,8 @@
  *          staged for the next swap (size, checksum, app or game), the APPBANK
  *          pages and the one showing at $4800, the boot state, and the status
  *          page at $FC00-$FC0F decoded (the 60 Hz tick included).
+ *          Under it the memory map: the regions of the program space as mapped
+ *          now, gap-free.
  *   right  the mailbox page the console reads ($F800-$FFFF, side-effect free) in
  *          hex, and the cartridge's event log: register writes, bytes sent, page
  *          selects and swaps, each with the PC that made it.
@@ -66,10 +68,28 @@ static void refresh_events(DbgCart *c)
     g_string_free(s, TRUE);
 }
 
+/* The memory map under the cartridge text: when `lead` is set it starts the
+ * text (no cartridge), else the text already holds `len` bytes. */
+static void append_map(DbgCart *c, char *text, size_t size, const char *lead, int len)
+{
+    chfdebug_region map[32];
+    const int count = chfdebug_memory_map(c->dbg, map, 32);
+    int i;
+    if (lead)
+        len = g_snprintf(text, size, "%s", lead);
+    len += g_snprintf(text + len, size - len, "\nMemory map (program space, as mapped now)\n");
+    if (!count)
+        len += g_snprintf(text + len, size - len, "  (no map: no machine is loaded)\n");
+    for (i = 0; i < count; i++)
+        len += g_snprintf(text + len, size - len, "  %04X-%04X  %c%c  %s\n", map[i].low,
+                          map[i].high, map[i].readable ? 'R' : '-', map[i].writable ? 'W' : '-',
+                          map[i].name);
+}
+
 void dbg_cart_refresh(DbgCart *c, gboolean live)
 {
     static chfdebug_cart d;
-    static char text[5000], mbox[MBOX_SIZE / 16 * 80 + 200];
+    static char text[7000], mbox[MBOX_SIZE / 16 * 80 + 200];
     char info[256];
     int len = 0, i;
     (void)live;
@@ -77,7 +97,8 @@ void dbg_cart_refresh(DbgCart *c, gboolean live)
     chfdebug_cart_get(c->dbg, &d);
     chfdebug_cart_info(c->dbg, info, sizeof info);
     if (!d.present) {
-        dbg_set_text(c->state_text, info[0] ? info : "(no cartridge)");
+        append_map(c, text, sizeof text, info[0] ? info : "(no cartridge)\n", 0);
+        dbg_set_text(c->state_text, text);
         dbg_set_text(c->mbox_text, "(no cartridge)");
         refresh_events(c);
         return;
@@ -140,6 +161,7 @@ void dbg_cart_refresh(DbgCart *c, gboolean live)
             p[9] >= 32 && p[9] < 127 ? p[9] : '.', p[10] >= 32 && p[10] < 127 ? p[10] : '.',
             p[11], p[12], p[14] | (p[15] << 8), p[14] | (p[15] << 8));
     }
+    append_map(c, text, sizeof text, NULL, len);
     dbg_set_text(c->state_text, text);
 
     len = 0;
@@ -156,13 +178,11 @@ void dbg_cart_refresh(DbgCart *c, gboolean live)
     refresh_events(c);
 }
 
-DbgCart *dbg_cart_new(chfsession *session, chfdebug *dbg, GtkWidget **root)
+DbgCart *dbg_cart_new(chfsession *session, chfdebug *dbg, GtkWidget **state_root,
+                      GtkWidget **mailbox_root)
 {
     DbgCart *c = g_new0(DbgCart, 1);
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-    GtkWidget *right = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
-    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *bottom = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     GtkWidget *state = dbg_mono_view(&c->state_text, FALSE);
     GtkWidget *mbox = dbg_mono_view(&c->mbox_text, FALSE);
     GtkWidget *events = dbg_mono_view(&c->events_text, FALSE);
@@ -171,26 +191,21 @@ DbgCart *dbg_cart_new(chfsession *session, chfdebug *dbg, GtkWidget **root)
     c->dbg = dbg;
     c->last_events = -1;
     gtk_text_view_set_wrap_mode(c->state_text, GTK_WRAP_WORD_CHAR);
-    gtk_widget_set_size_request(state, 620, -1);
+    gtk_widget_set_size_request(state, 540, -1);
     gtk_widget_set_hexpand(state, FALSE);
     dbg_log_make(c->events_text);
+    gtk_widget_set_size_request(mbox, -1, 330);
+    gtk_widget_set_vexpand(mbox, FALSE);
+    gtk_widget_set_size_request(events, -1, 150);
+    gtk_widget_set_vexpand(events, FALSE);
 
-    gtk_box_append(GTK_BOX(top), dbg_heading("Mailbox page ($F800-$FFFF) as the console reads it"));
-    gtk_box_append(GTK_BOX(top), mbox);
-    gtk_box_append(GTK_BOX(bottom), dbg_heading("Cartridge events"));
-    gtk_box_append(GTK_BOX(bottom), events);
-    gtk_paned_set_start_child(GTK_PANED(right), top);
-    gtk_paned_set_end_child(GTK_PANED(right), bottom);
-    gtk_paned_set_shrink_start_child(GTK_PANED(right), FALSE);
-    gtk_paned_set_shrink_end_child(GTK_PANED(right), FALSE);
-    gtk_paned_set_position(GTK_PANED(right), 340);
-    gtk_widget_set_hexpand(right, TRUE);
-    gtk_widget_set_size_request(mbox, 460, 160);
-    gtk_widget_set_size_request(events, 460, 150);
+    gtk_box_append(GTK_BOX(box), dbg_heading("Mailbox page ($F800-$FFFF) as the console reads it"));
+    gtk_box_append(GTK_BOX(box), mbox);
+    gtk_box_append(GTK_BOX(box), dbg_heading("Cartridge events"));
+    gtk_box_append(GTK_BOX(box), events);
 
-    gtk_box_append(GTK_BOX(outer), state);
-    gtk_box_append(GTK_BOX(outer), right);
-    *root = dbg_padded(outer);
+    *state_root = state;
+    *mailbox_root = box;
     return c;
 }
 

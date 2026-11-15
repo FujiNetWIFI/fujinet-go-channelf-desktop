@@ -1,15 +1,15 @@
 /*
- * The debugger's Sound & I/O tab: what the console's inputs and its beeper are
- * doing.
+ * The debugger's I/O half of the Cart & I/O tab and its Sound tab.
  *
- *   left   both hand controllers' eight contacts and the console's panel, as
+ *   I/O    both hand controllers' eight contacts and the console's panel, as
  *          the machine latched them at the frame (a held contact is a lit
  *          lamp), with the bytes the CPU reads from ports 0, 1 and 4 (active
- *          low); the beeper's mode, frequency, level meter and the forced-on
- *          interval after a change; for a Maze or Hangman cartridge, the 2102
- *          RAM's port and address latch.
- *   right  the sound mode changes (port 5 bits 7-6) and every port access, each
- *          with the PC that made it.
+ *          low), the four output latches raw, complemented and decoded; for a
+ *          Maze or Hangman cartridge, the 2102 RAM's port and address latch;
+ *          and every port access, each with the PC that made it.
+ *   Sound  the beeper's mode, frequency, level meter and the forced-on
+ *          interval after a change, and the sound mode changes (port 5 bits
+ *          7-6) as a timeline.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -193,9 +193,41 @@ void dbg_io_refresh(DbgIo *io, gboolean live)
         io->vid.in0, io->vid.in1, io->vid.controllers_enabled ? "" : "(off)",
         io->vid.in4, io->vid.controllers_enabled ? "" : "(off)",
         io->vid.controllers_enabled ? "on" : "off");
+    len = (int)strlen(text);
+    len += g_snprintf(text + len, sizeof text - len,
+        "\n\nOutput latches (raw / complemented / decoded)\n"
+        "port 0   $%02X   $%02X   strobe %s, controllers %s, panel latch $%X\n"
+        "port 1   $%02X   $%02X   colour value %d\n"
+        "port 4   $%02X   $%02X   column %d\n"
+        "port 5   $%02X   $%02X   row %d, sound %s",
+        io->vid.port0, (unsigned)(uint8_t)~io->vid.port0, io->vid.strobe ? "up" : "down",
+        io->vid.controllers_enabled ? "read" : "off", io->vid.panel_latch,
+        io->vid.port1, (unsigned)(uint8_t)~io->vid.port1, io->vid.value,
+        io->vid.port4, (unsigned)(uint8_t)~io->vid.port4, io->vid.col,
+        io->vid.port5, (unsigned)(uint8_t)~io->vid.port5, io->vid.row,
+        k_snd_name[io->vid.sound_mode & 3]);
     gtk_label_set_text(io->ports_text, text);
 
-    len = 0;
+    if (i->has_2102)
+        g_snprintf(text, sizeof text,
+            "2102 RAM       ports $%02X (data) and $%02X (address)   latched address $%03X   bit %d",
+            i->ram_port, i->ram_port + 1, i->ram_addr, i->ram_bit);
+    else
+        g_snprintf(text, sizeof text, "2102 RAM       none (Maze and Hangman carry one)");
+    gtk_label_set_text(io->ram_text, text);
+
+    refresh_io_log(io);
+}
+
+void dbg_sound_refresh(DbgIo *io, gboolean live)
+{
+    char text[1200];
+    const chfdebug_io *i;
+    int len = 0;
+    (void)live;
+
+    chfdebug_io_get(io->dbg, &io->io);
+    i = &io->io;
     len += g_snprintf(text + len, sizeof text - len,
         "Mode          %s   (port 5 bits 7-6 = %d)\n"
         "Level         %d of 32767%s\n"
@@ -206,17 +238,7 @@ void dbg_io_refresh(DbgIo *io, gboolean live)
         i->sound_changes, (unsigned long long)i->audio_samples);
     gtk_label_set_text(io->sound_text, text);
     gtk_level_bar_set_value(GTK_LEVEL_BAR(io->meter), i->sound_level);
-
-    if (i->has_2102)
-        g_snprintf(text, sizeof text,
-            "2102 RAM       ports $%02X (data) and $%02X (address)   latched address $%03X   bit %d",
-            i->ram_port, i->ram_port + 1, i->ram_addr, i->ram_bit);
-    else
-        g_snprintf(text, sizeof text, "2102 RAM       none (Maze and Hangman carry one)");
-    gtk_label_set_text(io->ram_text, text);
-
     refresh_snd_log(io);
-    refresh_io_log(io);
 }
 
 /* ---- construction -------------------------------------------------------------------- */
@@ -235,15 +257,14 @@ static GtkWidget *mono_text(GtkLabel **out)
     return l;
 }
 
-DbgIo *dbg_io_new(chfsession *session, chfdebug *dbg, GtkWidget **root)
+DbgIo *dbg_io_new(chfsession *session, chfdebug *dbg, GtkWidget **io_root, GtkWidget **sound_root)
 {
     DbgIo *io = g_new0(DbgIo, 1);
-    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 18);
-    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget *iobox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *sbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     GtkWidget *iorow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget *clear = gtk_button_new_with_label("Clear");
-    GtkWidget *snd_scroll, *io_scroll, *lscroll;
+    GtkWidget *snd_scroll, *io_scroll;
 
     io->session = session;
     io->dbg = dbg;
@@ -262,39 +283,33 @@ DbgIo *dbg_io_new(chfsession *session, chfdebug *dbg, GtkWidget **root)
     gtk_widget_set_size_request(io->meter, 360, 10);
     gtk_widget_set_halign(io->meter, GTK_ALIGN_START);
 
-    gtk_box_append(GTK_BOX(left), dbg_heading("Controllers and console (as the machine latched them)"));
-    gtk_box_append(GTK_BOX(left), io->lamps);
-    gtk_box_append(GTK_BOX(left), mono_text(&io->ports_text));
-    gtk_box_append(GTK_BOX(left), dbg_heading("Sound"));
-    gtk_box_append(GTK_BOX(left), mono_text(&io->sound_text));
-    gtk_box_append(GTK_BOX(left), io->meter);
-    gtk_box_append(GTK_BOX(left), dbg_heading("2102 RAM"));
-    gtk_box_append(GTK_BOX(left), mono_text(&io->ram_text));
-    lscroll = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(lscroll), dbg_padded(left));
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(lscroll), GTK_POLICY_AUTOMATIC,
-                                   GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(lscroll, 780, -1);
-
-    snd_scroll = dbg_mono_view(&io->snd_log, FALSE);
-    dbg_log_make(io->snd_log);
-    gtk_widget_set_size_request(snd_scroll, -1, 130);
-    gtk_widget_set_vexpand(snd_scroll, FALSE);
     io_scroll = dbg_mono_view(&io->io_log, FALSE);
     gtk_text_view_set_wrap_mode(io->io_log, GTK_WRAP_WORD_CHAR);
     dbg_log_make(io->io_log);
+    gtk_widget_set_size_request(io_scroll, -1, 150);
+    gtk_widget_set_vexpand(io_scroll, FALSE);
     g_signal_connect(clear, "clicked", G_CALLBACK(on_io_clear), io);
     gtk_box_append(GTK_BOX(iorow), dbg_heading("Port accesses"));
     gtk_box_append(GTK_BOX(iorow), clear);
-    gtk_box_append(GTK_BOX(right), dbg_heading("Sound mode changes"));
-    gtk_box_append(GTK_BOX(right), snd_scroll);
-    gtk_box_append(GTK_BOX(right), iorow);
-    gtk_box_append(GTK_BOX(right), io_scroll);
-    gtk_widget_set_hexpand(right, TRUE);
 
-    gtk_box_append(GTK_BOX(outer), lscroll);
-    gtk_box_append(GTK_BOX(outer), right);
-    *root = dbg_padded(outer);
+    gtk_box_append(GTK_BOX(iobox), dbg_heading("Controllers and console (as the machine latched them)"));
+    gtk_box_append(GTK_BOX(iobox), io->lamps);
+    gtk_box_append(GTK_BOX(iobox), mono_text(&io->ports_text));
+    gtk_box_append(GTK_BOX(iobox), dbg_heading("2102 RAM"));
+    gtk_box_append(GTK_BOX(iobox), mono_text(&io->ram_text));
+    gtk_box_append(GTK_BOX(iobox), iorow);
+    gtk_box_append(GTK_BOX(iobox), io_scroll);
+
+    snd_scroll = dbg_mono_view(&io->snd_log, FALSE);
+    dbg_log_make(io->snd_log);
+    gtk_box_append(GTK_BOX(sbox), dbg_heading("Beeper"));
+    gtk_box_append(GTK_BOX(sbox), mono_text(&io->sound_text));
+    gtk_box_append(GTK_BOX(sbox), io->meter);
+    gtk_box_append(GTK_BOX(sbox), dbg_heading("Sound mode changes (port 5 bits 7-6)"));
+    gtk_box_append(GTK_BOX(sbox), snd_scroll);
+
+    *io_root = iobox;
+    *sound_root = dbg_padded(sbox);
     return io;
 }
 

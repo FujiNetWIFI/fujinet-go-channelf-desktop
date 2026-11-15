@@ -37,7 +37,7 @@ add_executable(fujinet-go-channelf-gnome
   controllers/controllers_window.c
   help/help_window.c
   debugger/dbg_window.c
-  debugger/dbg_cpu.c
+  debugger/dbg_scratch.c
   debugger/dbg_video.c
   debugger/dbg_io.c
   debugger/dbg_cart.c

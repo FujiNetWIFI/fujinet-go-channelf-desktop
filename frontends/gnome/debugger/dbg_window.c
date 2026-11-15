@@ -1963,6 +1963,13 @@ static void on_bp_type_changed(GObject *o, GParamSpec *ps, gpointer ud)
         gtk_entry_set_placeholder_text(w->bp_start, k_bp_kinds[sel].hint);
 }
 
+/* A refused Add: said under the form, and as a toast so it is not missed. */
+static void bp_error(DbgWin *w, const char *msg)
+{
+    gtk_label_set_text(w->bp_msg, msg);
+    if (msg[0]) toast(w, msg);
+}
+
 static void on_bp_add(GtkWidget *wgt, gpointer ud)
 {
     DbgWin *w = ud;
@@ -1973,30 +1980,30 @@ static void on_bp_add(GtkWidget *wgt, gpointer ud)
     (void)wgt;
     if (sel >= (guint)NBPKINDS) sel = 0;
     if (!bp_parse(w, (int)sel, gtk_editable_get_text(GTK_EDITABLE(w->bp_start)), &a)) {
-        gtk_label_set_text(w->bp_msg, "Not a valid start for this kind of breakpoint");
+        bp_error(w, "Not a valid start for this kind of breakpoint");
         return;
     }
     b = a;
     if (end && *end && !bp_parse(w, (int)sel, end, &b)) {
-        gtk_label_set_text(w->bp_msg, "The end is not valid");
+        bp_error(w, "The end is not valid");
         return;
     }
     if (b < a) {
-        gtk_label_set_text(w->bp_msg, "The end comes before the start");
+        bp_error(w, "The end comes before the start");
         return;
     }
     if (a < 0 || b > 0xFFFF) {
-        gtk_label_set_text(w->bp_msg, "Out of range");
+        bp_error(w, "Out of range");
         return;
     }
     id = chfdebug_breakpoint_add(w->dbg, k_bp_kinds[sel].type, k_bp_kinds[sel].space,
                                  (uint16_t)a, (uint16_t)b,
                                  gtk_editable_get_text(GTK_EDITABLE(w->bp_cond)));
     if (id < 0) {
-        gtk_label_set_text(w->bp_msg, "The condition does not parse, or the range is outside its space");
+        bp_error(w, "The condition does not parse, or the range is outside its space");
         return;
     }
-    gtk_label_set_text(w->bp_msg, "");
+    bp_error(w, "");
     gtk_editable_set_text(GTK_EDITABLE(w->bp_start), "");
     gtk_editable_set_text(GTK_EDITABLE(w->bp_end), "");
     gtk_editable_set_text(GTK_EDITABLE(w->bp_cond), "");

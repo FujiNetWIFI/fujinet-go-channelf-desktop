@@ -2201,21 +2201,34 @@ static void on_break_at(debugger *d)
     resync(d);
 }
 
-/* A symbol row (double-click, Enter) goes to its address in the Disassembly. */
+/* A symbol row (double-click, Enter) goes to its address in the Disassembly.
+ * The row's own text is read back: the engine's table order is not stable
+ * between the listing and the click (a lookup can move entries). */
 static void on_symbol_activate(debugger *d)
 {
     const int row = (int)SendMessageA(d->sym_list, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
-    uint16_t address = 0;
-    char name[96], text[128];
-    int bank;
+    char address_text[32] = "", name[96] = "", kind[32] = "", text[160];
+    LVITEMA item;
     if (row < 0 || row >= d->sym_shown) return;
-    if (!chfdebug_symbols_get(d->dbg, d->sym_indices[row], &address, name, sizeof name, &bank)) return;
-    if (bank == CHFDEBUG_SYM_PORT) {
-        snprintf(text, sizeof text, "%s is port $%02X", name, address);
+    memset(&item, 0, sizeof item);
+    item.iSubItem = 0;
+    item.pszText = address_text;
+    item.cchTextMax = (int)sizeof address_text;
+    SendMessageA(d->sym_list, LVM_GETITEMTEXTA, (WPARAM)row, (LPARAM)&item);
+    item.iSubItem = 1;
+    item.pszText = name;
+    item.cchTextMax = (int)sizeof name;
+    SendMessageA(d->sym_list, LVM_GETITEMTEXTA, (WPARAM)row, (LPARAM)&item);
+    item.iSubItem = 2;
+    item.pszText = kind;
+    item.cchTextMax = (int)sizeof kind;
+    SendMessageA(d->sym_list, LVM_GETITEMTEXTA, (WPARAM)row, (LPARAM)&item);
+    if (strcmp(kind, "port") == 0) {
+        snprintf(text, sizeof text, "%s is port $%s", name, address_text);
         toast(d, text);
         return;
     }
-    snprintf(text, sizeof text, "$%04X", address);
+    snprintf(text, sizeof text, "$%s", address_text);
     goto_tab(d, TAB_DISASM);
     SetWindowTextA(d->jump, text);
     on_jump(d);

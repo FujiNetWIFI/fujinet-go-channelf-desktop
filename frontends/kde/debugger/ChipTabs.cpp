@@ -13,6 +13,8 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSplitter>
 #include <QVBoxLayout>
 #include <cstring>
@@ -26,6 +28,19 @@ using dbgui::yesNo;
 namespace {
 
 const char *const kSoundModes[] = { "off", "1 kHz", "500 Hz", "120 Hz" };
+
+/* The memory map as the console sees it, a line a region. */
+QString memoryMap(chfdebug *d)
+{
+    static chfdebug_region map[64];
+    const int n = chfdebug_memory_map(d, map, 64);
+    QString s = QStringLiteral("\nMemory map\n");
+    for (int i = 0; i < n; ++i)
+        s += QStringLiteral("  $%1-$%2  %3%4  %5\n").arg(hx(map[i].low, 4), hx(map[i].high, 4),
+                 map[i].readable ? QStringLiteral("r") : QStringLiteral("-"),
+                 map[i].writable ? QStringLiteral("w") : QStringLiteral("-"), QString::fromUtf8(map[i].name));
+    return s;
+}
 
 } // namespace
 
@@ -102,28 +117,53 @@ private:
     bool m_forced = false;
 };
 
-/* ---- Sound & I/O ------------------------------------------------------------------------ */
+/* ---- Sound ----------------------------------------------------------------------------- */
 
-IoTab::IoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
+SoundTab::SoundTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
 {
-    auto *h = new QHBoxLayout(this);
-    auto *left = new QVBoxLayout;
-
-    auto *sound = new QGroupBox(QStringLiteral("Sound"));
-    auto *sv = new QVBoxLayout(sound);
+    auto *v = new QVBoxLayout(this);
     m_sound = new QLabel;
     m_sound->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    sv->addWidget(m_sound);
+    v->addWidget(m_sound);
     m_meter = new LevelMeter;
-    sv->addWidget(m_meter, 0, Qt::AlignLeft);
-    sv->addWidget(dbgui::dimLabel(QStringLiteral("The level of the beeper's envelope; in the accent while it is forced "
-                                                 "on (about 2 ms after a mode change). Port 5 bits 7-6 pick the mode.")));
-    sv->addWidget(dbgui::titleLabel(QStringLiteral("Mode changes")));
+    v->addWidget(m_meter, 0, Qt::AlignLeft);
+    v->addWidget(dbgui::dimLabel(QStringLiteral("The level of the beeper's envelope; in the accent while it is forced "
+                                                "on (about 2 ms after a mode change). Port 5 bits 7-6 pick the mode: "
+                                                "off, 1 kHz, 500 Hz or 120 Hz.")));
+    v->addWidget(dbgui::titleLabel(QStringLiteral("Sound-mode timeline")));
     m_modes = dbgui::monoView();
-    m_modes->setMaximumHeight(m_modes->fontMetrics().lineSpacing() * 7 + 14);
-    sv->addWidget(m_modes);
-    left->addWidget(sound);
+    v->addWidget(m_modes, 1);
+}
 
+void SoundTab::refresh()
+{
+    chfdebug_io io;
+    chfdebug_io_get(m_dbg, &io);
+    const int mode = io.sound_mode & 3;
+    m_sound->setText(QStringLiteral("Mode %1: %2.  Level %3.  Forced on: %4.\n%5 mode changes and %6 samples since power-on.")
+                         .arg(mode).arg(QString::fromLatin1(kSoundModes[mode])).arg(io.sound_level)
+                         .arg(yesNo(io.sound_forced)).arg(io.sound_changes).arg((qulonglong)io.audio_samples));
+    m_meter->set(io.sound_level, io.sound_forced != 0);
+    static chfdebug_sound_event ev[256];
+    const int ne = chfdebug_sound_events(m_dbg, ev, 256);
+    QString modes;
+    for (int i = 0; i < ne; ++i)
+        modes += QStringLiteral("frame %1  PC $%2  %3 → %4\n").arg(ev[i].frame, 5).arg(hx(ev[i].pc, 4),
+                     QString::fromLatin1(kSoundModes[ev[i].old_mode & 3]), QString::fromLatin1(kSoundModes[ev[i].mode & 3]));
+    if (!ne) modes = QStringLiteral("(no mode change since the debugger attached)\n");
+    dbgui::setText(m_modes, modes, dbgui::atEnd(m_modes));
+}
+
+/* ---- Cart & I/O ------------------------------------------------------------------------- */
+
+CartIoTab::CartIoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
+{
+    auto *root = new QVBoxLayout(this);
+
+    /* the lamps and the ports on top, in a box that scrolls sideways rather
+     * than widen the window */
+    auto *top = new QWidget;
+    auto *th = new QHBoxLayout(top);
     auto *pads = new QGroupBox(QStringLiteral("Controllers and panel"));
     auto *pv = new QVBoxLayout(pads);
     const QStringList contacts = { QStringLiteral("RIGHT"), QStringLiteral("LEFT"), QStringLiteral("BACK"),
@@ -137,24 +177,56 @@ IoTab::IoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debug
     pv->addWidget(m_pad[0]);
     pv->addWidget(m_pad[1]);
     pv->addWidget(m_panel);
-    m_bytes = new QLabel;
-    m_bytes->setFont(dbgui::monoFont(m_bytes->font()));
-    m_bytes->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    pv->addWidget(m_bytes);
-    pv->addWidget(dbgui::dimLabel(QStringLiteral("Lit: held. The CPU reads the controllers active low, and only while "
-                                                 "port 0 bit 6 is clear.")));
-    left->addWidget(pads);
+    pv->addWidget(dbgui::dimLabel(QStringLiteral("Lit: held. The CPU reads the controllers active low, and only "
+                                                 "while port 0 bit 6 is clear.")));
+    th->addWidget(pads);
 
-    auto *ram = new QGroupBox(QStringLiteral("2102 RAM (Maze, Hangman)"));
-    auto *rv = new QVBoxLayout(ram);
+    auto *ports = new QGroupBox(QStringLiteral("Ports"));
+    auto *qv = new QVBoxLayout(ports);
+    m_ports = new QLabel;
+    m_ports->setFont(dbgui::monoFont(m_ports->font()));
+    m_ports->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    qv->addWidget(m_ports);
     m_ram = new QLabel;
     m_ram->setFont(dbgui::monoFont(m_ram->font()));
-    rv->addWidget(m_ram);
-    left->addWidget(ram);
-    left->addStretch(1);
-    h->addLayout(left);
+    qv->addWidget(m_ram);
+    qv->addStretch(1);
+    th->addWidget(ports);
+    th->addStretch(1);
+    auto *topScroll = new QScrollArea;
+    topScroll->setWidget(top);
+    topScroll->setWidgetResizable(true);
+    topScroll->setFrameShape(QFrame::NoFrame);
+    topScroll->setFixedHeight(top->sizeHint().height() + topScroll->horizontalScrollBar()->sizeHint().height() + 4);
+    root->addWidget(topScroll);
 
-    auto *right = new QVBoxLayout;
+    /* the cartridge, the mailbox and its events, the I/O log */
+    auto *split = new QSplitter(Qt::Horizontal);
+    m_text = dbgui::monoView();
+    split->addWidget(m_text);
+
+    auto *middle = new QSplitter(Qt::Vertical);
+    auto *mtop = new QWidget;
+    auto *mv = new QVBoxLayout(mtop);
+    mv->setContentsMargins(0, 0, 0, 0);
+    mv->addWidget(dbgui::titleLabel(QStringLiteral("The mailbox, $F800-$FFFF")));
+    m_mailbox = dbgui::monoView();
+    mv->addWidget(m_mailbox, 1);
+    auto *mbottom = new QWidget;
+    auto *bv = new QVBoxLayout(mbottom);
+    bv->setContentsMargins(0, 0, 0, 0);
+    bv->addWidget(dbgui::titleLabel(QStringLiteral("Cartridge events")));
+    m_events = dbgui::monoView();
+    bv->addWidget(m_events, 1);
+    middle->addWidget(mtop);
+    middle->addWidget(mbottom);
+    middle->setStretchFactor(0, 3);
+    middle->setStretchFactor(1, 2);
+    split->addWidget(middle);
+
+    auto *logBox = new QWidget;
+    auto *lv = new QVBoxLayout(logBox);
+    lv->setContentsMargins(0, 0, 0, 0);
     auto *head = new QHBoxLayout;
     head->addWidget(dbgui::titleLabel(QStringLiteral("I/O log: every port access")), 1);
     auto *clear = new QPushButton(QStringLiteral("Clear"));
@@ -163,44 +235,55 @@ IoTab::IoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debug
         refresh();
     });
     head->addWidget(clear);
-    right->addLayout(head);
+    lv->addLayout(head);
     m_log = dbgui::monoView();
-    right->addWidget(m_log, 1);
-    h->addLayout(right, 1);
+    lv->addWidget(m_log, 1);
+    split->addWidget(logBox);
+    split->setStretchFactor(0, 3);
+    split->setStretchFactor(1, 3);
+    split->setStretchFactor(2, 2);
+    split->setChildrenCollapsible(false);
+    root->addWidget(split, 1);
 }
 
-void IoTab::refresh()
+void CartIoTab::refresh()
+{
+    refreshIo();
+    refreshCart();
+}
+
+void CartIoTab::refreshIo()
 {
     chfdebug_io io;
     chfdebug_video v;
     chfdebug_io_get(m_dbg, &io);
     chfdebug_video_get(m_dbg, &v);
 
-    const int mode = io.sound_mode & 3;
-    m_sound->setText(QStringLiteral("Mode %1: %2.  Level %3.  Forced on: %4.\n%5 mode changes and %6 samples since power-on.")
-                         .arg(mode).arg(QString::fromLatin1(kSoundModes[mode])).arg(io.sound_level)
-                         .arg(yesNo(io.sound_forced)).arg(io.sound_changes).arg((qulonglong)io.audio_samples));
-    m_meter->set(io.sound_level, io.sound_forced != 0);
-    static chfdebug_sound_event ev[64];
-    const int ne = chfdebug_sound_events(m_dbg, ev, 64);
-    QString modes;
-    for (int i = 0; i < ne; ++i)
-        modes += QStringLiteral("frame %1  PC $%2  %3 → %4\n").arg(ev[i].frame, 5).arg(hx(ev[i].pc, 4),
-                     QString::fromLatin1(kSoundModes[ev[i].old_mode & 3]), QString::fromLatin1(kSoundModes[ev[i].mode & 3]));
-    if (!ne) modes = QStringLiteral("(none since the debugger attached)\n");
-    dbgui::setText(m_modes, modes, dbgui::atEnd(m_modes));
-
     m_pad[0]->set(io.controller[0]);
     m_pad[1]->set(io.controller[1]);
     m_panel->set((io.panel & 0xF) | (io.reset_held ? 0x10u : 0u));
-    m_bytes->setText(QStringLiteral("port 1 reads $%1 %2   port 4 reads $%3 %4\nport 0 reads $%5 %6   RESET %7")
-                         .arg(hx(v.in1, 2), dbgui::bin8(v.in1), hx(v.in4, 2), dbgui::bin8(v.in4), hx(v.in0, 2),
-                              dbgui::bin8(v.in0), io.reset_held ? QStringLiteral("held") : QStringLiteral("up")));
+
+    /* the latch the CPU last wrote, its complement (what the hardware wires),
+     * what the CPU would read now, and what the latch means */
+    static const char *const kSoundNames[4] = { "off", "1 kHz", "500 Hz", "120 Hz" };
+    QString p = QStringLiteral("port  latch  ~latch  reads   decoded\n");
+    p += QStringLiteral("  0   $%1    $%2    $%3    strobe %4, controllers %5, panel latch %6\n")
+             .arg(hx(v.port0, 2), hx((~v.port0) & 0xFF, 2), hx(v.in0, 2), v.strobe ? "up" : "down",
+                  v.controllers_enabled ? "read" : "off").arg(v.panel_latch);
+    p += QStringLiteral("  1   $%1    $%2    $%3    colour value %4\n")
+             .arg(hx(v.port1, 2), hx((~v.port1) & 0xFF, 2), hx(v.in1, 2)).arg(v.value);
+    p += QStringLiteral("  4   $%1    $%2    $%3    column %4\n")
+             .arg(hx(v.port4, 2), hx((~v.port4) & 0xFF, 2), hx(v.in4, 2)).arg(v.col);
+    p += QStringLiteral("  5   $%1    $%2    $%3    row %4, sound %5\n")
+             .arg(hx(v.port5, 2), hx((~v.port5) & 0xFF, 2), hx(v.in5, 2)).arg(v.row)
+             .arg(QString::fromLatin1(kSoundNames[v.sound_mode & 3]));
+    p += QStringLiteral("RESET %1").arg(io.reset_held ? QStringLiteral("held") : QStringLiteral("up"));
+    m_ports->setText(p);
     if (io.has_2102)
-        m_ram->setText(QStringLiteral("I/O ports $%1/$%2  address latch $%3  bit at it %4")
+        m_ram->setText(QStringLiteral("2102 RAM: ports $%1/$%2, address latch $%3, bit at it %4")
                            .arg(hx(io.ram_port, 2), hx(io.ram_port + 1, 2), hx(io.ram_addr, 3)).arg(io.ram_bit));
     else
-        m_ram->setText(QStringLiteral("(the cartridge has no 2102 RAM)"));
+        m_ram->setText(QStringLiteral("2102 RAM: (the cartridge has none)"));
 
     static chfdebug_io_event ioe[300];
     const int n = chfdebug_io_events(m_dbg, ioe, 300);
@@ -213,36 +296,7 @@ void IoTab::refresh()
     dbgui::setText(m_log, t, dbgui::atEnd(m_log));
 }
 
-/* ---- Cart ----------------------------------------------------------------------------------- */
-
-CartTab::CartTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
-{
-    auto *h = new QHBoxLayout(this);
-    m_text = dbgui::monoView();
-    h->addWidget(m_text, 1);
-
-    auto *split = new QSplitter(Qt::Vertical);
-    auto *top = new QWidget;
-    auto *tv = new QVBoxLayout(top);
-    tv->setContentsMargins(0, 0, 0, 0);
-    tv->addWidget(dbgui::titleLabel(QStringLiteral("The mailbox, $F800-$FFFF")));
-    m_mailbox = dbgui::monoView();
-    m_mailbox->setMinimumWidth(m_mailbox->fontMetrics().horizontalAdvance(QString(80, QLatin1Char('0'))));
-    tv->addWidget(m_mailbox, 1);
-    auto *bottom = new QWidget;
-    auto *bv = new QVBoxLayout(bottom);
-    bv->setContentsMargins(0, 0, 0, 0);
-    bv->addWidget(dbgui::titleLabel(QStringLiteral("Cartridge events")));
-    m_events = dbgui::monoView();
-    bv->addWidget(m_events, 1);
-    split->addWidget(top);
-    split->addWidget(bottom);
-    split->setStretchFactor(0, 3);
-    split->setStretchFactor(1, 2);
-    h->addWidget(split);
-}
-
-void CartTab::refresh()
+void CartIoTab::refreshCart()
 {
     chfdebug_cart c;
     char info[256] = "";
@@ -250,7 +304,7 @@ void CartTab::refresh()
     chfdebug_cart_info(m_dbg, info, sizeof info);
     QString t = QString::fromUtf8(info) + QStringLiteral("\n\n");
     if (!c.present) {
-        dbgui::setText(m_text, t);
+        dbgui::setText(m_text, t + memoryMap(m_dbg));
         dbgui::setText(m_mailbox, QString());
         dbgui::setText(m_events, QString());
         return;
@@ -269,7 +323,7 @@ void CartTab::refresh()
                                                                     : QStringLiteral("none"));
         if (c.bank || c.half)
             t += QStringLiteral("Bank           %1, half %2\n").arg(c.bank).arg(c.half);
-        dbgui::setText(m_text, t);
+        dbgui::setText(m_text, t + memoryMap(m_dbg));
         dbgui::setText(m_mailbox, QStringLiteral("(not a FujiNet cartridge: it has no mailbox)"));
         dbgui::setText(m_events, QStringLiteral("(a Videocart reports no events)"));
         return;
@@ -305,7 +359,7 @@ void CartTab::refresh()
     t += QStringLiteral("  $FC0B PROTO_VER   %1\n").arg(s[11]);
     t += QStringLiteral("  $FC0E TICK        $%1  (%2: the 60 Hz count)\n").arg(hx(s[14] | (s[15] << 8), 4)).arg(s[14] | (s[15] << 8));
     t += QStringLiteral("\nReply: %1 bytes waiting, last error $%2, queue depth %3\n").arg(c.rxlen).arg(hx(c.last_error, 2)).arg(c.queue_depth);
-    dbgui::setText(m_text, t);
+    dbgui::setText(m_text, t + memoryMap(m_dbg));
 
     QString dump;
     for (unsigned row = 0; row < sizeof c.mailbox_page / 16; ++row) {

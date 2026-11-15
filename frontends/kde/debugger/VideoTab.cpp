@@ -1,120 +1,115 @@
 /*
- * VideoTab -- see VideoTab.h.
+ * The debugger's Video tab (Qt6 Widgets).
+ *
+ * Everything that decides what to show lives in the core (chfvidtab.h): this file is widgets.
+ * The picture comes from the controller's cached buffer already opaque (0xFFRRGGBB), so
+ * Format_RGB32 is safe on KWin; a mouse move redraws only the marks, never re-renders.
+ * Only the section showing is filled in.
  *
  * Copyright (C) 2026 Thomas Cherryhomes
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
-
 #include "VideoTab.h"
+#include "../FujiNetWindows.h"
 
 #include <QCheckBox>
 #include <QComboBox>
-#include <QGridLayout>
-#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QImage>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
-#include <QSpinBox>
+#include <QScrollBar>
+#include <QSplitter>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QVBoxLayout>
-#include <cstring>
-
-#include "../FujiNetWindows.h"
-#include "DebugUi.h"
-
-using dbgui::hx;
 
 namespace {
 
-/* the overlay checkboxes: label, the engine's flag, what it marks */
-const struct { const char *label; unsigned flag; const char *tip; bool on; } kOverlays[8] = {
-    { "Visible area", CHFDEBUG_F_VISIBLE, "VISIBLE: the TV's rectangle, columns 4-105 and rows 4-61 (VRAM and Values)", true },
-    { "Grid", CHFDEBUG_F_GRID, "GRID: cell borders (from scale 2)", false },
-    { "Palette columns", CHFDEBUG_F_PALCOLS, "PALCOLS: columns 125-127, where the row's palette is chosen (VRAM and Values)", false },
-    { "Beam", CHFDEBUG_F_BEAM, "BEAM: the line the beam is on", false },
-    { "Write cursor", CHFDEBUG_F_CURSOR, "CURSOR: the cell the next strobe writes (ports 4 and 5)", false },
-    { "Heat", CHFDEBUG_F_HEAT, "HEAT: cells written this frame, brighter the more", false },
-    { "Changed", CHFDEBUG_F_DIRTY, "DIRTY: cells that changed since the last frame", false },
-    { "Palette rows", CHFDEBUG_F_PALROWS, "PALROWS: a tick at the left of the rows whose palette changed this frame", false },
-};
-
-const char *const kViews[] = { "Frame", "Live", "Beam", "VRAM", "Values", "Palettes" };
-const char *const kViewTips[] = {
-    "The last frame the machine finished: what the window shows",
-    "The video RAM as it is now, drawn the same way",
-    "What a CRT shows: rows the beam has passed this frame as they were when it drew them, the rest from the last frame, dimmed",
-    "All 128 × 64 cells, the hidden columns and rows hatched",
-    "The raw values 0-3 in false colour, whatever the palettes say",
-    "The four palettes",
-};
-const char *const kSoundModes[] = { "off", "1 kHz", "500 Hz", "120 Hz" };
-
-QColor fromXrgb(uint32_t v) { return QColor((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF); }
-
-QColor inkOn(const QColor &c) { return c.lightness() > 140 ? QColor(0, 0, 0) : QColor(255, 255, 255); }
-
-void setCell(QTableWidget *t, int row, int col, const QString &text)
+QColor accentColor()
 {
-    QTableWidgetItem *it = t->item(row, col);
-    if (!it) {
-        it = new QTableWidgetItem;
-        it->setFlags(it->flags() & ~Qt::ItemIsEditable);
-        t->setItem(row, col, it);
-    }
-    if (it->text() != text) it->setText(text);
+    return chfAccentColor();
 }
 
-QTableWidget *plainTable(const QStringList &headers, int rows)
+QLabel *monoLabel()
 {
-    auto *t = new QTableWidget(rows, headers.size());
-    t->setHorizontalHeaderLabels(headers);
-    t->verticalHeader()->setVisible(false);
+    auto *l = new QLabel;
+    QFont f = l->font();
+    f.setFamily(QStringLiteral("monospace"));
+    f.setStyleHint(QFont::TypeWriter);
+    l->setFont(f);
+    l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    l->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    return l;
+}
+
+QTableWidget *makeTable(const QStringList &heads)
+{
+    auto *t = new QTableWidget(0, heads.size());
+    t->setHorizontalHeaderLabels(heads);
+    t->verticalHeader()->hide();
     t->setEditTriggers(QAbstractItemView::NoEditTriggers);
     t->setSelectionMode(QAbstractItemView::NoSelection);
-    t->setFocusPolicy(Qt::NoFocus);
-    t->setFont(dbgui::monoFont(t->font()));
-    t->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    t->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    t->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    t->horizontalHeader()->setStretchLastSection(false);
-    t->setFixedHeight(t->horizontalHeader()->sizeHint().height() + rows * t->verticalHeader()->defaultSectionSize() + 6);
+    t->horizontalHeader()->setStretchLastSection(true);
+    QFont f = t->font();
+    f.setFamily(QStringLiteral("monospace"));
+    f.setStyleHint(QFont::TypeWriter);
+    t->setFont(f);
     return t;
+}
+
+QString hex(unsigned v, int digits)
+{
+    return QStringLiteral("%1").arg(v, digits, 16, QLatin1Char('0')).toUpper();
+}
+
+void setCell(QTableWidget *t, int row, int col, const QString &text, bool hot)
+{
+    auto *it = t->item(row, col);
+    if (!it) {
+        it = new QTableWidgetItem;
+        t->setItem(row, col, it);
+    }
+    it->setText(text);
+    it->setBackground(hot ? QBrush(accentColor()) : QBrush());
+    it->setForeground(hot ? QBrush(chfAccentInk()) : QBrush());
 }
 
 } // namespace
 
-/* ---- the picture ---------------------------------------------------------------- */
+/* ---- the picture ------------------------------------------------------------ */
 
-/* The chosen view, exactly as the engine drew it (it scales), with a box round
- * the cell under the pointer and a second round the pinned one. */
-class VideoImage : public QWidget {
+class VideoPicture : public QWidget
+{
 public:
-    std::function<void(int, int)> onHover;   /* a pixel, or -1 -1 when the pointer leaves */
-    std::function<void(int, int)> onClick, onDouble;
-
-    VideoImage()
+    explicit VideoPicture(VideoTab *owner) : m_owner(owner)
     {
         setMouseTracking(true);
-        setCursor(Qt::CrossCursor);
-        setFixedSize(204 * 2, 232 * 2);
+        setMinimumSize(320, 200);
     }
-    void setImage(const QImage &img)
+    /* the controller's buffer, or a message when this view cannot be drawn */
+    void sync()
     {
-        m_img = img;
-        if (size() != img.size()) setFixedSize(img.size());
-        update();
-    }
-    void setMarks(const QRect &hover, const QRect &pin)
-    {
-        if (hover == m_hover && pin == m_pin) return;
-        m_hover = hover;
-        m_pin = pin;
+        int width = 0, height = 0;
+        const uint32_t *pixels = chfvid_tab_picture(m_owner->m_tab, &width, &height);
+        if (pixels) {
+            /* a view over the controller's buffer: valid until its next refresh */
+            m_image = QImage(reinterpret_cast<const uchar *>(pixels), width, height, width * 4, QImage::Format_RGB32);
+            m_msg.clear();
+            setFixedSize(width, height);
+        } else {
+            m_image = QImage();
+            const char *why = chfvid_tab_why(m_owner->m_tab);
+            m_msg = QString::fromUtf8(why ? why : "Nothing to show");
+            setMinimumSize(320, 200);
+            setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        }
         update();
     }
 
@@ -122,504 +117,472 @@ protected:
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
-        p.fillRect(rect(), Qt::black);
-        if (m_img.isNull()) return;
-        p.drawImage(0, 0, m_img);
-        p.setBrush(Qt::NoBrush);
-        auto box = [&](const QRect &r, const QColor &c) {
-            if (r.isNull()) return;
-            p.setPen(QPen(Qt::black, 4));
-            p.drawRect(r.adjusted(-2, -2, 2, 2));
-            p.setPen(QPen(c, 2));
-            p.drawRect(r.adjusted(-2, -2, 2, 2));
-        };
-        box(m_hover, Qt::white);
-        box(m_pin, chfAccentColor());
+        p.fillRect(rect(), QColor(18, 18, 24));
+        if (m_image.isNull()) {
+            p.setPen(QColor(140, 140, 148));
+            p.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap, m_msg);
+            return;
+        }
+        p.drawImage(0, 0, m_image);
+        int hover[4] = { 0 }, pin[4] = { 0 };
+        const int marks = chfvid_tab_marks(m_owner->m_tab, hover, pin);
+        if (marks & 1) {
+            p.setPen(QPen(QColor(255, 255, 255, 230), 1));
+            p.drawRect(hover[0] - 1, hover[1] - 1, hover[2] + 1, hover[3] + 1);   /* just outside the pixel */
+        }
+        if (marks & 2) {
+            p.setPen(QPen(chfAccentColor(), 2));
+            p.drawRect(pin[0] - 1, pin[1] - 1, pin[2] + 1, pin[3] + 1);
+        }
     }
     void mouseMoveEvent(QMouseEvent *e) override
     {
-        if (onHover) onHover(e->position().toPoint().x(), e->position().toPoint().y());
+        const QPoint pt = e->position().toPoint();
+        if (chfvid_tab_hover(m_owner->m_tab, pt.x(), pt.y())) {
+            update();
+            m_owner->updatePixelSection();
+        }
     }
     void leaveEvent(QEvent *) override
     {
-        if (onHover) onHover(-1, -1);
+        if (chfvid_tab_hover(m_owner->m_tab, -1, -1)) {
+            update();
+            m_owner->updatePixelSection();
+        }
     }
     void mousePressEvent(QMouseEvent *e) override
     {
-        if (e->button() == Qt::LeftButton && onClick) onClick(e->position().toPoint().x(), e->position().toPoint().y());
+        if (e->button() != Qt::LeftButton) return;
+        const QPoint pt = e->position().toPoint();
+        chfvid_tab_pin(m_owner->m_tab, pt.x(), pt.y());
+        update();
+        m_owner->updatePixelSection();
     }
     void mouseDoubleClickEvent(QMouseEvent *e) override
     {
-        if (e->button() == Qt::LeftButton && onDouble) onDouble(e->position().toPoint().x(), e->position().toPoint().y());
+        if (e->button() != Qt::LeftButton) return;
+        const QPoint pt = e->position().toPoint();
+        chfvid_tab_hover(m_owner->m_tab, pt.x(), pt.y());
+        m_owner->breakOnPixel();
+        update();
     }
 
 private:
-    QImage m_img;
-    QRect m_hover, m_pin;
+    VideoTab *m_owner;
+    QImage m_image;
+    QString m_msg;
 };
 
-/* ---- the row palette strip ------------------------------------------------------- */
+/* ---- the tab ------------------------------------------------------------------ */
 
-/* All 64 rows' palettes: each row's number, its background colour and the
- * palette its columns 125 and 126 chose. A row whose palette changed since
- * the last look is marked in the accent for a few looks. */
-class RowStrip : public QWidget {
-public:
-    RowStrip()
-    {
-        setFixedSize(2 * kW + 12, 32 * kH + 4);
-        memset(m_pal, 0, sizeof m_pal);
-        memset(m_age, 0, sizeof m_age);
-    }
-    void set(const uint8_t pal[64], const uint32_t bg[64])
-    {
-        bool changed = false;
-        for (int i = 0; i < 64; ++i) {
-            if (m_have && pal[i] != m_pal[i]) m_age[i] = 12;
-            else if (m_age[i] > 0) m_age[i]--;
-            if (pal[i] != m_pal[i] || bg[i] != m_bg[i] || m_age[i] != m_shown[i]) changed = true;
-            m_pal[i] = pal[i];
-            m_bg[i] = bg[i];
-            m_shown[i] = m_age[i];
-        }
-        m_have = true;
-        if (changed) update();
-    }
-
-protected:
-    void paintEvent(QPaintEvent *) override
-    {
-        QPainter p(this);
-        QFont small = dbgui::monoFont(font());
-        small.setPointSizeF(qMax(7.0, font().pointSizeF() * 0.85));
-        p.setFont(small);
-        for (int i = 0; i < 64; ++i) {
-            const int x = 2 + (i / 32) * (kW + 4), y = 2 + (i % 32) * kH;
-            const QRect cell(x, y, kW, kH - 1);
-            p.setPen(palette().color(QPalette::Text));
-            p.drawText(QRect(x, y, 26, kH - 1), Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("r%1").arg(i));
-            const QRect sw(x + 30, y + 1, 96, kH - 3);
-            p.setPen(palette().color(QPalette::Mid));
-            p.setBrush(fromXrgb(m_bg[i]));
-            p.drawRect(sw);
-            p.setPen(inkOn(fromXrgb(m_bg[i])));
-            p.drawText(sw, Qt::AlignCenter, QStringLiteral("palette %1").arg(m_pal[i]));
-            if (m_age[i] > 0) {
-                p.setPen(Qt::NoPen);
-                p.setBrush(chfAccentColor());
-                p.drawEllipse(QPoint(x + 136, y + kH / 2), 4, 4);
-                p.setPen(palette().color(QPalette::Text));
-                p.drawText(QRect(x + 144, y, kW - 144, kH - 1), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("changed"));
-            }
-            (void)cell;
-        }
-    }
-
-private:
-    static constexpr int kW = 220, kH = 16;
-    uint8_t m_pal[64];
-    uint32_t m_bg[64] = {};
-    uint8_t m_age[64], m_shown[64] = {};
-    bool m_have = false;
-};
-
-/* ---- the tab ---------------------------------------------------------------------- */
-
-VideoTab::VideoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent), m_dbg(debugger)
+VideoTab::VideoTab(chfdebug *debugger, QWidget *parent) : QWidget(parent)
 {
-    memset(&m_v, 0, sizeof m_v);
-    auto *h = new QHBoxLayout(this);
-    h->addWidget(buildLeft());
+    m_tab = chfvid_tab_new(debugger);
 
-    m_sections = new QTabWidget;
-    m_sections->addTab(buildCell(), QStringLiteral("Cell"));
-    m_sections->addTab(buildPalettes(), QStringLiteral("Palettes"));
-    m_sections->addTab(buildPorts(), QStringLiteral("Ports"));
-    m_sections->addTab(buildLog(), QStringLiteral("Write log"));
-    if (qEnvironmentVariableIsSet("CHF_DEBUGGER_SECTION")) {
-        const int n = qEnvironmentVariable("CHF_DEBUGGER_SECTION").toInt();
-        if (n >= 0 && n < m_sections->count()) m_sections->setCurrentIndex(n);
-    }
-    connect(m_sections, &QTabWidget::currentChanged, this, [this] { refresh(); });
-    h->addWidget(m_sections, 1);
-}
+    auto *root = new QVBoxLayout(this);
 
-QWidget *VideoTab::buildLeft()
-{
-    auto *w = new QWidget;
-    auto *v = new QVBoxLayout(w);
-    v->setContentsMargins(0, 0, 0, 0);
-
-    auto *row = new QHBoxLayout;
+    /* ---- toolbar: view, Decoded source, zoom, break; then the overlays */
+    auto *bar = new QHBoxLayout;
     m_view = new QComboBox;
-    for (int i = 0; i < 6; ++i) {
-        m_view->addItem(QString::fromLatin1(kViews[i]));
-        m_view->setItemData(i, QString::fromLatin1(kViewTips[i]), Qt::ToolTipRole);
+    for (int i = 0; i < CHFVID_V_COUNT; ++i) m_view->addItem(QString::fromUtf8(chfvid_view_name(i)));
+    m_view->setToolTip(QStringLiteral(
+        "Display: the last finished frame, as the TV showed it.\n"
+        "Decoded: the whole 128 x 64 video RAM, each row in its own palette; hatched outside the visible area.\n"
+        "Beam: what a CRT shows: rows the beam has passed from the VRAM as it was, the rest last frame's, dimmed.\n"
+        "Values: the raw 0-3 of each cell, palette-free.\n"
+        "Live: the video RAM as it is now, drawn like Display."));
+    m_zoom = new QComboBox;
+    int zoomCount = 0;
+    const int *zooms = chfvid_zooms(&zoomCount);
+    for (int i = 0; i < zoomCount; ++i)
+        m_zoom->addItem(zooms[i] ? QStringLiteral("%1×").arg(zooms[i]) : QStringLiteral("Fit"), zooms[i]);
+    bar->addWidget(new QLabel(QStringLiteral("View")));
+    bar->addWidget(m_view);
+    bar->addWidget(new QLabel(QStringLiteral("Zoom")));
+    bar->addWidget(m_zoom);
+    m_breakBtn = new QPushButton(QStringLiteral("Break on writes"));
+    m_breakBtn->setToolTip(QStringLiteral("A VRAM write breakpoint on the inspected cell"));
+    bar->addWidget(m_breakBtn);
+    bar->addStretch(1);
+    root->addLayout(bar);
+
+    auto *overlays = new QHBoxLayout;
+    overlays->addWidget(new QLabel(QStringLiteral("Overlays")));
+    int overlayCount = 0;
+    const chfvid_overlay_info *overlayInfo = chfvid_overlays(&overlayCount);
+    for (int i = 0; i < overlayCount; ++i) {
+        auto *box = new QCheckBox(QString::fromUtf8(overlayInfo[i].label));
+        box->setProperty("bit", overlayInfo[i].bit);
+        m_overlays << box;
+        overlays->addWidget(box);
     }
-    m_scale = new QComboBox;
-    for (int s = 1; s <= 4; ++s) m_scale->addItem(QStringLiteral("%1×").arg(s), s);
-    m_scale->setCurrentIndex(1);
-    row->addWidget(new QLabel(QStringLiteral("View")));
-    row->addWidget(m_view);
-    row->addWidget(new QLabel(QStringLiteral("Scale")));
-    row->addWidget(m_scale);
-    row->addStretch(1);
-    v->addLayout(row);
+    overlays->addStretch(1);
+    root->addLayout(overlays);
 
-    auto *ov = new QGridLayout;
-    for (int i = 0; i < 8; ++i) {
-        m_overlay[i] = new QCheckBox(QString::fromLatin1(kOverlays[i].label));
-        m_overlay[i]->setToolTip(QString::fromLatin1(kOverlays[i].tip));
-        m_overlay[i]->setChecked(kOverlays[i].on);
-        m_overlay[i]->setFocusPolicy(Qt::NoFocus);
-        connect(m_overlay[i], &QCheckBox::toggled, this, [this] { refreshPicture(); });
-        ov->addWidget(m_overlay[i], i / 4, i % 4);
+    m_status = monoLabel();
+    root->addWidget(m_status);
+
+    auto *split = new QSplitter(Qt::Horizontal);
+    root->addWidget(split, 1);
+
+    /* ---- left: picture */
+    auto *left = new QWidget;
+    auto *lv = new QVBoxLayout(left);
+    lv->setContentsMargins(0, 0, 0, 0);
+    m_scroll = new QScrollArea;
+    m_pic = new VideoPicture(this);
+    m_pic->setObjectName(QStringLiteral("videoPicture"));
+    m_scroll->setWidget(m_pic);
+    m_scroll->setWidgetResizable(false);
+    m_scroll->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    lv->addWidget(m_scroll, 1);
+    m_note = new QLabel;
+    lv->addWidget(m_note);
+    split->addWidget(left);
+
+    /* ---- right: sections, in chfvid_section_name order */
+    m_sections = new QTabWidget;
+    {
+        auto *w = new QWidget;
+        auto *v = new QVBoxLayout(w);
+        m_pixelText = monoLabel();
+        m_pixelText->setWordWrap(true);
+        v->addWidget(m_pixelText);
+        auto *btns = new QHBoxLayout;
+        auto *brk = new QPushButton(QStringLiteral("Break on its writes"));
+        auto *unpin = new QPushButton(QStringLiteral("Unpin"));
+        btns->addWidget(brk);
+        btns->addWidget(unpin);
+        btns->addStretch(1);
+        v->addLayout(btns);
+        v->addStretch(1);
+        connect(brk, &QPushButton::clicked, this, [this] { breakOnPixel(); });
+        connect(unpin, &QPushButton::clicked, this, [this] {
+            chfvid_tab_unpin(m_tab);
+            m_pic->update();
+            updatePixelSection();
+        });
+        auto *scroll = new QScrollArea;
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setWidget(w);
+        m_sections->addTab(scroll, QString::fromUtf8(chfvid_section_name(CHFVID_S_PIXEL)));
     }
-    v->addLayout(ov);
-    connect(m_view, &QComboBox::currentIndexChanged, this, [this] {
-        m_hoverRow = m_hoverCol = m_pinRow = m_pinCol = -1;
-        refresh();
-    });
-    connect(m_scale, &QComboBox::currentIndexChanged, this, [this] { refresh(); });
-
-    m_image = new VideoImage;
-    m_image->onHover = [this](int x, int y) { hover(x, y); };
-    m_image->onClick = [this](int x, int y) { click(x, y); };
-    m_image->onDouble = [this](int x, int y) { doubleClick(x, y); };
-    auto *area = new QScrollArea;
-    area->setWidget(m_image);
-    area->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    area->setMinimumWidth(256 * 2 + 36);
-    v->addWidget(area, 1);
-
-    m_hover = dbgui::dimLabel();
-    m_hover->setMinimumHeight(m_hover->fontMetrics().lineSpacing() * 2 + 4);
-    m_hover->setWordWrap(true);
-    v->addWidget(m_hover);
-    return w;
-}
-
-QWidget *VideoTab::buildCell()
-{
-    auto *w = new QWidget;
-    auto *v = new QVBoxLayout(w);
-    m_cellText = dbgui::monoView();
-    v->addWidget(m_cellText, 1);
-    v->addWidget(dbgui::dimLabel(QStringLiteral("Hover a cell of the picture for its row, column, value, palette and "
-                                                "last write; click to pin it (click it again to let go); "
-                                                "double-click to break on writes to it (again to remove).")));
-    return w;
-}
-
-QWidget *VideoTab::buildPalettes()
-{
-    auto *w = new QWidget;
-    auto *v = new QVBoxLayout(w);
-    v->addWidget(dbgui::titleLabel(QStringLiteral("The four palettes")));
-    m_palTable = plainTable({ QStringLiteral("Palette"), QStringLiteral("Value 0"), QStringLiteral("Value 1"),
-                              QStringLiteral("Value 2"), QStringLiteral("Value 3"), QStringLiteral("Rows") }, 4);
-    m_palTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    v->addWidget(m_palTable);
-    v->addWidget(dbgui::dimLabel(QStringLiteral("A row's palette is (column 126 & 2) | (column 125 >> 1), from the "
-                                                "values in its own columns 125 and 126. Rows: how many of the 64 "
-                                                "rows use it now.")));
-    v->addWidget(dbgui::titleLabel(QStringLiteral("Each row's palette")));
-    m_strip = new RowStrip;
-    auto *area = new QScrollArea;
-    area->setWidget(m_strip);
-    area->setFrameShape(QFrame::NoFrame);
-    v->addWidget(area, 1);
-    return w;
-}
-
-QWidget *VideoTab::buildPorts()
-{
-    auto *w = new QWidget;
-    auto *v = new QVBoxLayout(w);
-    v->addWidget(dbgui::titleLabel(QStringLiteral("The F8's four video ports")));
-    m_ports = plainTable({ QStringLiteral("Port"), QStringLiteral("Latch"), QStringLiteral("Complement"),
-                           QStringLiteral("Decoded"), QStringLiteral("CPU reads now") }, 4);
-    m_ports->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    v->addWidget(m_ports);
-    m_portNote = dbgui::dimLabel();
-    v->addWidget(m_portNote);
-    v->addStretch(1);
-    return w;
-}
-
-QWidget *VideoTab::buildLog()
-{
-    auto *w = new QWidget;
-    auto *v = new QVBoxLayout(w);
-    auto *f = new QGridLayout;
-    auto spin = [](int lo, int hi, int val) {
-        auto *s = new QSpinBox;
-        s->setRange(lo, hi);
-        s->setValue(val);
-        return s;
-    };
-    m_row0 = spin(0, 63, 0);
-    m_row1 = spin(0, 63, 63);
-    m_col0 = spin(0, 127, 0);
-    m_col1 = spin(0, 127, 127);
-    f->addWidget(new QLabel(QStringLiteral("Rows")), 0, 0);
-    f->addWidget(m_row0, 0, 1);
-    f->addWidget(new QLabel(QStringLiteral("to")), 0, 2);
-    f->addWidget(m_row1, 0, 3);
-    f->addWidget(new QLabel(QStringLiteral("Columns")), 1, 0);
-    f->addWidget(m_col0, 1, 1);
-    f->addWidget(new QLabel(QStringLiteral("to")), 1, 2);
-    f->addWidget(m_col1, 1, 3);
-    m_changesOnly = new QCheckBox(QStringLiteral("Changes only"));
-    m_changesOnly->setToolTip(QStringLiteral("Only the writes that changed their cell"));
-    m_thisFrame = new QCheckBox(QStringLiteral("This frame"));
-    m_palCols = new QCheckBox(QStringLiteral("Palette columns"));
-    m_palCols->setToolTip(QStringLiteral("Only writes to columns 125-127"));
-    f->addWidget(m_changesOnly, 0, 4);
-    f->addWidget(m_thisFrame, 1, 4);
-    f->addWidget(m_palCols, 0, 5);
-    auto *clear = new QPushButton(QStringLiteral("Clear"));
-    connect(clear, &QPushButton::clicked, this, [this] {
-        chfdebug_vram_writes_clear(m_dbg);
-        refreshLog();
-    });
-    f->addWidget(clear, 1, 5);
-    f->setColumnStretch(6, 1);
-    v->addLayout(f);
-    for (QSpinBox *s : { m_row0, m_row1, m_col0, m_col1 })
-        connect(s, &QSpinBox::valueChanged, this, [this] { refreshLog(); });
-    for (QCheckBox *c : { m_changesOnly, m_thisFrame, m_palCols })
-        connect(c, &QCheckBox::toggled, this, [this] { refreshLog(); });
-    m_logCounts = dbgui::dimLabel();
-    v->addWidget(m_logCounts);
-    m_logText = dbgui::monoView();
-    v->addWidget(m_logText, 1);
-    return w;
-}
-
-/* ---- refreshing --------------------------------------------------------------- */
-
-int VideoTab::view() const { return m_view->currentIndex(); }
-int VideoTab::scale() const { return m_scale->currentData().toInt(); }
-
-unsigned VideoTab::overlays() const
-{
-    unsigned f = 0;
-    for (int i = 0; i < 8; ++i)
-        if (m_overlay[i]->isChecked()) f |= kOverlays[i].flag;
-    return f;
-}
-
-void VideoTab::refresh()
-{
-    chfdebug_video_get(m_dbg, &m_v);
-    refreshPicture();
-    refreshCell();
-    switch (m_sections->currentIndex()) {
-    case 1: refreshPalettes(); break;
-    case 2: refreshPorts(); break;
-    case 3: refreshLog(); break;
-    default: break;
-    }
-}
-
-void VideoTab::refreshPicture()
-{
-    int w = 0, h = 0;
-    if (!chfdebug_video_view(m_dbg, view(), overlays(), scale(), nullptr, 0, &w, &h) || w <= 0 || h <= 0) return;
-    m_px.assign((size_t)w * (size_t)h, 0);
-    int w2 = 0, h2 = 0;
-    if (!chfdebug_video_view(m_dbg, view(), overlays(), scale(), m_px.data(), m_px.size(), &w2, &h2)) return;
-    /* the pixels are 0x00RRGGBB: make them opaque, or a compositor shows through */
-    for (uint32_t &px : m_px) px |= 0xFF000000u;
-    m_image->setImage(QImage(reinterpret_cast<const uchar *>(m_px.data()), w2, h2, w2 * 4, QImage::Format_RGB32).copy());
-    QRect hover, pin;
-    if (m_hoverRow >= 0) hover = cellRect(m_hoverRow, m_hoverCol);
-    if (m_pinRow >= 0) pin = cellRect(m_pinRow, m_pinCol);
-    m_image->setMarks(hover, pin);
-}
-
-/* where a VRAM cell is in the view (null when it is not shown) */
-QRect VideoTab::cellRect(int row, int col) const
-{
-    const int s = scale();
-    switch (view()) {
-    case CHFDEBUG_VIEW_FRAME:
-    case CHFDEBUG_VIEW_LIVE:
-    case CHFDEBUG_VIEW_BEAM:
-        if (row < CHFDEBUG_VIS_ROW0 || row >= CHFDEBUG_VIS_ROW0 + CHFDEBUG_VIS_ROWS || col < CHFDEBUG_VIS_COL0
-            || col >= CHFDEBUG_VIS_COL0 + CHFDEBUG_VIS_COLS)
-            return QRect();
-        return QRect((col - CHFDEBUG_VIS_COL0) * 2 * s, (row - CHFDEBUG_VIS_ROW0) * 4 * s, 2 * s, 4 * s);
-    case CHFDEBUG_VIEW_VRAM:
-    case CHFDEBUG_VIEW_VALUES: return QRect(col * 2 * s, row * 4 * s, 2 * s, 4 * s);
-    default: return QRect();
-    }
-}
-
-bool VideoTab::hitAt(int x, int y, int *row, int *col)
-{
-    if (x < 0 || y < 0) return false;
-    return chfdebug_video_hit(m_dbg, view(), x, y, scale(), row, col) >= 0;
-}
-
-void VideoTab::hover(int x, int y)
-{
-    int row, col;
-    if (hitAt(x, y, &row, &col)) {
-        m_hoverRow = row;
-        m_hoverCol = col;
-    } else {
-        m_hoverRow = m_hoverCol = -1;
-    }
-    refreshPicture();
-    refreshCell();
-}
-
-void VideoTab::click(int x, int y)
-{
-    int row, col;
-    if (!hitAt(x, y, &row, &col)) return;
-    if (row == m_pinRow && col == m_pinCol) m_pinRow = m_pinCol = -1;
-    else { m_pinRow = row; m_pinCol = col; }
-    refreshPicture();
-    refreshCell();
-}
-
-/* Double-click: break on writes to the cell, or take that breakpoint off. */
-void VideoTab::doubleClick(int x, int y)
-{
-    int row, col;
-    if (!hitAt(x, y, &row, &col)) return;
-    const int cell = row * CHFDEBUG_VRAM_COLS + col;
-    chfdebug_breakpoint bps[256];
-    const int n = chfdebug_breakpoint_list(m_dbg, bps, 256);
-    for (int i = 0; i < n; ++i)
-        if (bps[i].type == CHFDEBUG_BP_VRAM && bps[i].start == cell && bps[i].end == cell) {
-            chfdebug_breakpoint_remove(m_dbg, bps[i].id);
-            if (onMessage) onMessage(QStringLiteral("Breakpoint on writes to row %1 column %2 removed").arg(row).arg(col));
-            return;
+    m_regs = makeTable({ QStringLiteral("Name"), QStringLiteral("Value"), QStringLiteral("Meaning"),
+                         QStringLiteral("Last write") });
+    m_sections->addTab(m_regs, QString::fromUtf8(chfvid_section_name(CHFVID_S_REGISTERS)));
+    m_swatches = makeTable({ QString(), QStringLiteral("Palette"), QStringLiteral("Value"), QStringLiteral("Colour"),
+                             QStringLiteral("RGB"), QStringLiteral("Rows"), QStringLiteral("Cells") });
+    m_swatches->verticalHeader()->setDefaultSectionSize(26);
+    m_sections->addTab(m_swatches, QString::fromUtf8(chfvid_section_name(CHFVID_S_COLOURS)));
+    m_lines = makeTable({ QStringLiteral("Row"), QStringLiteral("Line"), QString(), QStringLiteral("Palette"),
+                          QStringLiteral("Writes"), QStringLiteral("Palette writes"), QStringLiteral("Last writer"),
+                          QStringLiteral("Beam") });
+    m_sections->addTab(m_lines, QString::fromUtf8(chfvid_section_name(CHFVID_S_LINES)));
+    {
+        auto *w = new QWidget;
+        auto *v = new QVBoxLayout(w);
+        auto *filters = new QHBoxLayout;
+        const struct { const char *label, *tip; } kinds[5] = {
+            { "This frame", "Only the writes of the frame being drawn" },
+            { "Changes only", "Only writes that changed the cell" },
+            { "Palette columns", "Only columns 125-127, the row palettes" },
+            { "Inspected cell", "Only the cell under the pointer or pinned" },
+            { "Inspected row", "Only the row of that cell" },
+        };
+        for (int i = 0; i < 5; ++i) {
+            m_filter[i] = new QCheckBox(QString::fromUtf8(kinds[i].label));
+            m_filter[i]->setToolTip(QString::fromUtf8(kinds[i].tip));
+            filters->addWidget(m_filter[i]);
+            connect(m_filter[i], &QCheckBox::toggled, this, [this](bool) {
+                if (m_updating) return;
+                applyWriteFilter();
+                m_writesSig.clear();
+                refreshView(CHFVID_TAB_TABLES);
+            });
         }
-    if (chfdebug_breakpoint_add(m_dbg, CHFDEBUG_BP_VRAM, CHF_SPACE_VRAM, (uint16_t)cell, (uint16_t)cell, "") >= 0 && onMessage)
-        onMessage(QStringLiteral("Breaking on writes to row %1 column %2").arg(row).arg(col));
+        filters->addStretch(1);
+        auto *clear = new QPushButton(QStringLiteral("Clear"));
+        clear->setToolTip(QStringLiteral("Forget the logged writes"));
+        connect(clear, &QPushButton::clicked, this, [this] {
+            chfvid_tab_clear_writes(m_tab);
+            m_writesSig.clear();
+            refreshView(CHFVID_TAB_TABLES);
+        });
+        filters->addWidget(clear);
+        v->addLayout(filters);
+        m_writesText = new QPlainTextEdit;
+        m_writesText->setReadOnly(true);
+        m_writesText->setLineWrapMode(QPlainTextEdit::NoWrap);
+        QFont f = m_writesText->font();
+        f.setFamily(QStringLiteral("monospace"));
+        f.setStyleHint(QFont::TypeWriter);
+        m_writesText->setFont(f);
+        v->addWidget(m_writesText, 1);
+        m_sections->addTab(w, QString::fromUtf8(chfvid_section_name(CHFVID_S_WRITES)));
+    }
+    {
+        auto *w = new QWidget;
+        auto *v = new QVBoxLayout(w);
+        m_beam = new QProgressBar;
+        m_beam->setRange(0, 1000);
+        m_beam->setFormat(QStringLiteral("beam"));
+        v->addWidget(m_beam);
+        m_timingText = monoLabel();
+        v->addWidget(m_timingText);
+        v->addStretch(1);
+        m_sections->addTab(w, QString::fromUtf8(chfvid_section_name(CHFVID_S_TIMING)));
+    }
+    split->addWidget(m_sections);
+    split->setStretchFactor(0, 3);
+    split->setStretchFactor(1, 1);
+    m_sections->setMinimumWidth(480);
+    split->setSizes({ 640, 640 });
+
+    /* start from the controller's state (the CHF_DEBUGGER_VIDEO_* variables) */
+    m_updating = true;
+    m_view->setCurrentIndex(chfvid_tab_view(m_tab));
+    for (int i = 0; i < zoomCount; ++i)
+        if (zooms[i] == chfvid_tab_zoom(m_tab)) m_zoom->setCurrentIndex(i);
+    for (QCheckBox *box : m_overlays) box->setChecked((chfvid_tab_overlays(m_tab) & box->property("bit").toUInt()) != 0);
+    m_sections->setCurrentIndex(chfvid_tab_env_section(m_tab));
+    updateBreakEnabled();
+    m_updating = false;
+
+    connect(m_view, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (m_updating || i < 0) return;
+        chfvid_tab_set_view(m_tab, i);
+        refresh(true);
+    });
+    connect(m_zoom, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (m_updating || i < 0) return;
+        chfvid_tab_set_zoom(m_tab, m_zoom->itemData(i).toInt());
+        refresh(true);
+    });
+    for (QCheckBox *box : m_overlays)
+        connect(box, &QCheckBox::toggled, this, [this](bool) {
+            if (m_updating) return;
+            unsigned mask = 0;
+            for (QCheckBox *each : m_overlays)
+                if (each->isChecked()) mask |= each->property("bit").toUInt();
+            chfvid_tab_set_overlays(m_tab, mask);
+            refresh(true);
+        });
+    connect(m_breakBtn, &QPushButton::clicked, this, [this] { breakOnPixel(); });
+    connect(m_sections, &QTabWidget::currentChanged, this, [this](int) {
+        m_regsSig.clear();
+        m_linesSig.clear();
+        m_writesSig.clear();
+        refreshView(CHFVID_TAB_TABLES);
+    });
 }
 
-QString VideoTab::cellReadout(int row, int col)
+VideoTab::~VideoTab()
 {
-    chfdebug_vram_cell c;
-    if (chfdebug_vram_cell_get(m_dbg, row, col, &c) < 0) return QStringLiteral("(no such cell)");
-    QString t = QStringLiteral("Row %1, column %2  (cell %3)\n").arg(c.row).arg(c.col).arg(c.row * 128 + c.col);
-    t += c.visible ? QStringLiteral("Shown on the TV\n")
-                   : QStringLiteral("Hidden: %1\n").arg(QString::fromUtf8(c.hidden_why ? c.hidden_why : "outside the picture"));
-    t += QStringLiteral("Value       %1\n").arg(c.value);
-    t += QStringLiteral("Palette     %1 (%2)\n").arg(c.palette).arg(QString::fromUtf8(chfdebug_palette_name(c.palette)));
-    t += QStringLiteral("Colour      pen %1, %2, %3\n").arg(c.pen).arg(QString::fromUtf8(chfdebug_colour_name(c.pen)),
-                                                                     dbgui::rgbText(c.rgb));
-    t += QStringLiteral("Writes      %1 since the debugger attached\n").arg(c.writes);
-    if (c.last_pc >= 0)
-        t += QStringLiteral("Last write  PC $%1, frame %2, line %3, over value %4")
-                 .arg(hx((unsigned)c.last_pc, 4)).arg(c.last_frame).arg(c.last_line).arg(c.last_old);
+    chfvid_tab_free(m_tab);
+}
+
+/* Break on writes needs an inspected cell. */
+void VideoTab::updateBreakEnabled()
+{
+    m_breakBtn->setEnabled(chfvid_tab_can_break(m_tab) != 0);
+}
+
+void VideoTab::note(const QString &text)
+{
+    m_note->setText(text);
+}
+
+void VideoTab::breakOnPixel()
+{
+    const chfvid_pixel *pixel = chfvid_tab_pixel(m_tab);
+    const int id = chfvid_tab_break_on_pixel(m_tab);
+    if (id >= 0 && pixel && pixel->valid)
+        note(QStringLiteral("Break on writes to row %1 col %2 (see Breakpoints)").arg(pixel->row).arg(pixel->col));
+    else if (id >= 0)
+        note(QStringLiteral("Write breakpoint added (see Breakpoints)"));
     else
-        t += QStringLiteral("Last write  never");
-    return t;
+        note(QStringLiteral("Nothing to break on: hover or pin a cell first"));
+    updatePixelSection();
 }
 
-void VideoTab::refreshCell()
+void VideoTab::updatePixelSection()
 {
-    QString text;
-    if (m_pinRow >= 0)
-        text += QStringLiteral("Pinned\n") + cellReadout(m_pinRow, m_pinCol) + QStringLiteral("\n\n");
-    if (m_hoverRow >= 0)
-        text += QStringLiteral("Under the pointer\n") + cellReadout(m_hoverRow, m_hoverCol);
-    else if (m_pinRow < 0)
-        text = QStringLiteral("(no cell under the pointer)");
-    dbgui::setText(m_cellText, text);
-
-    /* one line under the picture */
-    auto brief = [&](int row, int col) {
-        chfdebug_vram_cell c;
-        if (chfdebug_vram_cell_get(m_dbg, row, col, &c) < 0) return QString();
-        return QStringLiteral("row %1 col %2: value %3, palette %4, %5 %6%7").arg(c.row).arg(c.col).arg(c.value)
-            .arg(c.palette).arg(QString::fromUtf8(chfdebug_colour_name(c.pen)), dbgui::rgbText(c.rgb),
-                                 c.visible ? QString() : QStringLiteral(" (hidden: %1)").arg(QString::fromUtf8(c.hidden_why ? c.hidden_why : "?")));
-    };
-    QString line;
-    if (m_hoverRow >= 0) line = brief(m_hoverRow, m_hoverCol);
-    if (m_pinRow >= 0) line += (line.isEmpty() ? QString() : QStringLiteral("\n")) + QStringLiteral("Pinned: ") + brief(m_pinRow, m_pinCol);
-    if (line.isEmpty()) line = QStringLiteral("Hover a cell");
-    m_hover->setText(line);
+    const chfvid_pixel *pixel = chfvid_tab_pixel(m_tab);
+    updateBreakEnabled();
+    m_pixelText->setText(pixel ? QString::fromUtf8(pixel->text)
+                               : QStringLiteral("Move over the picture to inspect a cell.\nClick to pin it; "
+                                                "double-click to break on writes to it."));
 }
 
-void VideoTab::refreshPalettes()
+void VideoTab::fillRegs()
 {
-    for (int p = 0; p < 4; ++p) {
-        setCell(m_palTable, p, 0, QStringLiteral("%1 %2").arg(p).arg(QString::fromUtf8(chfdebug_palette_name(p))));
-        for (int v = 0; v < 4; ++v) {
-            const int pen = chfdebug_palette_pen(p, v);
-            const uint32_t rgb = chfdebug_colour_rgb(pen);
-            setCell(m_palTable, p, 1 + v, QStringLiteral("%1 %2").arg(QString::fromUtf8(chfdebug_colour_name(pen)), dbgui::rgbText(rgb)));
-            QTableWidgetItem *it = m_palTable->item(p, 1 + v);
-            it->setBackground(fromXrgb(rgb));
-            it->setForeground(inkOn(fromXrgb(rgb)));
-        }
-        setCell(m_palTable, p, 5, QString::number(m_v.palette_rows[p]));
-    }
-    m_strip->set(m_v.row_palette, m_v.row_background);
-}
-
-void VideoTab::refreshPorts()
-{
-    const struct { int port; uint8_t latch, in; } ports[4] = {
-        { 0, m_v.port0, m_v.in0 }, { 1, m_v.port1, m_v.in1 }, { 4, m_v.port4, m_v.in4 }, { 5, m_v.port5, m_v.in5 } };
-    const QString decoded[4] = {
-        QStringLiteral("strobe %1, controllers %2, panel latch %3")
-            .arg(m_v.strobe ? "up" : "down", m_v.controllers_enabled ? "read" : "off", hx(m_v.panel_latch, 1)),
-        QStringLiteral("colour value %1").arg(m_v.value),
-        QStringLiteral("column %1").arg(m_v.col),
-        QStringLiteral("row %1, sound %2").arg(m_v.row).arg(QString::fromLatin1(kSoundModes[m_v.sound_mode & 3])),
-    };
-    for (int i = 0; i < 4; ++i) {
-        setCell(m_ports, i, 0, QStringLiteral("%1").arg(ports[i].port));
-        setCell(m_ports, i, 1, QStringLiteral("$%1 %2").arg(hx(ports[i].latch, 2), dbgui::bin8(ports[i].latch)));
-        const unsigned comp = (~ports[i].latch) & 0xFF;
-        setCell(m_ports, i, 2, QStringLiteral("$%1 %2").arg(hx(comp, 2), dbgui::bin8(comp)));
-        setCell(m_ports, i, 3, decoded[i]);
-        setCell(m_ports, i, 4, QStringLiteral("$%1 %2").arg(hx(ports[i].in, 2), dbgui::bin8(ports[i].in)));
-    }
-    m_portNote->setText(QStringLiteral("The CPU writes a cell by putting the colour on port 1 (bits 7-6, complemented), "
-                                       "the column on port 4 (complemented) and the row on port 5 (bits 5-0, "
-                                       "complemented; bits 7-6 are the sound), then strobing port 0 bit 5. Ports 1 and 4 "
-                                       "read player 1's (right) and player 2's (left) controller, active low, while "
-                                       "port 0 bit 6 is clear; port 0 reads the panel's buttons.\n\n"
-                                       "Beam: line %1 of %2, cycle %3 of %4. Frame %5. "
-                                       "VRAM writes: %6 so far this frame; the last whole frame had %7, %8 of them "
-                                       "changing their cell.")
-                            .arg(m_v.line).arg(m_v.lines).arg(m_v.cycle_in_line).arg(m_v.cycles_per_line).arg(m_v.frame)
-                            .arg(m_v.strobes_frame).arg(m_v.strobes_last).arg(m_v.changes_last));
-}
-
-void VideoTab::refreshLog()
-{
-    static chfdebug_vram_write w[500];
-    chfdebug_vram_filter f;
-    f.row0 = m_row0->value();
-    f.row1 = m_row1->value();
-    f.col0 = m_col0->value();
-    f.col1 = m_col1->value();
-    f.changes_only = m_changesOnly->isChecked();
-    f.this_frame = m_thisFrame->isChecked();
-    f.palette_cols = m_palCols->isChecked();
-    const int n = chfdebug_vram_writes(m_dbg, &f, w, 500);
-    chfdebug_video v;
-    chfdebug_video_get(m_dbg, &v);
-    m_logCounts->setText(QStringLiteral("This frame so far: %1 writes. Last whole frame: %2 writes, %3 changing their "
-                                        "cell. Showing the newest %4.")
-                             .arg(v.strobes_frame).arg(v.strobes_last).arg(v.changes_last).arg(n));
-    QString t = QStringLiteral("frame  line  cycle      PC     cell        old → new\n");
+    const chfvid_reg *regs;
+    const int n = chfvid_tab_regs(m_tab, &regs);
+    QString sig;
     for (int i = 0; i < n; ++i)
-        t += QStringLiteral("%1 %2 %3  $%4  r%5 c%6  %7 → %8\n").arg(w[i].frame, 5).arg(w[i].line, 4)
-                 .arg((qulonglong)w[i].cycle, 10).arg(hx(w[i].pc, 4)).arg(w[i].row, 2).arg(w[i].col, -3)
-                 .arg(w[i].old).arg(w[i].value);
-    if (n == 0) t += QStringLiteral("(no writes match)\n");
-    dbgui::setText(m_logText, t, dbgui::atEnd(m_logText));
+        sig += QString::fromUtf8(regs[i].value) + QString::fromUtf8(regs[i].last)
+               + (regs[i].age < CHFVID_REG_FADE ? QLatin1Char('*') : QLatin1Char('.'));
+    sig += QString::number(n);
+    if (sig == m_regsSig) return;
+    m_regsSig = sig;
+    const int vpos = m_regs->verticalScrollBar()->value();
+    m_regs->setRowCount(n);
+    for (int i = 0; i < n; ++i) {
+        const bool hot = regs[i].age < CHFVID_REG_FADE;
+        setCell(m_regs, i, 0, QString::fromUtf8(regs[i].name), hot);
+        setCell(m_regs, i, 1, QString::fromUtf8(regs[i].value), hot);
+        setCell(m_regs, i, 2, QString::fromUtf8(regs[i].meaning), hot);
+        setCell(m_regs, i, 3, QString::fromUtf8(regs[i].last), hot);
+    }
+    m_regs->resizeColumnsToContents();
+    m_regs->verticalScrollBar()->setValue(vpos);
+}
+
+/* The four palettes of four colours, each with a swatch; the one the inspected
+ * cell uses is marked. */
+void VideoTab::fillColours()
+{
+    const chfvid_swatch *swatches;
+    const int n = chfvid_tab_swatches(m_tab, &swatches);
+    m_swatches->setRowCount(n);
+    for (int i = 0; i < n; ++i) {
+        const bool inspected = swatches[i].inspected != 0;
+        auto *colour = m_swatches->item(i, 0);
+        if (!colour) {
+            colour = new QTableWidgetItem;
+            m_swatches->setItem(i, 0, colour);
+        }
+        colour->setBackground(QBrush(QColor::fromRgb(swatches[i].rgb & 0xFFFFFF)));
+        setCell(m_swatches, i, 1, QStringLiteral("%1 %2").arg(swatches[i].palette).arg(QString::fromUtf8(swatches[i].palette_name)), inspected);
+        setCell(m_swatches, i, 2, QString::number(swatches[i].value), inspected);
+        setCell(m_swatches, i, 3, QString::fromUtf8(swatches[i].name), inspected);
+        setCell(m_swatches, i, 4, QStringLiteral("#") + hex(swatches[i].rgb & 0xFFFFFF, 6), inspected);
+        setCell(m_swatches, i, 5, QString::number(swatches[i].rows), inspected);
+        setCell(m_swatches, i, 6, QString::number(swatches[i].cells), inspected);
+    }
+    m_swatches->resizeColumnsToContents();
+    m_swatches->setColumnWidth(0, 28);
+}
+
+/* The 64 rows of the video RAM: the palette each uses, its writes this frame
+ * and the last writer; a row written this frame or under the beam is marked. */
+void VideoTab::fillLines()
+{
+    const chfvid_line_row *rows;
+    const int n = chfvid_tab_lines(m_tab, &rows);
+    QString sig = QString::number(n);
+    for (int i = 0; i < n; ++i)
+        sig += QStringLiteral("|%1:%2:%3:%4:%5:%6:%7:%8").arg(rows[i].row).arg(rows[i].palette).arg(rows[i].writes)
+                   .arg(rows[i].pal_writes).arg(rows[i].last_pc).arg(rows[i].last_col).arg(rows[i].last_frame)
+                   .arg(rows[i].beam);
+    if (sig == m_linesSig) return;
+    m_linesSig = sig;
+    const int vpos = m_lines->verticalScrollBar()->value();
+    m_lines->setRowCount(n);
+    for (int i = 0; i < n; ++i) {
+        const bool hot = rows[i].writes > 0 || rows[i].beam;
+        setCell(m_lines, i, 0, QString::number(rows[i].row) + (rows[i].visible ? QString() : QStringLiteral(" (hidden)")), hot);
+        setCell(m_lines, i, 1, QString::number(rows[i].scanline), hot);
+        auto *back = m_lines->item(i, 2);
+        if (!back) {
+            back = new QTableWidgetItem;
+            m_lines->setItem(i, 2, back);
+        }
+        back->setBackground(QBrush(QColor::fromRgb(rows[i].background & 0xFFFFFF)));
+        setCell(m_lines, i, 3, QStringLiteral("%1 %2").arg(rows[i].palette).arg(QString::fromUtf8(rows[i].palette_name)), hot);
+        setCell(m_lines, i, 4, QString::number(rows[i].writes), hot);
+        setCell(m_lines, i, 5, QString::number(rows[i].pal_writes), hot);
+        setCell(m_lines, i, 6, rows[i].last_pc >= 0 ? QStringLiteral("pc $%1 col %2 frame %3")
+                                                           .arg(hex((unsigned)rows[i].last_pc, 4)).arg(rows[i].last_col)
+                                                           .arg(rows[i].last_frame)
+                                                     : QStringLiteral("-"), hot);
+        setCell(m_lines, i, 7, rows[i].beam ? QStringLiteral("<") : QString(), hot);
+    }
+    m_lines->resizeColumnsToContents();
+    m_lines->setColumnWidth(2, 28);
+    m_lines->verticalScrollBar()->setValue(vpos);
+}
+
+void VideoTab::applyWriteFilter()
+{
+    chfvid_write_filter filter = {};
+    filter.this_frame = m_filter[0]->isChecked();
+    filter.changes_only = m_filter[1]->isChecked();
+    filter.palette_cols = m_filter[2]->isChecked();
+    filter.inspected_cell = m_filter[3]->isChecked();
+    filter.inspected_row = m_filter[4]->isChecked();
+    chfvid_tab_set_write_filter(m_tab, &filter);
+}
+
+/* The logged VRAM writes through the filter, newest last. */
+void VideoTab::fillWrites()
+{
+    const chfdebug_vram_write *writes;
+    const int n = chfvid_tab_writes(m_tab, &writes);
+    QString text;
+    char line[160];
+    for (int i = 0; i < n; ++i) {
+        chfvid_write_text(&writes[i], line, sizeof line);
+        text += QString::fromUtf8(line);
+        text += QLatin1Char('\n');
+    }
+    if (n == 0) text = QStringLiteral("(no VRAM writes logged through this filter)");
+    if (text == m_writesSig) return;
+    m_writesSig = text;
+    QScrollBar *bar = m_writesText->verticalScrollBar();
+    const bool follow = bar->value() >= bar->maximum() - 1;
+    const int top = bar->value();
+    m_writesText->setPlainText(text);
+    bar->setValue(follow ? bar->maximum() : top);
+}
+
+void VideoTab::fillTiming()
+{
+    const char *const *lines;
+    const int n = chfvid_tab_timing(m_tab, &lines);
+    QString text;
+    for (int i = 0; i < n; ++i) {
+        const QString line = QString::fromUtf8(lines[i]);
+        const int tab = line.indexOf(QLatin1Char('\t'));
+        text += tab >= 0 ? line.left(tab).leftJustified(14) + QLatin1Char(' ') + line.mid(tab + 1) : line;
+        text += QLatin1Char('\n');
+    }
+    m_timingText->setText(text.isEmpty() ? QStringLiteral("No timing yet") : text);
+    m_beam->setValue(chfvid_tab_beam_permille(m_tab));
+}
+
+void VideoTab::refreshView(unsigned what)
+{
+    if (what & CHFVID_TAB_PICTURE) m_pic->sync();
+    if (what & CHFVID_TAB_TABLES) {
+        m_status->setText(QString::fromUtf8(chfvid_tab_status(m_tab)));
+        switch (m_sections->currentIndex()) {
+        case CHFVID_S_REGISTERS: fillRegs(); break;
+        case CHFVID_S_COLOURS: fillColours(); break;
+        case CHFVID_S_LINES: fillLines(); break;
+        case CHFVID_S_WRITES: fillWrites(); break;
+        case CHFVID_S_TIMING: fillTiming(); break;
+        default: break;
+        }
+        updatePixelSection();
+    }
+}
+
+void VideoTab::resizeEvent(QResizeEvent *e)
+{
+    QWidget::resizeEvent(e);
+    /* Fit follows the room the picture has */
+    if (chfvid_tab_zoom(m_tab) == 0) refresh(false);
+}
+
+void VideoTab::refresh(bool force)
+{
+    const QSize viewport = m_scroll->viewport()->size();
+    if (viewport.width() > 4 && viewport.height() > 4)
+        chfvid_tab_set_viewport(m_tab, viewport.width() - 2, viewport.height() - 2);
+    unsigned what = chfvid_tab_refresh(m_tab, force);
+    if (force) what |= CHFVID_TAB_PICTURE | CHFVID_TAB_TABLES;
+    if (what & CHFVID_TAB_OFF) what |= CHFVID_TAB_PICTURE | CHFVID_TAB_TABLES;
+    refreshView(what);
 }

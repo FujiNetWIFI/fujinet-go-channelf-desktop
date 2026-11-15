@@ -37,7 +37,7 @@ add_executable(fujinet-go-channelf-kde
   FujiNetWindows.cpp
   controllers/ControllersWindow.cpp
   debugger/DebuggerWindow.cpp
-  debugger/CpuTab.cpp
+  debugger/ScratchPanel.cpp
   debugger/VideoTab.cpp
   debugger/ChipTabs.cpp
   help/HelpWindow.cpp
@@ -89,3 +89,28 @@ qt_add_shaders(display_shaders_test "display_shaders_guard"
 add_test(NAME display_shaders_kde COMMAND display_shaders_test)
 set_tests_properties(display_shaders_kde PROPERTIES
                      ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# The Debugger window (and F12 from the main window), on the offscreen
+# platform, against a running session on the stand-in BIOS.
+find_package(Qt6 COMPONENTS Test QUIET)
+if(Qt6Test_FOUND)
+  add_executable(debugger_test debugger_test.cpp debugger/DebuggerWindow.cpp
+                 debugger/ScratchPanel.cpp debugger/VideoTab.cpp debugger/ChipTabs.cpp
+                 MainWindow.cpp DisplayWidget.cpp SoftDisplayWidget.cpp
+                 FrameFeed.cpp SettingsDialog.cpp KeyForward.cpp
+                 FujiNetWindows.cpp help/HelpWindow.cpp
+                 controllers/ControllersWindow.cpp)
+  set_target_properties(debugger_test PROPERTIES CXX_STANDARD 17)
+  target_link_libraries(debugger_test PRIVATE chf_session Qt6::Widgets
+                        Qt6::GuiPrivate Qt6::Network Qt6::Test)
+  qt_add_shaders(debugger_test "display_shaders_test"
+    PREFIX "/"
+    FILES ${CHF_DISPLAY_SHADERS})
+  target_include_directories(debugger_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(debugger_test PRIVATE -Wall -Wextra)
+  target_compile_definitions(debugger_test PRIVATE
+    CHF_SOURCE_ICON_DIR="${CMAKE_SOURCE_DIR}/data/icons")
+  add_test(NAME debugger_kde COMMAND debugger_test)
+  set_tests_properties(debugger_kde PROPERTIES
+                       ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()

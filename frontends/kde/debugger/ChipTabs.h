@@ -1,8 +1,9 @@
 /*
- * The debugger's chip tabs: Sound & I/O (the beeper, both hand controllers'
- * eight contacts, the panel, the ports' traffic and a 2102 cartridge's RAM
- * port) and Cart (the Videocart or the FujiNet cartridge's state, its status
- * page and mailbox, and its events).
+ * The debugger's chip tabs: Sound (the beeper's mode, level and the
+ * sound-mode timeline) and Cart & I/O (the Videocart or the FujiNet
+ * cartridge's state, its status page, mailbox and events and the memory map;
+ * the hand controllers' and the panel's contacts, the ports raw, complemented
+ * and decoded, a 2102 cartridge's RAM latch and the I/O log).
  *
  * Each is refreshed by the debugger window while it shows.
  *
@@ -20,9 +21,9 @@ class LevelMeter;
 class QLabel;
 class QPlainTextEdit;
 
-class IoTab : public QWidget {
+class SoundTab : public QWidget {
 public:
-    explicit IoTab(chfdebug *debugger, QWidget *parent = nullptr);
+    explicit SoundTab(chfdebug *debugger, QWidget *parent = nullptr);
     void refresh();
 
 private:
@@ -30,20 +31,23 @@ private:
     QLabel *m_sound = nullptr;
     LevelMeter *m_meter = nullptr;
     QPlainTextEdit *m_modes = nullptr;
-    ContactsWidget *m_pad[2] = {};
-    ContactsWidget *m_panel = nullptr;
-    QLabel *m_bytes = nullptr;
-    QLabel *m_ram = nullptr;
-    QPlainTextEdit *m_log = nullptr;
 };
 
-class CartTab : public QWidget {
+class CartIoTab : public QWidget {
 public:
-    explicit CartTab(chfdebug *debugger, QWidget *parent = nullptr);
+    explicit CartIoTab(chfdebug *debugger, QWidget *parent = nullptr);
     void refresh();
 
 private:
+    void refreshCart();
+    void refreshIo();
+
     chfdebug *m_dbg;
+    ContactsWidget *m_pad[2] = {};
+    ContactsWidget *m_panel = nullptr;
+    QLabel *m_ports = nullptr;
+    QLabel *m_ram = nullptr;
+    QPlainTextEdit *m_log = nullptr;
     QPlainTextEdit *m_text = nullptr;
     QPlainTextEdit *m_mailbox = nullptr;
     QPlainTextEdit *m_events = nullptr;

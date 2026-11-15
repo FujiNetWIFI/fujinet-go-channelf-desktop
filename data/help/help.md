@@ -672,13 +672,16 @@ stops only when a write changes something), and `row` and `col` are for
 The F8 disassembled at the PC, with the opcode bytes and labels. The current
 instruction is in the app's accent colour and a breakpoint is a red dot in
 the margin (a grey hollow one when it is disabled); click a line to toggle
-its breakpoint. **Follow PC** keeps the current line in view.
-<!-- only: macos -->
-On a Mac a click picks a line (for **Run to Cursor**); click in the margin or
-double-click to toggle its breakpoint.
-<!-- end --> The BIOS, the
+its breakpoint. **Follow PC** keeps the current line in view. The BIOS, the
 cartridge header and FujiNet's mailbox registers have labels of their own.
 The APPBANK window ($4800 to $67FF) says which page it shows.
+
+<!-- only: macos -->
+
+On a Mac a click picks a line (for **Run to Cursor**); click in the margin or
+double-click to toggle its breakpoint.
+
+<!-- end -->
 
 <!-- context: debugger/memory -->
 ## Memory

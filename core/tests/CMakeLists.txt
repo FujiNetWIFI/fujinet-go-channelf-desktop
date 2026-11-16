@@ -161,3 +161,8 @@ set_tests_properties(netboot_sync PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN
 
 endif()
 endif()
+
+# The audio ring holds its fill against a mismatched device clock with no
+# hard trims (core/chf/audioring.h).
+chf_test(audioring_test audioring_test.c)
+add_test(NAME audioring COMMAND audioring_test)

@@ -53,6 +53,7 @@ target_link_libraries(fujinet-go-channelf-macos PRIVATE chf_session
   "-framework CoreVideo"    # CVDisplayLink: this platform's frame clock
   "-framework CoreGraphics"
   "-framework QuartzCore"
+  "-framework Metal"        # the picture is a texture on a CAMetalLayer
   "-framework UniformTypeIdentifiers"   # UTType: the open panels' filters
   "-framework Carbon")      # kVK_* virtual key codes
 target_compile_options(fujinet-go-channelf-macos PRIVATE -Wall -Wextra

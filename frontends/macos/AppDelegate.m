@@ -128,6 +128,7 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     BOOL _launched;
     NSWindow *_window;
     ChfDisplayView *_display;
+    id<NSObject> _activity;          /* no App Nap, no timer coalescing while we run */
     ChfContentView *_content;
     NSTimer *_statusTimer;
     NSTimer *_sysactTimer;
@@ -174,6 +175,13 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
 - (void)applicationDidFinishLaunching:(NSNotification *)note
 {
     (void)note;
+
+    /* An emulator is latency-critical work: App Nap must not throttle the
+     * machine thread or coalesce its timers when the window is behind
+     * another, and Game Mode (Info.plist) asks the system to favour it. */
+    _activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                          reason:@"Emulating a Fairchild Channel F"];
 
     /* The 204x232 picture at the TV's 4:3: 699x524 is a comfortable first
      * window on any Mac. */
@@ -490,6 +498,10 @@ static NSArray<UTType *> *typesForExtensions(NSArray<NSString *> *exts)
     [_sysactTimer invalidate];
     [_logTimer invalidate];
     [_display stop];
+    if (_activity) {
+        [[NSProcessInfo processInfo] endActivity:_activity];
+        _activity = nil;
+    }
     chfsession_stop(_session);
     chfsession_free(_session);
     _session = NULL;

@@ -45,6 +45,19 @@
 #include "fujiDevice.h"
 #include "rs232/rs232Network.h"
 
+/* Firmware PR #2378 moved the Fuji device from the global theFuji into
+ * SYSTEM_BUS.theFuji (and shuttingDown behind setShuttingDown()). Reach both
+ * layouts, so the pin can sit on either side of that change. The int/long
+ * overloads prefer the member form and fall back to the old globals. */
+extern fujiDevice *theFuji;
+namespace fn_compat {
+template <class B> auto fuji(B &bus, int) -> decltype(bus.theFuji) { return bus.theFuji; }
+template <class B> fujiDevice *fuji(B &, long) { return ::theFuji; }
+template <class B> auto clear_shutting(B &bus, int) -> decltype(bus.setShuttingDown(false), void()) { bus.setShuttingDown(false); }
+template <class B> void clear_shutting(B &bus, long) { bus.shuttingDown = false; }
+}
+static inline fujiDevice *the_fuji() { return fn_compat::fuji(SYSTEM_BUS, 0); }
+
 extern rs232Network rs232NetDevs[MAX_NETWORK_DEVICES];
 
 extern void main_setup(int argc, char* argv[]);
@@ -602,10 +615,10 @@ FUJINET_ENTRY int fujinet_desktop_copy_recent_log(char* output, int maxBytes) {
 static void release_hosts_at_exit()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_running || theFuji == nullptr)
+    if (g_running || the_fuji() == nullptr)
         return;
     for (int i = 0; i < MAX_HOSTS; i++)
-        theFuji->get_host(i)->set_type(HOSTTYPE_UNINITIALIZED);
+        the_fuji()->get_host(i)->set_type(HOSTTYPE_UNINITIALIZED);
     /* The same for a network channel a client left open (an HTTP poll in
      * flight when the session stopped): rs232NetDevs' destructors would
      * close it after the HTTP client's globals are gone, and the process
